@@ -19,6 +19,7 @@ import { cardBookToLorebookRows, parseWorldBook, entryToLorebookRow } from '../.
 import { parsePreset } from '../../packages/core/src/preset.ts';
 import { RegexLibrary } from '../../packages/core/src/regex-library.ts';
 import { LorebookScanner } from '../../packages/core/src/scanner.ts';
+import { matchSkills, renderSkillBlock } from '../../packages/core/src/skills.ts';
 import { MemoryDb } from '../../packages/memory/src/db.ts';
 import { WriteLoop } from '../../packages/memory/src/writer.ts';
 import { RetrievalEngine } from '../../packages/memory/src/retrieval.ts';
@@ -27,7 +28,7 @@ import { createEmbeddingProvider, HashEmbeddingProvider } from '../../packages/m
 import { VariableManager } from '../../packages/variable/src/vms.ts';
 import { persistVariables, restoreVariables } from '../../packages/variable/src/persist.ts';
 import { assembleTurn, DEFAULT_SYSTEM_CORE } from '../../packages/prompt/src/assembly.ts';
-import { validateGameTurn, safeParseTurn, normalizeTurn } from '../../packages/prompt/src/turn.ts';
+import { validateGameTurn, safeParseTurn, normalizeTurn, createProseStreamExtractor } from '../../packages/prompt/src/turn.ts';
 import type { GameTurn } from '../../packages/prompt/src/turn.ts';
 import { OpenAICompatibleClient, toolLoopMessages } from '../../packages/proxy/src/client.ts';
 import { loadProviderConfig, assertProviderReady } from '../../packages/proxy/src/config.ts';
@@ -406,17 +407,25 @@ export class ChatSession {
       .run(round, role, content, new Date().toISOString());
   }
 
-  /** 单轮对话 @param contentMode 内容分支（缺省用会话配置） */
-  async turn(userInput: string, contentMode?: 'nsfw' | 'nsf'): Promise<string> {
+  /** 单轮对话
+   *  @param contentMode 内容分支（缺省用会话配置）
+   *  @param onProse     真流式回调：模型生成正文时逐字/逐块回调（prose 增量；未传入则完整返回时一次性给）
+   */
+  async turn(userInput: string, contentMode?: 'nsfw' | 'nsf', onProse?: (chunk: string) => void): Promise<string> {
     this.round++;
     const round = this.round;
     const mode = contentMode ?? this.args.contentMode ?? 'nsfw';
+    const emit = onProse ?? (() => {});
 
-    // ① 平台预计算（并行：检索 + 扫描 + 变量）
-    const [recall, scan] = await Promise.all([
+    // ① 平台预计算（并行：检索 + 扫描 + 变量 + Skill 自觉匹配）
+    const [recall, scan, skillMatches] = await Promise.all([
       this.ret.recallAsync({ query: userInput.slice(0, 24), round, budgetTokens: 400 }),
       Promise.resolve(this.scanner.scan({ text: userInput, seed: round, budgetTokens: 1200 })),
+      // Skill 系统：语义匹配用户输入 vs 各 skill 描述（阈值/topK），命中读取指令正文
+      Promise.resolve(matchSkills(userInput)),
     ]);
+    const skillBlock = renderSkillBlock(skillMatches);
+    if (skillMatches.length > 0) console.log(`[Skill] 命中 ${skillMatches.map((m) => `${m.skill.name}(${m.score.toFixed(2)})`).join(', ')}`);
     const vmsResult = this.vms.evaluate();
     console.log(`[预计算] 检索 ${recall.hits.length} 条 / 世界书 ${scan.activated.length} 条 / 变量 ${Object.keys(vmsResult.values).length} 个`);
 
@@ -434,7 +443,7 @@ export class ChatSession {
       .filter((s) => s.length > 0);
     // 变量值：VMS 全量 + 引擎叶子（完整名 session:mvu:<path>，宏展开走后缀匹配）
     const variableValues = { ...vmsResult.values, ...(this.bridge?.getFlat() ?? {}) };
-    const userContent = `<最新互动>\n${userInput}\n</最新互动>${pluginInject.length ? `\n<插件注入>\n${pluginInject.join('\n')}\n</插件注入>` : ''}`;
+    const userContent = `<最新互动>\n${userInput}\n</最新互动>${pluginInject.length ? `\n<插件注入>\n${pluginInject.join('\n')}\n</插件注入>` : ''}${skillBlock ? `\n${skillBlock}` : ''}`;
     const assembled = assembleTurn({
       systemCore: DEFAULT_SYSTEM_CORE,
       staticSettings: `角色卡：${this.cardName}\n${this.cardDesc.slice(0, 400)}${scan.injectedBlock ? `\n\n<世界书激活>\n${scan.injectedBlock}\n</世界书激活>` : ''}`,
@@ -449,10 +458,20 @@ export class ChatSession {
     });
     this.logChat('user', userInput, round);
 
-    // ③ 模型调用 + 校验 + 错误召回重试（统一：最多 2 次尝试，每次均过 归一化→校验；重试消息用首轮 tool_call 注入错误）
+    // ③ 模型调用（真流式）+ 校验 + 错误召回重试（统一：最多 2 次尝试，每次均过 归一化→校验；重试消息用首轮 tool_call 注入错误）
     const attemptTurn = async (messages: import('../../packages/proxy/src/client.ts').ChatMessage[]):
       Promise<{ turn: GameTurn | null; tc: import('../../packages/proxy/src/client.ts').ToolCall | null }> => {
-      const res = await this.client.complete({ messages, tools: assembled.tools, temperature: 0.9 });
+      const extractor = createProseStreamExtractor();
+      const res = await this.client.stream(
+        { messages, tools: assembled.tools, temperature: 0.9 },
+        () => {},   // content 增量忽略（prose 在 game_turn 工具参数里；content 多为模型思考/闲话）
+        (name, argDelta) => {
+          if (name === 'game_turn') {
+            const p = extractor(argDelta);
+            if (p) emit(p);
+          }
+        },
+      );
       const tc = res.toolCalls.find((t) => t.name === 'game_turn') ?? null;
       if (!tc) {
         console.log(`  ⚠ 未返回 game_turn（finish=${res.finishReason}）`);

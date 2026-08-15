@@ -90,6 +90,74 @@ export function validateGameTurn(input: unknown): { ok: boolean; issues: string[
   return { ok: false, issues: issues.slice(0, 10) };
 }
 
+/** 流式 prose 提取器：从不断增长的 game_turn 工具参数 JSON 中渐进提取 prose 字段增量
+ *  - 原理：prose 是契约最后一个字段，流式到达时前面的 plan/memory_delta 已完整闭合
+ *  - 用法：每次收到 tool_calls.arguments 增量就调用一次，返回新增的 prose 文本（已解码转义）
+ *  - 安全性：prose 值未闭合时只返回已完整部分；末尾 done 事件会用完整 prose 兜底覆盖
+ */
+export function createProseStreamExtractor(): (delta: string) => string {
+  let buf = '';          // 累积的 arguments
+  let scanFrom = 0;      // scan 阶段搜索起点
+  let state: 'scan' | 'value' | 'done' = 'scan';
+  let emitFrom = 0;      // proseBuf 中已发出的长度
+  let proseBuf = '';     // 已提取的 prose 值（解码后）
+
+  return (delta: string): string => {
+    buf += delta;
+    // 循环处理直到状态转移完成；无进展（数据未到齐）则退出等下一次增量
+    let progressed = true;
+    while (state !== 'done' && progressed) {
+      progressed = false;
+      if (state === 'scan') {
+        const k = buf.indexOf('"prose"', scanFrom);
+        if (k < 0) {
+          scanFrom = Math.max(0, buf.length - 12);
+          break;
+        }
+        const colon = buf.indexOf(':', k);
+        if (colon < 0) { scanFrom = k; break; }
+        let q = colon + 1;
+        while (q < buf.length && (buf[q] === ' ' || buf[q] === '\t' || buf[q] === '\n')) q++;
+        if (q >= buf.length || buf[q] !== '"') { scanFrom = Math.max(k + 1, colon + 1); break; }
+        state = 'value';
+        scanFrom = q + 1;
+        progressed = true;
+      } else {
+        // value 状态：扫描到字符串闭合引号或缓冲末尾
+        let i = scanFrom;
+        let advanced = false;
+        while (i < buf.length) {
+          const c = buf[i];
+          if (c === '\\') {
+            if (i + 1 >= buf.length) break; // 转义未完整，等下一次增量
+            const e = buf[i + 1];
+            proseBuf += e === 'n' ? '\n' : e === 't' ? '\t' : e === 'r' ? '\r' : e === '"' ? '"' : e === '\\' ? '\\' : e;
+            i += 2;
+            advanced = true;
+          } else if (c === '"') {
+            state = 'done';
+            i++;
+            advanced = true;
+            break;
+          } else {
+            proseBuf += c;
+            i++;
+            advanced = true;
+          }
+        }
+        if (i > scanFrom) {
+          scanFrom = i;
+          progressed = true;
+        }
+        if (state !== 'done') break; // 未闭合：等下一次增量
+      }
+    }
+    const fresh = proseBuf.slice(emitFrom);
+    emitFrom = proseBuf.length;
+    return fresh;
+  };
+}
+
 /** 容错解析模型输出的 game_turn 参数 JSON（L6 错误输出召回：修复截断/尾随字符/嵌套字符串） */
 export function safeParseTurn(args: string): GameTurn | null {
   if (!args || !args.trim()) return null;

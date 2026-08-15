@@ -128,10 +128,14 @@ export class OpenAICompatibleClient {
     return parseChatResponse(JSON.parse(text));
   }
 
-  /** 流式调用（正文渲染：逐块回调 delta） */
+  /** 流式调用（正文渲染：逐块回调 delta）
+   *  @param onDelta   content 增量（assistant 正文逐字）
+   *  @param onToolArg 工具参数增量（function.arguments 分片，用于真流式提取 prose）
+   */
   async stream(
     req: ChatRequest,
     onDelta: (delta: string) => void,
+    onToolArg?: (name: string, argsDelta: string) => void,
   ): Promise<ChatResponse> {
     const res = await fetch(`${this.base}/chat/completions`, {
       method: 'POST',
@@ -176,7 +180,10 @@ export class OpenAICompatibleClient {
           toolCalls[idx] = toolCalls[idx] ?? { id: tc.id ?? '', name: '', arguments: '' };
           if (tc.id) toolCalls[idx].id = tc.id;
           if (tc.function?.name) toolCalls[idx].name += tc.function.name;
-          if (tc.function?.arguments) toolCalls[idx].arguments += tc.function.arguments;
+          if (tc.function?.arguments) {
+            toolCalls[idx].arguments += tc.function.arguments;
+            if (onToolArg && toolCalls[idx].name) onToolArg(toolCalls[idx].name, tc.function.arguments);
+          }
         }
       }
       if (choice.finish_reason) finishReason = choice.finish_reason;

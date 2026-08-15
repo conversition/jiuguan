@@ -199,12 +199,16 @@ const server = createServer(async (req, res) => {
       sseSend(res, { type: 'status', stage: 'thinking' });
       try {
         const mode = body.content_mode === 'nsf' ? 'nsf' : 'nsfw';
-        const prose = await session.turn(input, mode as 'nsfw' | 'nsf');
-        sseSend(res, { type: 'status', stage: 'streaming' });
-        const chunks = chunkText(prose);
-        for (const c of chunks) {
-          sseSend(res, { type: 'delta', text: c });
-        }
+        let streamStarted = false;
+        // 真流式：session.turn 回调 prose 增量 → 逐字转发 SSE；最终 done 携带完整 prose（前端覆盖兜底）
+        const prose = await session.turn(input, mode as 'nsfw' | 'nsf', (chunk) => {
+          if (!streamStarted) {
+            sseSend(res, { type: 'status', stage: 'streaming' });
+            streamStarted = true;
+          }
+          sseSend(res, { type: 'delta', text: chunk });
+        });
+        if (!streamStarted) sseSend(res, { type: 'status', stage: 'streaming' });
         sseSend(res, { type: 'done', prose });
       } catch (e) {
         sseSend(res, { type: 'error', message: (e as Error).message.slice(0, 200) });
@@ -514,6 +518,49 @@ const server = createServer(async (req, res) => {
         })),
         count: rows.length,
       });
+    }
+
+    // ── Skill 系统（公共格式 data/skills/<name>/SKILL.md）──
+    if (method === 'GET' && p === '/api/skills') {
+      const { listSkills } = await import('../../packages/core/src/skills.ts');
+      return json(res, { skills: listSkills() });
+    }
+    if (method === 'POST' && p === '/api/skills/match') {
+      const { matchSkills } = await import('../../packages/core/src/skills.ts');
+      const body = await readBody(req);
+      const query = String(body.query ?? '').trim();
+      if (!query) return json(res, { matched: [] });
+      return json(res, { matched: matchSkills(query).map((m) => ({ name: m.skill.name, score: Number(m.score.toFixed(3)), body: m.body.slice(0, 200) })) });
+    }
+    if (method === 'POST' && p === '/api/skills/add') {
+      const { addSkill } = await import('../../packages/core/src/skills.ts');
+      const body = await readBody(req);
+      const name = String(body.name ?? '').trim();
+      const description = String(body.description ?? '').trim();
+      const content = String(body.content ?? '').trim();
+      const keywords = Array.isArray(body.keywords)
+        ? (body.keywords as string[]).map((s) => String(s).trim()).filter(Boolean)
+        : String(body.keywords ?? '').split(/[,，]/).map((s) => s.trim()).filter(Boolean);
+      if (!name || !content) return json(res, { error: '技能名与指令正文不能为空' }, 400);
+      try {
+        const skill = addSkill({ name, description, content, keywords });
+        return json(res, { ok: true, skill: { name: skill.name, description: skill.description, keywords: skill.keywords, enabled: skill.enabled } });
+      } catch (e) {
+        return json(res, { error: (e as Error).message }, 400);
+      }
+    }
+    if (method === 'POST' && p.startsWith('/api/skills/')) {
+      const { setSkillEnabled, deleteSkill } = await import('../../packages/core/src/skills.ts');
+      const name = decodeURIComponent(p.split('/')[3]);
+      const action = p.split('/')[4] ?? '';
+      try {
+        if (action === 'enable') return json(res, { ok: true, skill: setSkillEnabled(name, true) });
+        if (action === 'disable') return json(res, { ok: true, skill: setSkillEnabled(name, false) });
+        if (action === 'delete') { deleteSkill(name); return json(res, { ok: true }); }
+        return json(res, { error: `未知操作: ${action}` }, 400);
+      } catch (e) {
+        return json(res, { error: (e as Error).message }, 404);
+      }
     }
 
     // 健康检查

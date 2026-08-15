@@ -5,6 +5,7 @@ import { AssetsPanel } from './AssetsPanel.tsx';
 import { PluginsPanel } from './PluginsPanel.tsx';
 import { SessionSetup } from './SessionSetup.tsx';
 import { EditorPanel } from './EditorPanel.tsx';
+import { SkillsPanel } from './SkillsPanel.tsx';
 import { MarkdownMessage } from './MarkdownMessage.tsx';
 import { applyRegexRules } from '../../../packages/core/src/regex.ts';
 import type { RegexRule } from '../../../packages/core/src/regex.ts';
@@ -89,7 +90,7 @@ export function App() {
   const [busy, setBusy] = useState(false);
   const [initStage, setInitStage] = useState('');
   const [contentMode, setContentMode] = useState<'nsfw' | 'nsf'>('nsfw');
-  const [tab, setTab] = useState<'setup' | 'chat' | 'memory' | 'provider' | 'assets' | 'editor' | 'plugins'>('setup');
+  const [tab, setTab] = useState<'setup' | 'chat' | 'memory' | 'provider' | 'assets' | 'editor' | 'plugins' | 'skills'>('setup');
   const [error, setError] = useState('');
   const [adultOk, setAdultOk] = useState<boolean>(() => localStorage.getItem('jg-adult-ok') === '1');
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -100,6 +101,18 @@ export function App() {
   const [theme, setTheme] = useState<Theme>(() => (localStorage.getItem('jg-theme') as Theme) || 'dark');
   const [readFs, setReadFs] = useState<number>(() => Number(localStorage.getItem('jg-read-fs')) || 16);
   const [turnState, setTurnState] = useState<TurnState | null>(null);
+  // 生成计时器
+  const [genSeconds, setGenSeconds] = useState(0);
+  const genTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const startGenTimer = () => {
+    setGenSeconds(0);
+    if (genTimerRef.current) clearInterval(genTimerRef.current);
+    genTimerRef.current = setInterval(() => setGenSeconds((s) => s + 0.1), 100);
+  };
+  const stopGenTimer = () => {
+    if (genTimerRef.current) { clearInterval(genTimerRef.current); genTimerRef.current = null; }
+  };
+  useEffect(() => () => { if (genTimerRef.current) clearInterval(genTimerRef.current); }, []);
 
   // 主题应用到 <html data-theme>，字号写到 --read-fs 变量
   useEffect(() => {
@@ -165,19 +178,26 @@ export function App() {
     setInput('');
     setBusy(true);
     setError('');
+    startGenTimer();
     setMessages((m) => [...m, { id: nextMsgId(), round: 0, role: 'user', content: text }]);
     const replyId = nextMsgId();
     setMessages((m) => [...m, { id: replyId, round: 0, role: 'assistant', content: '' }]);
     try {
       await apiStream('/api/turn', { session: sessionId, input: text, content_mode: contentMode }, (ev) => {
         if (ev.type === 'delta' && typeof ev.text === 'string') {
+          // 真流式：逐字追加（MarkdownMessage 渐进渲染）
           setMessages((m) => m.map((x) => (x.id === replyId ? { ...x, content: x.content + ev.text } : x)));
+        }
+        if (ev.type === 'done' && typeof ev.prose === 'string') {
+          // 兜底：done 携带完整 prose，整体覆盖（保证流式片段/重试后最终一致）
+          setMessages((m) => m.map((x) => (x.id === replyId ? { ...x, content: ev.prose } : x)));
         }
         if (ev.type === 'error') setError(String(ev.message ?? '回合失败'));
       });
       // 回合结束 → 刷新推进槽（侧栏常驻）
       fetchTurnState(sessionId);
     } catch (e) { setError((e as Error).message); }
+    stopGenTimer();
     setBusy(false);
   };
 
@@ -259,6 +279,7 @@ export function App() {
           <button className={tab === 'provider' ? 'tab-active' : ''} onClick={() => setTab('provider')}>Provider</button>
           <button className={tab === 'assets' ? 'tab-active' : ''} onClick={() => setTab('assets')}>资产</button>
           <button className={tab === 'editor' ? 'tab-active' : ''} onClick={() => setTab('editor')}>编辑</button>
+          <button className={tab === 'skills' ? 'tab-active' : ''} onClick={() => setTab('skills')}>技能</button>
           <button className={tab === 'plugins' ? 'tab-active' : ''} onClick={() => setTab('plugins')}>插件</button>
         </div>
         {error && <p className="error">{error}</p>}
@@ -274,11 +295,18 @@ export function App() {
           <AssetsPanel sessionId={sessionId} />
         ) : tab === 'editor' ? (
           <EditorPanel />
+        ) : tab === 'skills' ? (
+          <SkillsPanel />
         ) : tab === 'plugins' ? (
           <PluginsPanel />
         ) : (
           <>
             <div className="messages">
+              {busy && (
+                <div className="gen-timer" title="从点击发送开始计时">
+                  <span className="gen-timer-spin" /> 正在生成… <b>{genSeconds.toFixed(1)}s</b>
+                </div>
+              )}
               {messages.length === 0 && !busy && (
                 <div className="empty">从左侧选择一张角色卡开始对话（首次需加载世界书 + 向量化，约 10 秒）</div>
               )}
