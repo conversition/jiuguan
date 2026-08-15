@@ -1,0 +1,13 @@
+export { MemoryDb } from './db.ts';
+export { RetrievalEngine } from './retrieval.ts';
+export { cosine, encodeF32, decodeF32 } from './retrieval.ts';
+export type { RecallQuery, RecallHit, RecallResult } from './retrieval.ts';
+export { WriteLoop } from './writer.ts';
+export type { MemoryDelta, StateChange, WriteResult } from './writer.ts';
+export { SCHEMA_V3, DEFAULT_WEIGHTS, DEFAULT_DROP_THRESHOLD, AM_CODE_RE, nextAmCode } from './schema.ts';
+export { MemoryService } from './api.ts';
+export type { MemoryServiceOptions } from './api.ts';
+export { HashEmbeddingProvider, TransformersEmbeddingProvider, createEmbeddingProvider } from './embedding.ts';
+export type { EmbeddingProvider } from './embedding.ts';
+export { Vectorizer } from './vectorize.ts';
+export type { VectorizeOptions, VectorizeResult, VecSource } from './vectorize.ts';

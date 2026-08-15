@@ -1,0 +1,21 @@
+{
+  "name": "@jiuguan/memory",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./schema": "./dist/schema.js",
+    "./retrieval": "./dist/retrieval.js",
+    "./writer": "./dist/writer.js",
+    "./db": "./dist/db.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --experimental-strip-types --experimental-transform-types tests/verify.ts",
+    "start": "node --experimental-strip-types --experimental-transform-types src/api.ts"
+  },
+  "dependencies": {}
+}

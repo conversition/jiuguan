@@ -1,0 +1,17 @@
+{
+  "name": "@jiuguan/sandbox",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./mvu": "./dist/mvu-sandbox.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --experimental-strip-types --experimental-transform-types tests/verify.ts"
+  },
+  "dependencies": {}
+}

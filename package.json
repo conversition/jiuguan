@@ -1,0 +1,46 @@
+{
+  "name": "jiuguan",
+  "private": true,
+  "version": "0.1.0",
+  "description": "酒馆提示词Agent - 下一代剧本游玩平台（headless-first MVP）",
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "tools/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "tsc -p packages/core/tsconfig.json && tsc -p packages/memory/tsconfig.json && tsc -p packages/prompt/tsconfig.json && tsc -p packages/proxy/tsconfig.json && tsc -p packages/variable/tsconfig.json",
+    "test:memory": "node --experimental-strip-types --experimental-transform-types packages/memory/tests/verify.ts",
+    "test:core": "node --experimental-strip-types --experimental-transform-types packages/core/tests/verify.ts && node --experimental-strip-types --experimental-transform-types packages/core/tests/verify-scanner.ts && node --experimental-strip-types --experimental-transform-types packages/core/tests/verify-preset.ts && node --experimental-strip-types --experimental-transform-types packages/core/tests/verify-assets.ts && node --experimental-strip-types --experimental-transform-types packages/core/tests/verify-regex.ts",
+    "test:proxy": "node --experimental-strip-types --experimental-transform-types packages/proxy/tests/verify-config.ts",
+    "test:prompt": "node --experimental-strip-types --experimental-transform-types packages/prompt/tests/verify.ts",
+    "test:variable": "node --experimental-strip-types --experimental-transform-types packages/variable/tests/verify.ts && node --experimental-strip-types --experimental-transform-types packages/variable/tests/verify-integration.ts && node --experimental-strip-types --experimental-transform-types packages/variable/tests/verify-persist.ts",
+    "test:sandbox": "node --experimental-strip-types --experimental-transform-types packages/sandbox/tests/verify.ts && node --experimental-strip-types --experimental-transform-types packages/sandbox/tests/verify-bridge.ts",
+    "test:plugin": "node --experimental-strip-types --experimental-transform-types packages/plugin/tests/verify.ts && node --experimental-strip-types --experimental-transform-types packages/plugin/tests/verify-runtime.ts && node --experimental-strip-types --experimental-transform-types packages/plugin/tests/verify-install.ts",
+    "test": "pnpm test:memory && pnpm test:core && pnpm test:proxy && pnpm test:prompt && pnpm test:variable && pnpm test:sandbox && pnpm test:plugin",
+    "turn-loop": "node --experimental-strip-types --experimental-transform-types tools/cli/turn-loop.ts",
+    "turn-runner": "node --experimental-strip-types --experimental-transform-types tools/cli/turn-runner.ts",
+    "session": "node --experimental-strip-types --experimental-transform-types tools/cli/session.ts",
+    "web:server": "node --experimental-strip-types --experimental-transform-types apps/server/server.ts",
+    "web:dev": "pnpm --filter @jiuguan/web dev",
+    "evaluate": "node --experimental-strip-types --experimental-transform-types tools/evaluator/run.ts",
+    "memory:serve": "node --experimental-strip-types --experimental-transform-types packages/memory/src/api.ts"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.31",
+    "@types/react-dom": "^18.3.7",
+    "@vitejs/plugin-react": "^4.7.0",
+    "typescript": "^5.9.3",
+    "vite": "^6.4.3",
+    "zod": "^4.4.3"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^4.2.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  }
+}

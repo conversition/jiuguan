@@ -1,0 +1,12 @@
+{
+  "name": "@jiuguan/evaluator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "start": "node --experimental-strip-types --experimental-transform-types run.ts",
+    "live": "node --experimental-strip-types --experimental-transform-types run.ts --live --rounds 10"
+  },
+  "dependencies": {}
+}

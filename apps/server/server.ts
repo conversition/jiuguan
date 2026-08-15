@@ -1,0 +1,533 @@
+/**
+ * Web API 服务（前后端软件的后端）
+ * 聚合 core/memory/prompt/proxy/variable 包，暴露 REST + SSE API：
+ *   GET  /api/cards                 → 可用角色卡列表
+ *   GET  /api/sessions              → 已有会话（DB 文件，含摘要名）
+ *   POST /api/session/new           {card} → SSE：创建会话（阶段进度：card→worldbook→vectorize→ready）
+ *   POST /api/session/resume        {db}   → 恢复会话
+ *   POST /api/turn                  {session, input, content_mode} → SSE：状态 + 模拟流式正文
+ *   GET  /api/session/:id/history   → 会话历史（chat_log）
+ * 会话实例进程内 Map + DB 文件持久化。
+ */
+import { createServer, IncomingMessage, ServerResponse } from 'node:http';
+import { readdirSync, existsSync, statSync, readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { ChatSession } from '../../tools/cli/session.ts';
+import { MemoryDb } from '../../packages/memory/src/db.ts';
+import { PluginRegistry } from '../../packages/plugin/src/registry.ts';
+import { listAssets, readAsset, saveUserAsset, deleteUserAsset } from '../../packages/core/src/asset-paths.ts';
+import { parseWorldBook } from '../../packages/core/src/worldbook.ts';
+import { RegexLibrary } from '../../packages/core/src/regex-library.ts';
+
+const PORT = Number(process.env.JG_WEB_PORT ?? 17800);
+const HOST = '127.0.0.1';
+const DATA_DIR = resolve('data');
+const CARDS_DIR = 'E:/claude cade test/project/jiuguanlike/剧本方案/角色卡';
+
+const sessions = new Map<string, ChatSession>();
+/** 插件注册表（插件市场：git URL 安装 / 启停 / 卸载 / 更新，数据在 data/plugins） */
+const pluginRegistry = new PluginRegistry(resolve('data', 'plugins'));
+/** 正则库（前端屏蔽隐藏 + 用户维护，数据在 data/regex-rules.json） */
+const regexLibrary = new RegexLibrary();
+
+function json(res: ServerResponse, obj: unknown, status = 200): void {
+  res.statusCode = status;
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.end(JSON.stringify(obj));
+}
+
+/** SSE 初始化 */
+function sse(res: ServerResponse): void {
+  res.statusCode = 200;
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+}
+function sseSend(res: ServerResponse, obj: unknown): void {
+  res.write(`data: ${JSON.stringify(obj)}\n\n`);
+}
+
+function readBody(req: IncomingMessage): Promise<Record<string, string>> {
+  return new Promise((resolveBody, reject) => {
+    let data = '';
+    req.on('data', (c: Buffer) => { data += c.toString('utf8'); });
+    req.on('end', () => { try { resolveBody(data ? JSON.parse(data) : {}); } catch (e) { reject(e); } });
+    req.on('error', reject);
+  });
+}
+
+/** 模拟流式分块（按标点/换行/60 字切） */
+function chunkText(text: string, size = 60): string[] {
+  const out: string[] = [];
+  const parts = text.split(/(?<=[。！？\n；])/);
+  let buf = '';
+  for (const p of parts) {
+    buf += p;
+    if (buf.length >= size || p.includes('\n')) {
+      out.push(buf);
+      buf = '';
+    }
+  }
+  if (buf) out.push(buf);
+  return out;
+}
+
+/** 读取会话 DB 摘要名（首条 assistant 消息前 15 字） */
+function sessionSummary(dbPath: string): string {
+  try {
+    const mem = new MemoryDb({ path: dbPath });
+    const row = mem.db.prepare("SELECT content FROM chat_log WHERE role='assistant' ORDER BY id LIMIT 1").get() as { content: string } | undefined;
+    mem.db.close();
+    if (row?.content) return row.content.replace(/\s+/g, ' ').slice(0, 15);
+  } catch { /* 保持 id 名 */ }
+  return '';
+}
+
+const server = createServer(async (req, res) => {
+  if (req.method === 'OPTIONS') { res.statusCode = 204; res.end(); return; }
+  try {
+    const url = new URL(req.url ?? '/', `http://${req.headers.host}`);
+    const p = url.pathname;
+    const method = req.method ?? 'GET';
+
+    // 角色卡列表
+    if (method === 'GET' && p === '/api/cards') {
+      const files = readdirSync(CARDS_DIR).filter((f) => f.endsWith('.json'));
+      return json(res, { cards: files.map((f) => ({ id: f, name: f.replace(/\.json$/, '') })) });
+    }
+
+    // 会话列表（data/*.db，含摘要名）
+    if (method === 'GET' && p === '/api/sessions') {
+      if (!existsSync(DATA_DIR)) return json(res, { sessions: [] });
+      const dbs = readdirSync(DATA_DIR).filter((f) => f.endsWith('.db'));
+      const list = dbs.map((f) => {
+        const dbPath = resolve(DATA_DIR, f);
+        const name = sessionSummary(dbPath) || f.replace(/\.db$/, '');
+        return { id: f.replace(/\.db$/, ''), file: f, name };
+      });
+      return json(res, { sessions: list });
+    }
+
+    // ── 插件市场（04 §4.1 / §7：git 安装 + 启停 + 卸载 + 更新）──
+    if (method === 'GET' && p === '/api/plugins') {
+      return json(res, { plugins: pluginRegistry.list() });
+    }
+    if (method === 'POST' && p === '/api/plugins/install') {
+      const body = await readBody(req);
+      const url = (body.url ?? '').trim();
+      if (!url) return json(res, { error: '缺少插件来源（git URL / 本地路径 / .zip）' }, 400);
+      try {
+        const rec = await pluginRegistry.install(url);
+        return json(res, { plugin: rec });
+      } catch (e) {
+        return json(res, { error: (e as Error).message.slice(0, 200) }, 400);
+      }
+    }
+    if (method === 'POST' && p.startsWith('/api/plugins/')) {
+      const id = p.split('/')[3];
+      const action = p.split('/')[4] ?? '';
+      if (action === 'enable' || action === 'disable') {
+        try { return json(res, { plugin: pluginRegistry.setEnabled(id, action === 'enable') }); }
+        catch (e) { return json(res, { error: (e as Error).message }, 404); }
+      }
+      if (action === 'uninstall') {
+        try { pluginRegistry.uninstall(id); return json(res, { ok: true }); }
+        catch (e) { return json(res, { error: (e as Error).message }, 404); }
+      }
+      if (action === 'update') {
+        try { return json(res, { plugin: await pluginRegistry.update(id) }); }
+        catch (e) { return json(res, { error: (e as Error).message.slice(0, 200) }, 400); }
+      }
+    }
+
+    // 新会话（SSE：阶段进度；启动流程审查 P0：入参收纳 世界书/预设/预设块勾选）
+    if (method === 'POST' && p === '/api/session/new') {
+      const body = await readBody(req);
+      const cardFile = body.card ?? '';
+      const cardPath = resolve(CARDS_DIR, cardFile);
+      if (!cardFile || !existsSync(cardPath) || !statSync(cardPath).isFile()) {
+        return json(res, { error: `角色卡不存在: ${cardFile}` }, 404);
+      }
+      sse(res);
+      const dbName = `session-${Date.now()}.db`;
+      const dbPath = resolve(DATA_DIR, dbName);
+      const mode = body.content_mode === 'nsf' ? 'nsf' : 'nsfw';
+      let presetOverrides: Record<string, boolean> | undefined;
+      if (body.preset_overrides && typeof body.preset_overrides === 'object') {
+        presetOverrides = body.preset_overrides as Record<string, boolean>;
+      }
+      const session = new ChatSession({
+        card: cardPath, db: dbPath, resume: false, useBge: true, contentMode: mode,
+        worldbooks: Array.isArray(body.worldbooks) ? body.worldbooks.map(String) : undefined,
+        preset: typeof body.preset === 'string' && body.preset ? body.preset : undefined,
+        presetOverrides,
+      });
+      await session.init((stage) => sseSend(res, { type: 'stage', stage }));
+      const id = dbName.replace(/\.db$/, '');
+      sessions.set(id, session);
+      sseSend(res, { type: 'ready', id, greeting: session.getGreeting(), card: session.getCardName(), db: dbName, contentMode: mode, config: session.getSessionConfig() });
+      res.end();
+      return;
+    }
+
+    // 恢复会话
+    if (method === 'POST' && p === '/api/session/resume') {
+      const body = await readBody(req);
+      const dbName = body.db ?? '';
+      const dbPath = resolve(DATA_DIR, dbName);
+      if (!existsSync(dbPath)) return json(res, { error: '会话不存在' }, 404);
+      const id = dbName.replace(/\.db$/, '');
+      const session = sessions.get(id) ?? new ChatSession({ db: dbPath, resume: true, useBge: false });
+      if (!sessions.has(id)) await session.init();
+      sessions.set(id, session);
+      return json(res, { id });
+    }
+
+    // 单轮对话（SSE：状态 + 模拟流式正文）
+    if (method === 'POST' && p === '/api/turn') {
+      const body = await readBody(req);
+      const session = sessions.get(body.session ?? '');
+      if (!session) return json(res, { error: '会话不存在，请先创建或恢复' }, 404);
+      const input = (body.input ?? '').trim();
+      if (!input) return json(res, { error: '输入为空' }, 400);
+
+      sse(res);
+      sseSend(res, { type: 'status', stage: 'thinking' });
+      try {
+        const mode = body.content_mode === 'nsf' ? 'nsf' : 'nsfw';
+        const prose = await session.turn(input, mode as 'nsfw' | 'nsf');
+        sseSend(res, { type: 'status', stage: 'streaming' });
+        const chunks = chunkText(prose);
+        for (const c of chunks) {
+          sseSend(res, { type: 'delta', text: c });
+        }
+        sseSend(res, { type: 'done', prose });
+      } catch (e) {
+        sseSend(res, { type: 'error', message: (e as Error).message.slice(0, 200) });
+      }
+      res.end();
+      return;
+    }
+
+    // 会话历史
+    if (method === 'GET' && p.startsWith('/api/session/') && p.endsWith('/history')) {
+      const id = p.split('/')[3];
+      const session = sessions.get(id);
+      if (!session) return json(res, { error: '会话不存在' }, 404);
+      return json(res, { messages: session.getHistory() });
+    }
+
+    // 会话配置（启动流程审查：世界书/预设/引擎 回显）
+    if (method === 'GET' && p.startsWith('/api/session/') && p.endsWith('/config')) {
+      const id = p.split('/')[3];
+      const session = sessions.get(id);
+      if (!session) return json(res, { error: '会话不存在' }, 404);
+      return json(res, { config: session.getSessionConfig() });
+    }
+
+    // 记忆控制台：双通道检索调试
+    if (method === 'POST' && p.startsWith('/api/session/') && p.endsWith('/memory-search')) {
+      const id = p.split('/')[3];
+      const session = sessions.get(id);
+      if (!session) return json(res, { error: '会话不存在' }, 404);
+      const body = await readBody(req);
+      const query = (body.query ?? '').trim();
+      if (!query) return json(res, { error: '查询为空' }, 400);
+      const r = session.debugSearch(query);
+      return json(res, {
+        hits: r.hits.map((h) => ({ code: h.code, category: h.category, source: h.source, score: Number(h.score.toFixed(3)), confidence: h.confidence, content: h.content.slice(0, 80) })),
+        layerStats: r.layerStats,
+        elapsedMs: r.elapsedMs,
+      });
+    }
+
+    // 记忆控制台：状态表 + 大纲表 + 元数据
+    if (method === 'GET' && p.startsWith('/api/session/') && (p.endsWith('/memory-state') || p.endsWith('/memory-arc') || p.endsWith('/memory-meta'))) {
+      const id = p.split('/')[3];
+      const session = sessions.get(id);
+      if (!session) return json(res, { error: '会话不存在' }, 404);
+      if (p.endsWith('/memory-state')) return json(res, { states: session.getStateRows() });
+      if (p.endsWith('/memory-arc')) return json(res, { arcs: session.getArcRows() });
+      return json(res, { meta: session.getMeta() });
+    }
+
+    // 世界书激活调试（P2）
+    if (method === 'POST' && p.startsWith('/api/session/') && p.endsWith('/lorebook-scan')) {
+      const id = p.split('/')[3];
+      const session = sessions.get(id);
+      if (!session) return json(res, { error: '会话不存在' }, 404);
+      const body = await readBody(req);
+      const input = (body.input ?? '').trim();
+      if (!input) return json(res, { error: '输入为空' }, 400);
+      const r = session.debugScan(input);
+      return json(res, {
+        activated: r.activated.map((e) => ({ comment: e.comment, matchType: e.matchType, content: e.content.slice(0, 60), constant: e.constant })),
+        stats: r.stats,
+      });
+    }
+
+    // 变量控制台（VMS：声明 + 求值 + 依赖分层）
+    if (method === 'GET' && p.startsWith('/api/session/') && p.endsWith('/variables')) {
+      const id = p.split('/')[3];
+      const session = sessions.get(id);
+      if (!session) return json(res, { error: '会话不存在' }, 404);
+      const v = session.getVariables();
+      return json(res, {
+        decls: v.decls.map((d) => ({ name: d[0], type: d[1], expr: d[2] })),
+        values: v.values,
+        layers: v.layers,
+        errors: v.errors,
+      });
+    }
+
+    // 推进槽 / 事件类型 / NSFW 锁定（P2）
+    if (method === 'GET' && p.startsWith('/api/session/') && p.endsWith('/turn-state')) {
+      const id = p.split('/')[3];
+      const session = sessions.get(id);
+      if (!session) return json(res, { error: '会话不存在' }, 404);
+      return json(res, { state: session.getTurnState() });
+    }
+
+    // Provider 配置（非敏感：不含 key）
+    if (method === 'GET' && p === '/api/provider') {
+      const cfg = (await import('../../packages/proxy/src/config.ts')).loadProviderConfig();
+      return json(res, { baseUrl: cfg.baseUrl, model: cfg.model, kind: cfg.kind, prefixCacheThreshold: cfg.prefixCacheThreshold, hasKey: Boolean(cfg.apiKey) });
+    }
+
+    // Provider 测试连接（模型列表）
+    if (method === 'POST' && p === '/api/provider/test') {
+      const { loadProviderConfig } = await import('../../packages/proxy/src/config.ts');
+      const { OpenAICompatibleClient } = await import('../../packages/proxy/src/client.ts');
+      const cfg = loadProviderConfig();
+      const client = new OpenAICompatibleClient(cfg);
+      const models = await client.listModels();
+      return json(res, { ok: true, models: models.slice(0, 30), count: models.length });
+    }
+
+    // Provider 写 key（启动流程审查 P0-2：UI 填写 → data/provider.json，不回显；新会话即时生效）
+    if (method === 'POST' && p === '/api/provider/key') {
+      const { writeProviderJson, loadProviderConfig } = await import('../../packages/proxy/src/config.ts');
+      const body = await readBody(req);
+      const apiKey = (body.apiKey ?? '').toString().trim();
+      if (!apiKey) return json(res, { error: 'API key 为空' }, 400);
+      writeProviderJson({ apiKey });
+      const cfg = loadProviderConfig();
+      return json(res, { ok: true, hasKey: Boolean(cfg.apiKey), baseUrl: cfg.baseUrl, model: cfg.model });
+    }
+
+    // ── P3 资产工具 ──
+
+    // 正则调试器：测试 findRegex 对输入文本的匹配/替换（P3）
+    if (method === 'POST' && p === '/api/regex/test') {
+      const body = await readBody(req);
+      const pattern = (body.findRegex ?? '').trim();
+      const text = body.text ?? '';
+      if (!pattern) return json(res, { error: '正则为空' }, 400);
+      let re: RegExp;
+      try {
+        // 支持 /pattern/flags 与纯 pattern 两种格式
+        const m = pattern.match(/^\/([\s\S]*)\/([gimsuy]*)$/);
+        re = m ? new RegExp(m[1], m[2]) : new RegExp(pattern, 'g');
+      } catch (e) {
+        return json(res, { error: `正则非法: ${(e as Error).message.slice(0, 60)}` }, 400);
+      }
+      const flags = re.flags.includes('g') ? re.flags : `${re.flags}g`;
+      const gRe = new RegExp(re.source, flags);
+      const matches: { index: number; text: string }[] = [];
+      let m2: RegExpExecArray | null;
+      let count = 0;
+      while ((m2 = gRe.exec(text)) !== null && count < 100) {
+        matches.push({ index: m2.index, text: m2[0].slice(0, 60) });
+        count++;
+        if (m2.index === gRe.lastIndex) gRe.lastIndex++;
+      }
+      const replaceString = body.replaceString ?? '';
+      const replaced = replaceString ? text.replace(new RegExp(re.source, flags.includes('g') ? flags : `${flags}g`), replaceString) : undefined;
+      return json(res, { matches, count, replaced: replaced !== undefined ? replaced.slice(0, 2000) : undefined });
+    }
+
+    // ── 正则库（前端屏蔽隐藏 + 用户维护）──
+    // 规则列表（builtin + user + card 合并）
+    if (method === 'GET' && p === '/api/regex-rules') {
+      return json(res, { rules: regexLibrary.list() });
+    }
+
+    // 保存/更新规则（builtin 可覆盖启用状态）
+    if (method === 'POST' && p === '/api/regex-rules/save') {
+      const body = await readBody(req);
+      const rule = body.rule as unknown as Record<string, unknown>;
+      if (!rule || typeof rule.id !== 'string' || typeof rule.findRegex !== 'string') {
+        return json(res, { error: '规则缺少 id/findRegex' }, 400);
+      }
+      const saved = regexLibrary.save({
+        id: rule.id,
+        name: String(rule.name ?? rule.id),
+        findRegex: rule.findRegex,
+        replaceString: String(rule.replaceString ?? ''),
+        enabled: rule.enabled !== false,
+        scope: (rule.scope === 'prompt' || rule.scope === 'both' ? rule.scope : 'display') as 'display' | 'prompt' | 'both',
+        source: 'user',
+        note: typeof rule.note === 'string' ? rule.note : undefined,
+        order: Number(rule.order ?? 999),
+      });
+      return json(res, { rule: saved });
+    }
+
+    // 删除用户/卡片规则
+    if (method === 'POST' && p === '/api/regex-rules/delete') {
+      const body = await readBody(req);
+      const id = (body.id ?? '').toString();
+      const removed = id ? regexLibrary.remove(id) : false;
+      return json(res, { ok: true, removed, id });
+    }
+
+    // 从角色卡智能导入正则脚本
+    if (method === 'POST' && p === '/api/regex-rules/import-card') {
+      const body = await readBody(req);
+      const cardFile = (body.card ?? '').toString();
+      const cardPath = resolve(CARDS_DIR, cardFile);
+      if (!cardFile || !existsSync(cardPath) || !statSync(cardPath).isFile()) {
+        return json(res, { error: `角色卡不存在: ${cardFile}` }, 404);
+      }
+      const { parseCharaCard } = await import('../../packages/core/src/chara.ts');
+      const parsed = parseCharaCard(readFileSync(cardPath, 'utf8'));
+      const result = regexLibrary.importFromCard(parsed.regexScripts);
+      return json(res, { ok: true, ...result, total: regexLibrary.list().length });
+    }
+
+    // ── 资产编辑器（P2 非只读：用户层 data/{presets,worldbooks} 优先于源）──
+    // 预设列表（用户层 + 源，source 标记）
+    if (method === 'GET' && p === '/api/presets') {
+      return json(res, { presets: listAssets('preset').map((a) => ({ id: a.file, name: a.name, source: a.source })) });
+    }
+
+    // 预设内容（prompt 块，含全文 content 供编辑器）
+    if (method === 'GET' && p.startsWith('/api/preset/')) {
+      const file = decodeURIComponent(p.slice('/api/preset/'.length));
+      const asset = readAsset('preset', file);
+      if (!asset) return json(res, { error: '预设不存在' }, 404);
+      const raw = JSON.parse(asset.raw) as { prompts?: { role?: string; name?: string; enabled?: boolean; content?: string }[]; name?: string };
+      const prompts = (raw.prompts ?? []).map((pr, i) => ({
+        index: i,
+        role: pr.role ?? 'user',
+        name: pr.name ?? '',
+        enabled: pr.enabled !== false,
+        content: pr.content ?? '',
+        contentLen: (pr.content ?? '').length,
+        preview: (pr.content ?? '').replace(/\s+/g, ' ').slice(0, 60),
+      }));
+      return json(res, { name: raw.name ?? file.replace(/\.json$/, ''), promptCount: prompts.length, prompts, source: asset.source });
+    }
+
+    // 预设保存（写用户层 data/presets/<file>；重名=另存为）
+    if (method === 'POST' && p === '/api/preset/save') {
+      const body = await readBody(req);
+      const file = (body.file ?? '').trim();
+      const prompts = Array.isArray(body.prompts) ? body.prompts as { role?: string; name?: string; enabled?: boolean; content?: string }[] : [];
+      if (!file) return json(res, { error: '缺少文件名' }, 400);
+      if (prompts.some((x) => typeof x.content !== 'string')) return json(res, { error: 'prompts 缺少 content' }, 400);
+      const payload = JSON.stringify({ name: body.name ?? file.replace(/\.json$/, ''), prompts }, null, 2);
+      const path = saveUserAsset('preset', file, payload);
+      return json(res, { ok: true, file, path: path.replace(process.cwd(), '.'), source: 'user', promptCount: prompts.length });
+    }
+
+    // 预设删除（仅用户层副本，恢复源）
+    if (method === 'POST' && p === '/api/preset/delete') {
+      const body = await readBody(req);
+      const file = (body.file ?? '').trim();
+      const removed = file ? deleteUserAsset('preset', file) : false;
+      return json(res, { ok: true, removed, file });
+    }
+
+    // 世界书列表（用户层 + 源）
+    if (method === 'GET' && p === '/api/worldbooks') {
+      return json(res, { worldbooks: listAssets('worldbook').map((a) => ({ id: a.file, name: a.name, source: a.source })) });
+    }
+
+    // 世界书全量条目（编辑器）
+    if (method === 'GET' && p.startsWith('/api/worldbook/')) {
+      const file = decodeURIComponent(p.slice('/api/worldbook/'.length));
+      const asset = readAsset('worldbook', file);
+      if (!asset) return json(res, { error: '世界书不存在' }, 404);
+      const wb = parseWorldBook(asset.raw);
+      return json(res, {
+        file, name: file.replace(/\.json$/, ''), source: asset.source,
+        entries: wb.entries.map((e) => ({
+          uid: String(e.uid ?? ''),
+          key: e.key ?? [],
+          comment: e.comment ?? '',
+          content: e.content ?? '',
+          constant: Boolean(e.constant),
+          selective: Boolean(e.selective),
+          use_regex: Boolean(e.use_regex),
+          triggers: e.triggers ?? [],
+          probability: Number(e.extensions?.probability ?? e.probability ?? 100),
+          useProbability: Boolean(e.extensions?.useProbability ?? e.useProbability ?? false),
+          active: !e.disable,
+          depth: e.depth ?? 0,
+        })),
+      });
+    }
+
+    // 世界书保存（写用户层 data/worldbooks/<file>，ST v1.12 entries 格式）
+    if (method === 'POST' && p === '/api/worldbook/save') {
+      const body = await readBody(req);
+      const file = (body.file ?? '').trim();
+      const entries = Array.isArray(body.entries) ? body.entries as Record<string, unknown>[] : [];
+      if (!file) return json(res, { error: '缺少文件名' }, 400);
+      const record: Record<string, unknown> = {};
+      for (const e of entries) {
+        const uid = String(e.uid ?? `e${Object.keys(record).length + 1}`);
+        const { uid: _uid, ...rest } = e;
+        record[uid] = { ...rest, uid: Number(uid) || uid };
+      }
+      const payload = JSON.stringify({ entries: record }, null, 2);
+      const path = saveUserAsset('worldbook', file, payload);
+      return json(res, { ok: true, file, path: path.replace(process.cwd(), '.'), source: 'user', count: entries.length });
+    }
+
+    // 世界书删除（仅用户层副本）
+    if (method === 'POST' && p === '/api/worldbook/delete') {
+      const body = await readBody(req);
+      const file = (body.file ?? '').trim();
+      const removed = file ? deleteUserAsset('worldbook', file) : false;
+      return json(res, { ok: true, removed, file });
+    }
+
+    // 会话内世界书条目浏览（lorebook_entry）
+    if (method === 'GET' && p.startsWith('/api/session/') && p.endsWith('/lorebook-entries')) {
+      const id = p.split('/')[3];
+      const session = sessions.get(id);
+      if (!session) return json(res, { error: '会话不存在' }, 404);
+      const mem = (session as unknown as { getMemory(): { mem: { db: import('node:sqlite').DatabaseSync } } }).getMemory().mem.db;
+      const rows = mem.prepare('SELECT id, book, comment, key, content, use_regex, probability, active FROM lorebook_entry ORDER BY id LIMIT 300').all() as {
+        id: number; book: string; comment: string; key: string; content: string; use_regex: number; probability: number; active: number;
+      }[];
+      return json(res, {
+        entries: rows.map((r) => ({
+          id: r.id, book: r.book, comment: r.comment, key: r.key, useRegex: r.use_regex === 1,
+          probability: r.probability, active: r.active === 1, preview: r.content.replace(/\s+/g, ' ').slice(0, 60),
+        })),
+        count: rows.length,
+      });
+    }
+
+    // 健康检查
+    if (method === 'GET' && p === '/api/health') {
+      return json(res, { ok: true, sessions: sessions.size });
+    }
+
+    return json(res, { error: `not found: ${method} ${p}` }, 404);
+  } catch (e) {
+    return json(res, { error: (e as Error).message.slice(0, 200) }, 500);
+  }
+});
+
+server.listen(PORT, HOST, () => {
+  console.log(`[web-api] http://${HOST}:${PORT}`);
+  console.log(`[web-api] GET /api/cards | POST /api/session/new(SSE) | POST /api/turn(SSE)`);
+});

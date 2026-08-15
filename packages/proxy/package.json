@@ -1,0 +1,18 @@
+{
+  "name": "@jiuguan/proxy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./client": "./dist/client.js",
+    "./config": "./dist/config.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --experimental-strip-types --experimental-transform-types tests/verify.ts"
+  },
+  "dependencies": {}
+}

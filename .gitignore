@@ -1,0 +1,19 @@
+# 依赖与构建
+node_modules/
+dist/
+.pnpm-store/
+
+# 密钥与本地配置
+.env.local
+.env
+
+# 运行时数据（会话 DB / 插件 / 用户层资产 / provider.json / vendor）
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# 日志 / 系统杂项
+*.log
+Thumbs.db
+.DS_Store

@@ -1,0 +1,12 @@
+{
+  "name": "style-tight",
+  "display_name": "冷冽叙事文风插件",
+  "version": "1.0.0",
+  "description": "注入冷冽叙事文风指令；回合后自动剔除\"（笑）\"等出戏符号。演示 onMessageSend / onProsePostProcess / storage 钩子。",
+  "author": "jiuguan",
+  "homepage": "",
+  "license": "MIT",
+  "includes": [],
+  "server": "server.js",
+  "hooks": ["onMessageSend", "onProsePostProcess", "onSessionStart", "onSessionEnd"]
+}
