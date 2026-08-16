@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { StoryboardPanel } from './StoryboardPanel.tsx';
 
 const API = (import.meta as unknown as { env: Record<string, string> }).env?.VITE_API_BASE ?? '';
 
@@ -15,13 +16,15 @@ const STAGE_LABEL: Record<string, string> = {
   ready: '就绪',
 };
 
-/** 新建会话前置面板（启动流程审查 P1：选卡 + 世界书多选 + 预设块勾选 + content_mode → 会话入参） */
+type CreateMode = 'nsfw' | 'nsf' | 'director';
+
+/** 新建创作前置面板（创作模式三项并列：NSFW / NSF / 导演分镜；对话走会话入参，分镜走编排器） */
 export function SessionSetup({ onCreated }: { onCreated: (sid: string, greeting: string, card: string, mode: string) => void }) {
   const [cards, setCards] = useState<CardInfo[] | null>(null);
   const [worldbooks, setWorldbooks] = useState<WorldbookInfo[] | null>(null);
   const [presets, setPresets] = useState<PresetInfo[] | null>(null);
   const [card, setCard] = useState('');
-  const [mode, setMode] = useState<'nsfw' | 'nsf'>('nsfw');
+  const [mode, setMode] = useState<CreateMode>('nsfw');
   const [selectedBooks, setSelectedBooks] = useState<string[]>([]);
   const [preset, setPreset] = useState('');
   const [blocks, setBlocks] = useState<PresetBlock[] | null>(null);
@@ -126,73 +129,90 @@ export function SessionSetup({ onCreated }: { onCreated: (sid: string, greeting:
 
   return (
     <div className="console">
-      <h2>新建会话</h2>
+      <h2>新建创作</h2>
+
+      {/* 创作模式：NSFW / NSF / 导演分镜 三项并列 */}
       <section className="console-section">
-        <h3>1. 角色卡</h3>
-        {cards === null ? <p className="hint">加载中…</p> : (
-          <div className="setup-grid">
-            {cards.map((c) => (
-              <button key={c.id} className={`setup-item${card === c.id ? ' setup-active' : ''}`} onClick={() => setCard(c.id)}>
-                {c.name.replace(/\.json$/, '')}
-              </button>
-            ))}
+        <h3>创作模式</h3>
+        <div className="setup-grid">
+          <button className={`setup-item${mode === 'nsfw' ? ' setup-active' : ''}`} onClick={() => setMode('nsfw')}>NSFW（成年向对话）</button>
+          <button className={`setup-item${mode === 'nsf' ? ' setup-active' : ''}`} onClick={() => setMode('nsf')}>NSF（纯净对话）</button>
+          <button className={`setup-item${mode === 'director' ? ' setup-active' : ''}`} onClick={() => setMode('director')}>导演分镜（分镜创作）</button>
+        </div>
+      </section>
+
+      {mode === 'director' ? (
+        <StoryboardPanel />
+      ) : (
+        <>
+          <section className="console-section">
+            <h3>1. 角色卡</h3>
+            {cards === null ? <p className="hint">加载中…</p> : (
+              <div className="setup-grid">
+                {cards.map((c) => (
+                  <button key={c.id} className={`setup-item${card === c.id ? ' setup-active' : ''}`} onClick={() => setCard(c.id)}>
+                    {c.name.replace(/\.json$/, '')}
+                  </button>
+                ))}
+              </div>
+            )}
+          </section>
+
+          <section className="console-section">
+            <h3>2. 世界书（多选；留空 = 按 content_mode 默认）</h3>
+            {worldbooks === null ? <p className="hint">加载中…</p> : (
+              <div className="setup-grid">
+                {worldbooks.map((w) => (
+                  <label key={w.id} className={`setup-item setup-check${selectedBooks.includes(w.id) ? ' setup-active' : ''}`}>
+                    <input type="checkbox" checked={selectedBooks.includes(w.id)} onChange={() => toggleBook(w.id)} />
+                    {w.name}
+                  </label>
+                ))}
+              </div>
+            )}
+          </section>
+
+          <section className="console-section">
+            <h3>3. 预设（可选；勾选生效块，未勾选 = 不加载预设）</h3>
+            <select value={preset} onChange={(e) => openPreset(e.target.value)}>
+              <option value="">（不加载预设）</option>
+              {(presets ?? []).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+            </select>
+            {blocks && (
+              <div className="preset-blocks">
+                <div className="preset-block-head">
+                  <span>共 {blocks.length} 块，已选 {Object.values(overrides).filter(Boolean).length} 块（注入 {'<预设>'}）</span>
+                </div>
+                {blocks.map((b) => (
+                  <label key={b.index} className={`preset-block${overrides[b.index] ? ' preset-block-on' : ''}`}>
+                    <input
+                      type="checkbox"
+                      checked={overrides[b.index] === true}
+                      onChange={(e) => setOverrides((prev) => ({ ...prev, [b.index]: e.target.checked }))}
+                    />
+                    <span className="preset-block-name">{b.name || `块${b.index + 1}`} <small>({b.contentLen}字)</small></span>
+                    <span className="muted">{b.preview}</span>
+                  </label>
+                ))}
+              </div>
+            )}
+          </section>
+
+          <section className="console-section">
+            <h3>4. 内容分支（{mode === 'nsfw' ? 'NSFW 成年向' : 'NSF 纯净'}）</h3>
+            <select value={mode} onChange={(e) => setMode(e.target.value as 'nsfw' | 'nsf')}>
+              <option value="nsfw">NSFW（成年向）</option>
+              <option value="nsf">NSF（纯净）</option>
+            </select>
+          </section>
+
+          {stage && <p className="progress">{STAGE_LABEL[stage] ?? stage}</p>}
+          {error && <p className="error">{error}</p>}
+          <div className="row">
+            <button onClick={create} disabled={busy || !card}>创建会话并开始</button>
           </div>
-        )}
-      </section>
-
-      <section className="console-section">
-        <h3>2. 世界书（多选；留空 = 按 content_mode 默认）</h3>
-        {worldbooks === null ? <p className="hint">加载中…</p> : (
-          <div className="setup-grid">
-            {worldbooks.map((w) => (
-              <label key={w.id} className={`setup-item setup-check${selectedBooks.includes(w.id) ? ' setup-active' : ''}`}>
-                <input type="checkbox" checked={selectedBooks.includes(w.id)} onChange={() => toggleBook(w.id)} />
-                {w.name}
-              </label>
-            ))}
-          </div>
-        )}
-      </section>
-
-      <section className="console-section">
-        <h3>3. 预设（可选；勾选生效块，未勾选 = 不加载预设）</h3>
-        <select value={preset} onChange={(e) => openPreset(e.target.value)}>
-          <option value="">（不加载预设）</option>
-          {(presets ?? []).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
-        </select>
-        {blocks && (
-          <div className="preset-blocks">
-            <div className="preset-block-head">
-              <span>共 {blocks.length} 块，已选 {Object.values(overrides).filter(Boolean).length} 块（注入 {'<预设>'}）</span>
-            </div>
-            {blocks.map((b) => (
-              <label key={b.index} className={`preset-block${overrides[b.index] ? ' preset-block-on' : ''}`}>
-                <input
-                  type="checkbox"
-                  checked={overrides[b.index] === true}
-                  onChange={(e) => setOverrides((prev) => ({ ...prev, [b.index]: e.target.checked }))}
-                />
-                <span className="preset-block-name">{b.name || `块${b.index + 1}`} <small>({b.contentLen}字)</small></span>
-                <span className="muted">{b.preview}</span>
-              </label>
-            ))}
-          </div>
-        )}
-      </section>
-
-      <section className="console-section">
-        <h3>4. 内容分支</h3>
-        <select value={mode} onChange={(e) => setMode(e.target.value as 'nsfw' | 'nsf')}>
-          <option value="nsfw">NSFW（成年向）</option>
-          <option value="nsf">NSF（纯净）</option>
-        </select>
-      </section>
-
-      {stage && <p className="progress">{STAGE_LABEL[stage] ?? stage}</p>}
-      {error && <p className="error">{error}</p>}
-      <div className="row">
-        <button onClick={create} disabled={busy || !card}>创建会话并开始</button>
-      </div>
+        </>
+      )}
     </div>
   );
 }

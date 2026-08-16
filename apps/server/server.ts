@@ -18,6 +18,12 @@ import { PluginRegistry } from '../../packages/plugin/src/registry.ts';
 import { listAssets, readAsset, saveUserAsset, deleteUserAsset } from '../../packages/core/src/asset-paths.ts';
 import { parseWorldBook } from '../../packages/core/src/worldbook.ts';
 import { RegexLibrary } from '../../packages/core/src/regex-library.ts';
+import { StoryboardOrchestrator, StoryboardRegistry, DEFAULT_WORKFLOW } from '../../tools/cli/storyboard-orchestrator.ts';
+import { OpenAICompatibleClient } from '../../packages/proxy/src/client.ts';
+import { RetrievalEngine } from '../../packages/memory/src/retrieval.ts';
+import { HashEmbeddingProvider, createEmbeddingProvider } from '../../packages/memory/src/embedding.ts';
+import { LorebookScanner } from '../../packages/core/src/scanner.ts';
+import { VariableManager } from '../../packages/variable/src/vms.ts';
 
 const PORT = Number(process.env.JG_WEB_PORT ?? 17800);
 const HOST = '127.0.0.1';
@@ -561,6 +567,79 @@ const server = createServer(async (req, res) => {
       } catch (e) {
         return json(res, { error: (e as Error).message }, 404);
       }
+    }
+
+    // ── 导演分镜（第三个创作选项，Commit B 前端入口）──
+    // 工作流列表 + 默认导演之声池
+    if (method === 'GET' && p === '/api/storyboard/workflows') {
+      try {
+        const registry = new StoryboardRegistry();
+        const workflows = registry.list();
+        const voices = workflows.includes(DEFAULT_WORKFLOW) ? registry.get(DEFAULT_WORKFLOW).voices : [];
+        return json(res, { workflows, defaultWorkflow: DEFAULT_WORKFLOW, voices });
+      } catch (e) {
+        return json(res, { error: `工作流注册表不可用: ${(e as Error).message.slice(0, 120)}` }, 500);
+      }
+    }
+
+    // 执行分镜（SSE：stage 阶段进度 → done 结果摘要）
+    if (method === 'POST' && p === '/api/storyboard/run') {
+      const body = await readBody(req);
+      const scene = (body.scene ?? '').toString().trim();
+      if (!scene) return json(res, { error: '场景描述为空' }, 400);
+      sse(res);
+      try {
+        const cfg = (await import('../../packages/proxy/src/config.ts')).loadProviderConfig();
+        (await import('../../packages/proxy/src/config.ts')).assertProviderReady(cfg);
+        const mem = new MemoryDb({ path: resolve(DATA_DIR, `storyboard-${Date.now()}.db`) });
+        const ret = new RetrievalEngine(mem);
+        try {
+          ret.setEmbeddingProvider(await createEmbeddingProvider(true));
+        } catch {
+          ret.setEmbeddingProvider(new HashEmbeddingProvider());
+        }
+        const orch = new StoryboardOrchestrator({
+          client: new OpenAICompatibleClient(cfg),
+          ret,
+          scanner: new LorebookScanner(mem),
+          vms: new VariableManager(),
+          mem,
+          cardName: '导演分镜',
+          round: 1,
+        });
+        const result = await orch.run(
+          scene,
+          {
+            mode: body.mode === 'shot' ? 'shot' : 'batch',
+            shotCount: Math.min(30, Math.max(1, Number(body.shots ?? 9))),
+            workflow: typeof body.workflow === 'string' && body.workflow ? body.workflow : undefined,
+            voice: typeof body.voice === 'string' && body.voice ? body.voice : undefined,
+          },
+          (label, detail) => sseSend(res, { type: 'stage', label, detail: detail ?? '' }),
+        );
+        sseSend(res, {
+          type: 'done',
+          passed: result.passed,
+          voice: result.directorsRead?.voice ?? '',
+          intention: result.directorsRead?.intention ?? '',
+          panels: result.panels.map((p) => ({
+            panel: p.panel, time: p.time, shot_size: p.shot_size, angle: p.angle,
+            transition_hint: p.transition_hint, positive_prompt_short: p.positive_prompt_short,
+          })),
+          sequence: result.sequence ? {
+            master_prompt: result.sequence.master_prompt.slice(0, 400), narrative: result.sequence.narrative.slice(0, 400),
+            consistency: result.sequence.consistency.slice(0, 200), sfx: result.sequence.sfx.slice(0, 200),
+          } : null,
+          humanized: result.humanized?.summary ?? '',
+          validation: result.validation,
+          errors: result.errors.slice(0, 12),
+          warnings: result.warnings.slice(0, 12),
+        });
+      } catch (e) {
+        sseSend(res, { type: 'error', message: (e as Error).message.slice(0, 200) });
+      }
+      res.end();
+      return;
     }
 
     // 健康检查
