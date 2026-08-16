@@ -40,7 +40,7 @@
 │ core       │ │ memory      │ │ prompt     │ │ proxy       │ │ variable    │ │ sandbox/plug │
 │ 卡/世界书/ │ │ SQLite      │ │ L0-L6 装配 │ │ OpenAI兼容  │ │ VMS 变量    │ │ MVU沙箱     │
 │ 预设/正则  │ │ FTS5 trigram│ │ game_turn  │ │ provider自适应│ │ DSL白名单   │ │ 插件git安装 │
-│ 资产解析   │ │ +vec BLOB   │ │ 宏展开     │ │ 缓存/流式   │ │ 依赖图并行  │ │ node:vm钩子 │
+│ 资产解析   │ │ +vec BLOB   │ │ 宏展开     │ │ 缓存/流式   │ │ 依赖图分层  │ │ node:vm钩子 │
 └────────────┘ │ RRF融合+写环│ │ 容错/归一化│ └─────────────┘ │ 持久化      │ └─────────────┘
                └─────────────┘              └───────────────┘
 ┌────────────────────────────────────────── tools/cli ──────────────────────────────────────┐
@@ -85,7 +85,7 @@
 
 ### 变量管理 VMS `packages/variable`
 - 三源命名空间 `scope:source:name`（session>scene>card>book>preset>sys 覆盖优先级）
-- **DSL 白名单求值器**（算术/比较/逻辑/`{ref}`/min/max/clamp/roll/len/concat）+ **依赖图拓扑分层**（同层可并行，Kahn 循环检测）
+- **DSL 白名单求值器**（算术/比较/逻辑/`{ref}`/min/max/clamp/roll/len/concat）+ **依赖图拓扑分层**（同层无依赖，Kahn 循环检测）
 - 持久化：`memory_state(entity_type='variable')` 快照 + 恢复（仅 literal，derived 重算）
 
 ### MVU 引擎沙箱 `packages/sandbox`
