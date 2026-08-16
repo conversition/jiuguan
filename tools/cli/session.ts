@@ -282,8 +282,6 @@ export class ChatSession {
     this.client = new OpenAICompatibleClient(this.cfg);
     this.round = this.loadRound();
     this.loadContentModes();
-    // VMS 持久化接线（06 §6）：每次 evaluate 后快照 literal 变量到 memory_state(entity_type='variable')
-    this.vms.onPersist(() => persistVariables(this.mem, this.vms, this.round));
     // 插件宿主（04 §4.1：data/plugins 注册表，启用的服务端插件在 init 时沙箱加载）
     this.plugins = new PluginHost(new PluginRegistry(resolve('data', 'plugins')));
     // 正则库（04 §4.3：data/regex-rules.json，卡片正则自动导入）

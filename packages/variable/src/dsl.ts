@@ -37,6 +37,7 @@ export const WHITELIST_FUNCS: Record<string, (args: VarValue[]) => VarValue> = {
   len: ([s]) => String(s).length,
   concat: (a) => a.map((x) => String(x)).join(''),
   // roll("d20") | roll("2d6+3") | roll(1,6)
+  // 非确定性：全局 Math.random，结果不参与缓存/重放（见 06 文档 §4.4）
   roll: (a) => {
     if (a.length === 1 && typeof a[0] === 'string') {
       const s = a[0] as string;

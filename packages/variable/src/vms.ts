@@ -1,6 +1,6 @@
 /**
  * variable 包 - 变量管理服务 VMS（06 设计 Phase 1）
- * 三源统一命名空间（scope:source:name）+ 依赖图 + 分层并行调度 + 循环检测 + 持久化。
+ * 三源统一命名空间（scope:source:name）+ 依赖图 + 分层调度 + 循环检测 + 持久化。
  *
  * 命名空间：<scope>:<source>:<name>
  *   scope:  session > scene > card > book > preset > sys（覆盖优先级）
@@ -24,8 +24,6 @@ export interface VarDecl {
   expression?: string;
   ast?: AstNode;
   deps: string[];
-  /** 每轮变化（round 源） */
-  version: number;
 }
 
 export interface RegisterInput {
@@ -39,7 +37,7 @@ export interface RegisterInput {
 
 export interface EvalResult {
   values: Record<string, VarValue>;
-  /** 并行分层：[[varA, varB], [varC]]（同层无依赖可并行） */
+  /** 分层结果：[[varA, varB], [varC]]（同层无依赖） */
   layers: string[][];
   /** 求值失败项 */
   errors: { name: string; message: string }[];
@@ -47,6 +45,8 @@ export interface EvalResult {
 }
 
 export class VariableManager {
+  /** 裸名 → 全局最高优先级 fullName（注册期维护，求值期 O(1) 查表，避免 O(N) 扫描） */
+  private nameIndex = new Map<string, string>();
   private decls = new Map<string, VarDecl>();
 
   /** 注册变量（derived 需解析表达式 + 提取依赖） */
@@ -56,7 +56,7 @@ export class VariableManager {
       fullName, scope: input.scope, source: input.source, name: input.name,
       type: input.type, value: input.type === 'literal' ? input.value : undefined,
       expression: input.type === 'derived' ? input.expression : undefined,
-      deps: [], version: 0,
+      deps: [],
     };
     if (input.type === 'derived') {
       if (!input.expression) throw new Error(`derived 变量缺少表达式: ${fullName}`);
@@ -64,6 +64,15 @@ export class VariableManager {
       decl.deps = extractDeps(decl.ast).map((d) => this.resolveRef(fullName, d));
     }
     this.decls.set(fullName, decl);
+    this.indexName(decl, fullName);
+  }
+
+  private indexName(decl: VarDecl, fullName: string): void {
+    if (decl.name.includes(':')) return;
+    const prev = this.nameIndex.get(decl.name);
+    if (!prev || SCOPE_RANK[decl.scope] > SCOPE_RANK[prev.split(':')[0]]) {
+      this.nameIndex.set(decl.name, fullName);
+    }
   }
 
   /** 批量注册（三源导入） */
@@ -85,7 +94,7 @@ export class VariableManager {
     return { ok, conflicts };
   }
 
-  /** 解析引用：优先当前声明所在 scope 的同名变量，否则全 scope 找最高优先级 */
+  /** 解析引用：优先当前声明所在 scope 的同名变量，否则裸名走全局最高优先级（nameIndex 查表） */
   private resolveRef(fromFull: string, refName: string): string {
     // refName 可能是完整名（含 :）
     if (refName.includes(':')) return refName;
@@ -93,16 +102,7 @@ export class VariableManager {
     // 同 source 同名（变量常在同源内互相引用）
     const sameSource = `${fromScope}:${fromSource}:${refName}`;
     if (this.decls.has(sameSource)) return sameSource;
-    // 全 scope 找最高优先级
-    let best: string | null = null;
-    let bestRank = -1;
-    for (const [full, d] of this.decls) {
-      if (d.name === refName && SCOPE_RANK[d.scope] > bestRank) {
-        best = full;
-        bestRank = SCOPE_RANK[d.scope];
-      }
-    }
-    return best ?? sameSource; // 未找到也返回预期名（求值时报未定义）
+    return this.nameIndex.get(refName) ?? sameSource; // 未找到也返回预期名（求值时报未定义）
   }
 
   /** 获取变量（未求值的声明访问 value 字段） */
@@ -116,7 +116,6 @@ export class VariableManager {
     if (!d) throw new Error(`变量未注册: ${fullName}`);
     if (d.type === 'derived') throw new Error(`derived 变量不可直接赋值: ${fullName}`);
     d.value = value;
-    d.version++;
   }
 
   /** 列出全部变量 */
@@ -125,8 +124,8 @@ export class VariableManager {
   }
 
   /**
-   * 求值：拓扑分层 + 逐层求值（同层无依赖可并行；循环检测失败抛错）
-   * 返回 values 与 layers（并行分层可视化）
+   * 求值：拓扑分层 + 逐层求值（层间串行，同层无依赖；循环检测失败抛错）
+   * 返回 values 与 layers（分层可视化）
    */
   evaluate(targets?: string[]): EvalResult {
     const t0 = Date.now();
@@ -179,7 +178,8 @@ export class VariableManager {
       throw new Error(`变量依赖存在循环: ${unresolved.join(', ')}`);
     }
 
-    // 2. 逐层求值（同层 Promise.all 并行接口——纯计算同层可 worker 化）
+    // 2. 逐层求值（层间串行 barrier；当前同层亦串行——DSL 为纯计算且规模小，
+    //    worker 并行收益为负，保留 worker 化扩展点）
     for (const layer of layers) {
       for (const n of layer) {
         const d = this.decls.get(n)!;
@@ -200,18 +200,7 @@ export class VariableManager {
       }
     }
 
-    // 3. 持久化快照（供记忆服务 memory_state 复用）
-    this.persist(values);
-
+    // 3. 求值完成（持久化为调用方显式步骤，不由 evaluate 副作用触发）
     return { values, layers, errors, elapsedMs: Date.now() - t0 };
-  }
-
-  /** 持久化到 memory_state 表（entity_type='variable'）——由外部注入 db 句柄 */
-  private persistCb: ((values: Record<string, VarValue>) => void) | null = null;
-  onPersist(cb: (values: Record<string, VarValue>) => void): void {
-    this.persistCb = cb;
-  }
-  private persist(values: Record<string, VarValue>): void {
-    if (this.persistCb) this.persistCb(values);
   }
 }

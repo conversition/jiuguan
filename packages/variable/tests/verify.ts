@@ -1,5 +1,5 @@
 /**
- * variable 包验证：DSL 求值 + VMS 依赖图分层并行 + 循环检测 + 持久化
+ * variable 包验证：DSL 求值 + VMS 依赖图分层 + 循环检测
  */
 import { VariableManager } from '../src/vms.ts';
 import { parseExpr, evaluate, extractDeps, WHITELIST_FUNCS } from '../src/dsl.ts';
@@ -40,7 +40,7 @@ console.log('== VMS 注册与求值 ==');
   const r = vms.evaluate();
   check('progress=5', r.values['card:card:progress'] === 5, `got=${r.values['card:card:progress']}`);
   check('next=5', r.values['card:card:next'] === 5, `got=${r.values['card:card:next']}`);
-  check('并行分层（同层无依赖）', r.layers.length >= 2, JSON.stringify(r.layers));
+  check('拓扑分层（同层无依赖，层间串行）', r.layers.length >= 2, JSON.stringify(r.layers));
   check('无错误', r.errors.length === 0, JSON.stringify(r.errors));
 
   // set 后重算
@@ -68,16 +68,6 @@ console.log('== 循环检测 ==');
   let thrown = false;
   try { vms.evaluate(); } catch (e) { thrown = true; check('循环被拦截', (e as Error).message.includes('循环')); }
   check('循环检测生效', thrown);
-}
-
-console.log('== 持久化回调 ==');
-{
-  const vms = new VariableManager();
-  let saved: Record<string, unknown> = {};
-  vms.onPersist((values) => { saved = { ...values }; });
-  vms.register({ scope: 'sys', source: 'sys', name: 'hp', type: 'literal', value: 100 });
-  vms.evaluate();
-  check('持久化回调收到值', saved['sys:sys:hp'] === 100, JSON.stringify(saved));
 }
 
 console.log('== 批量注册（三源导入）==');

@@ -30,9 +30,9 @@ vms.registerBatch([
 ]);
 vms.register({ scope: 'card', source: 'card', name: 'power2', type: 'derived', expression: '{power} * 2' });
 
-console.log('\n== 全量快照落库（onPersist 每次 evaluate 触发）==');
-vms.onPersist(() => persistVariables(db, vms, 3));
+console.log('\n== 全量快照落库（回合末显式持久化）==');
 const r = vms.evaluate();
+persistVariables(db, vms, 3);
 check('evaluate 成功（derived 重算 100）', r.values['card:card:power2'] === 100, String(r.values['card:card:power2']));
 const row = db.db.prepare('SELECT state_json, updated_round FROM memory_state WHERE entity_type = ? AND entity_id = ?')
   .get(VMS_ENTITY_TYPE, VMS_ENTITY_ID) as { state_json: string; updated_round: number } | undefined;
@@ -49,6 +49,7 @@ if (row) {
 console.log('\n== 值变更后快照更新 ==');
 vms.set('session:mvu:系统状态.幕间回合计数', 3);
 vms.evaluate();
+persistVariables(db, vms, 3);
 const row2 = db.db.prepare('SELECT state_json FROM memory_state WHERE entity_type = ? AND entity_id = ?')
   .get(VMS_ENTITY_TYPE, VMS_ENTITY_ID) as { state_json: string };
 check('变更后快照刷新', JSON.parse(row2.state_json)['session:mvu:系统状态.幕间回合计数'] === 3);
