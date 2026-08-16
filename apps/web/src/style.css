@@ -126,6 +126,9 @@ body { font-family: system-ui, 'PingFang SC', 'Microsoft YaHei', sans-serif; bac
 @keyframes blink { 50% { opacity: 0; } }
 .typing { color: var(--ink-3); font-style: italic; }
 
+/* 流式正文纯文本预览（busy 期间轻量渲染，done 后切回 markdown） */
+.stream-text { white-space: pre-wrap; word-break: break-word; }
+
 /* ═══════════ Markdown 正文排版 ═══════════ */
 .md-body p { margin: 0 0 var(--read-gap); }
 .md-body p:last-child { margin-bottom: 0; }

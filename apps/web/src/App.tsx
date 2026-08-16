@@ -6,7 +6,7 @@ import { PluginsPanel } from './PluginsPanel.tsx';
 import { SessionSetup } from './SessionSetup.tsx';
 import { EditorPanel } from './EditorPanel.tsx';
 import { SkillsPanel } from './SkillsPanel.tsx';
-import { MarkdownMessage } from './MarkdownMessage.tsx';
+import { MarkdownMessage, StreamText } from './MarkdownMessage.tsx';
 import { HtmlMessage, looksLikeHtml, extractHtmlFromCodeFence } from './HtmlMessage.tsx';
 import { applyRegexRules } from '../../../packages/core/src/regex.ts';
 import type { RegexRule } from '../../../packages/core/src/regex.ts';
@@ -40,16 +40,18 @@ const api = async <T,>(path: string, opts?: RequestInit): Promise<T> => {
   return data as T;
 };
 
-/** SSE 流式请求：POST + 读 event stream，回调各事件 */
+/** SSE 流式请求：POST + 读 event stream，回调各事件；signal 用于中止（前端停止按钮） */
 const apiStream = async (
   path: string,
   body: Record<string, unknown>,
   onEvent: (ev: Record<string, unknown>) => void,
+  signal?: AbortSignal,
 ): Promise<void> => {
   const res = await fetch(`${API}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
     body: JSON.stringify(body),
+    signal,
   });
   if (!res.ok || !res.body) {
     const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
@@ -74,6 +76,13 @@ const apiStream = async (
   }
 };
 
+/** 合并服务端历史到本地消息列表（稳定 key：round+role 匹配保留前端 id，仅追加新消息分配 id）
+ *  避免回合结束用后端真实 id 覆盖前端假 id 导致 React key 全部变化、DOM 重挂、动画重放 */
+const mergeHistory = (prev: Message[], server: { id: number; round: number; role: string; content: string }[]): Message[] => {
+  const localIds = new Map(prev.map((m) => [`${m.round}:${m.role}`, m.id]));
+  return server.map((m) => ({ ...m, id: localIds.get(`${m.round}:${m.role}`) ?? nextMsgId() }));
+};
+
 const STAGE_LABEL: Record<string, string> = {
   card: '加载角色卡…',
   worldbook: '加载世界书…',
@@ -81,6 +90,64 @@ const STAGE_LABEL: Record<string, string> = {
   engine: '接入 MVU 引擎…',
   ready: '就绪',
 };
+
+/** 消息行操作（稳定容器：App 每渲染更新字段，引用不变 → memo 不因回调新建而失效） */
+interface MsgOps {
+  regenerate: (m: Message) => void;
+  deleteRound: (round: number) => void;
+  deleteFromHere: (round: number) => void;
+}
+
+/** 单条消息行（memo：流式期旧消息 content 不变则不重渲染，避免全量 re-parse 卡死）
+ *  仅比较渲染相关字段，忽略 ops/streamingMsgRef 等稳定引用 */
+const MessageRow = React.memo(function MessageRow({
+  m, busy, streaming, isLastAssistant, showRaw, regexRules, ops, streamingMsgRef,
+}: {
+  m: Message;
+  busy: boolean;
+  streaming: boolean;
+  isLastAssistant: boolean;
+  showRaw: boolean;
+  regexRules: RegexRule[] | null;
+  ops: MsgOps;
+  streamingMsgRef: React.RefObject<HTMLDivElement>;
+}) {
+  const shown = showRaw || !regexRules ? m.content : applyRegexRules(m.content, regexRules, 'display').text;
+  const msgHtml = !streaming && m.role === 'assistant'
+    ? extractHtmlFromCodeFence(shown) ?? (looksLikeHtml(shown) ? shown : null)
+    : null;
+  return (
+    <div className={`msg ${m.role}`} ref={streaming ? streamingMsgRef : undefined}>
+      <div className="msg-body">
+        {msgHtml ? (
+          <HtmlMessage text={msgHtml} />
+        ) : m.role === 'assistant' ? (
+          <div className={`bubble read${streaming ? ' streaming' : ''}`}>
+            {streaming ? <StreamText text={shown} /> : <MarkdownMessage text={shown} />}
+          </div>
+        ) : (
+          <div className="bubble">{shown}</div>
+        )}
+        <div className="msg-ops">
+          {m.round > 0 && (
+            <>
+              {m.role === 'assistant' && isLastAssistant && (
+                <button className="op-btn" title="重新生成上一条 AI 回复" onClick={() => ops.regenerate(m)} disabled={busy}>↻</button>
+              )}
+              <button className="op-btn" title="删除本轮（用户消息 + AI 回复）" onClick={() => ops.deleteRound(m.round)} disabled={busy}>✕</button>
+              <button className="op-btn" title="从本轮删到结尾" onClick={() => ops.deleteFromHere(m.round)} disabled={busy}>⧗</button>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}, (prev, next) =>
+  prev.m.id === next.m.id && prev.m.round === next.m.round && prev.m.role === next.m.role
+  && prev.m.content === next.m.content && prev.busy === next.busy
+  && prev.streaming === next.streaming && prev.isLastAssistant === next.isLastAssistant
+  && prev.showRaw === next.showRaw && prev.regexRules === next.regexRules
+);
 
 export function App() {
   const [cards, setCards] = useState<Card[]>([]);
@@ -109,6 +176,35 @@ export function App() {
   const [storyLoading, setStoryLoading] = useState(false);
   // 流式生成时钉住正文起点（从头阅读）
   const streamingMsgRef = useRef<HTMLDivElement>(null);
+  // 流式批合并（rAF 节流）：delta 先累积到 buf，每帧最多一次 setMessages，避免逐字全量 map 卡死
+  const streamBufRef = useRef('');
+  const streamRafRef = useRef<number | null>(null);
+  const streamTargetRef = useRef<{ kind: 'id'; id: number } | { kind: 'round'; round: number } | null>(null);
+  const flushStream = () => {
+    streamRafRef.current = null;
+    const chunk = streamBufRef.current;
+    streamBufRef.current = '';
+    const target = streamTargetRef.current;
+    if (!chunk || !target) return;
+    setMessages((m) => m.map((x) => (
+      (target.kind === 'id' && x.id === target.id)
+      || (target.kind === 'round' && x.round === target.round && x.role === 'assistant')
+        ? { ...x, content: x.content + chunk }
+        : x
+    )));
+  };
+  const pushStream = (text: string) => {
+    streamBufRef.current += text;
+    if (streamRafRef.current == null) {
+      streamRafRef.current = requestAnimationFrame(flushStream);
+    }
+  };
+  const stopStream = () => {
+    if (streamRafRef.current != null) { cancelAnimationFrame(streamRafRef.current); streamRafRef.current = null; }
+    flushStream();
+    streamTargetRef.current = null;
+  };
+  useEffect(() => () => { if (streamRafRef.current != null) cancelAnimationFrame(streamRafRef.current); }, []);
   // 会话删除：两步内联确认
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -207,12 +303,6 @@ export function App() {
   // 每次切到"新建会话"面板时同步侧栏角色卡列表（导入后立即可见）
   useEffect(() => { if (tab === 'setup') refreshCards(); }, [tab]);
 
-  /** 显示层清洗：应用 display 范围正则（显示原文开关关闭时） */
-  const cleanDisplay = (text: string): string => {
-    if (showRaw || !regexRules) return text;
-    return applyRegexRules(text, regexRules, 'display').text;
-  };
-
   useEffect(() => {
     // 流式生成时：钉在正在生成正文的起点，方便从头阅读；空闲/结束后回到底部
     if (busy && streamingMsgRef.current) {
@@ -232,14 +322,19 @@ export function App() {
     fetchTurnState(sid);
   };
 
+  /** 拉取会话历史并合并到本地（稳定 key：round+role 匹配保留前端 id） */
+  const fetchHistory = async (sid: string): Promise<void> => {
+    const h = await api<{ messages: { id: number; round: number; role: string; content: string }[] }>(`/api/session/${sid}/history`);
+    setMessages((prev) => mergeHistory(prev, h.messages));
+  };
+
   const resumeSession = async (sid: string) => {
     setBusy(true);
     setError('');
     try {
       await api('/api/session/resume', { method: 'POST', body: JSON.stringify({ db: `${sid}.db` }) });
       setSessionId(sid);
-      const h = await api<{ messages: { id: number; round: number; role: string; content: string }[] }>(`/api/session/${sid}/history`);
-      setMessages(h.messages.map((m) => ({ ...m, id: m.id ?? nextMsgId() })));
+      await fetchHistory(sid);
       setTab('chat');
       fetchTurnState(sid);
     } catch (e) { setError((e as Error).message); }
@@ -256,24 +351,27 @@ export function App() {
     setMessages((m) => [...m, { id: nextMsgId(), round: 0, role: 'user', content: text }]);
     const replyId = nextMsgId();
     setMessages((m) => [...m, { id: replyId, round: 0, role: 'assistant', content: '' }]);
+    streamTargetRef.current = { kind: 'id', id: replyId };
     try {
       await apiStream('/api/turn', { session: sessionId, input: text, content_mode: contentMode }, (ev) => {
         if (ev.type === 'delta' && typeof ev.text === 'string') {
-          // 真流式：逐字追加（MarkdownMessage 渐进渲染）
-          setMessages((m) => m.map((x) => (x.id === replyId ? { ...x, content: x.content + ev.text } : x)));
+          // 真流式：rAF 批合并逐帧追加（StreamText 渐进渲染，不做全量 re-parse）
+          pushStream(ev.text);
         }
         if (ev.type === 'done' && typeof ev.prose === 'string') {
           // 兜底：done 携带完整 prose，整体覆盖（保证流式片段/重试后最终一致）
-          setMessages((m) => m.map((x) => (x.id === replyId ? { ...x, content: ev.prose } : x)));
+          stopStream();
+          const prose = ev.prose;
+          setMessages((m) => m.map((x) => (x.id === replyId ? { ...x, content: prose } : x)));
         }
         if (ev.type === 'error') setError(String(ev.message ?? '回合失败'));
       });
       // 回合结束 → 刷新推进槽（侧栏常驻）+ 拉真实 round（消息操作按 round 定位）+ 会话预览
       fetchTurnState(sessionId);
-      const h = await api<{ messages: { id: number; round: number; role: string; content: string }[] }>(`/api/session/${sessionId}/history`);
-      setMessages(h.messages.map((x) => ({ ...x, id: x.id ?? nextMsgId() })));
+      await fetchHistory(sessionId);
       refreshSessions();
     } catch (e) { setError((e as Error).message); }
+    stopStream();
     stopGenTimer();
     setBusy(false);
   };
@@ -284,21 +382,22 @@ export function App() {
     setBusy(true);
     setError('');
     startGenTimer();
+    streamTargetRef.current = { kind: 'round', round: msg.round };
     try {
       await apiStream(`/api/session/${sessionId}/regenerate`, { round: msg.round }, (ev) => {
-        if (ev.type === 'delta' && typeof ev.text === 'string') {
-          setMessages((m) => m.map((x) => (x.round === msg.round && x.role === 'assistant' ? { ...x, content: x.content + ev.text } : x)));
-        }
+        if (ev.type === 'delta' && typeof ev.text === 'string') pushStream(ev.text);
         if (ev.type === 'done' && typeof ev.prose === 'string') {
-          setMessages((m) => m.map((x) => (x.round === msg.round && x.role === 'assistant' ? { ...x, content: ev.prose } : x)));
+          stopStream();
+          const prose = ev.prose;
+          setMessages((m) => m.map((x) => (x.round === msg.round && x.role === 'assistant' ? { ...x, content: prose } : x)));
         }
         if (ev.type === 'error') setError(String(ev.message ?? '重新生成失败'));
       });
-      const h = await api<{ messages: { id: number; round: number; role: string; content: string }[] }>(`/api/session/${sessionId}/history`);
-      setMessages(h.messages.map((x) => ({ ...x, id: x.id ?? nextMsgId() })));
+      await fetchHistory(sessionId);
       fetchTurnState(sessionId);
       refreshSessions();
     } catch (e) { setError((e as Error).message); }
+    stopStream();
     stopGenTimer();
     setBusy(false);
   };
@@ -313,12 +412,19 @@ export function App() {
         method: 'POST',
         body: JSON.stringify({ round, mode }),
       });
-      const h = await api<{ messages: { id: number; round: number; role: string; content: string }[] }>(`/api/session/${sessionId}/history`);
-      setMessages(h.messages.map((x) => ({ ...x, id: x.id ?? nextMsgId() })));
+      await fetchHistory(sessionId);
       fetchTurnState(sessionId);
       refreshSessions();
     } catch (e) { setError((e as Error).message); }
     setBusy(false);
+  };
+
+  // 消息行操作稳定容器（引用不变 → React.memo 生效；字段每次渲染更新为最新闭包）
+  const msgOpsRef = useRef<MsgOps>({ regenerate: () => {}, deleteRound: () => {}, deleteFromHere: () => {} });
+  msgOpsRef.current = {
+    regenerate: regenerateMessage,
+    deleteRound: (r) => deleteMessagesOp(r, 'round'),
+    deleteFromHere: (r) => deleteMessagesOp(r, 'fromHere'),
   };
 
   return (
@@ -456,41 +562,29 @@ export function App() {
               {messages.length === 0 && !busy && (
                 <div className="empty">从左侧选择一张角色卡开始对话（首次需加载世界书 + 向量化，约 10 秒）</div>
               )}
-              {messages.map((m, i) => {
-                const streaming = busy && i === messages.length - 1 && m.role === 'assistant' && m.content.length > 0;
+              {(() => {
+                const target = streamTargetRef.current;
                 const lastAssistantRound = messages.reduce((mx, x) => (x.role === 'assistant' ? Math.max(mx, x.round) : mx), 0);
-                const isLastAssistant = m.role === 'assistant' && lastAssistantRound > 0 && m.round === lastAssistantRound;
-                const shown = cleanDisplay(m.content);
-                const msgHtml = m.role === 'assistant'
-                  ? extractHtmlFromCodeFence(shown) ?? (looksLikeHtml(shown) ? shown : null)
-                  : null;
-                return (
-                  <div key={m.id} className={`msg ${m.role}`} ref={streaming ? streamingMsgRef : undefined}>
-                    <div className="msg-body">
-                      {msgHtml ? (
-                        <HtmlMessage text={msgHtml} />
-                      ) : m.role === 'assistant' ? (
-                        <div className={`bubble read${streaming ? ' streaming' : ''}`}>
-                          <MarkdownMessage text={shown} />
-                        </div>
-                      ) : (
-                        <div className="bubble">{shown}</div>
-                      )}
-                      <div className="msg-ops">
-                        {m.round > 0 && (
-                          <>
-                            {m.role === 'assistant' && isLastAssistant && (
-                              <button className="op-btn" title="重新生成上一条 AI 回复" onClick={() => regenerateMessage(m)} disabled={busy}>↻</button>
-                            )}
-                            <button className="op-btn" title="删除本轮（用户消息 + AI 回复）" onClick={() => deleteMessagesOp(m.round, 'round')} disabled={busy}>✕</button>
-                            <button className="op-btn" title="从本轮删到结尾" onClick={() => deleteMessagesOp(m.round, 'fromHere')} disabled={busy}>⧗</button>
-                          </>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
+                return messages.map((m, i) => {
+                  const streaming = busy && !!target && !!m.content
+                    && ((target.kind === 'id' && m.id === target.id)
+                        || (target.kind === 'round' && m.round === target.round && m.role === 'assistant'));
+                  const isLastAssistant = m.role === 'assistant' && lastAssistantRound > 0 && m.round === lastAssistantRound;
+                  return (
+                    <MessageRow
+                      key={m.id}
+                      m={m}
+                      busy={busy}
+                      streaming={streaming}
+                      isLastAssistant={isLastAssistant}
+                      showRaw={showRaw}
+                      regexRules={regexRules}
+                      ops={msgOpsRef.current}
+                      streamingMsgRef={streamingMsgRef}
+                    />
+                  );
+                });
+              })()}
               {busy && !messages.some((m) => m.role === 'assistant' && m.content === '') && (
                 <div className="msg assistant"><div className="bubble typing">思考中…</div></div>
               )}
