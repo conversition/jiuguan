@@ -303,3 +303,38 @@ body { font-family: system-ui, 'PingFang SC', 'Microsoft YaHei', sans-serif; bac
 .edit-ops { margin-left: auto; display: flex; gap: 4px; }
 .edit-ops button { background: var(--bg-card); color: var(--ink-2); border: 1px solid var(--border); border-radius: 4px; padding: 2px 8px; font-size: 12px; cursor: pointer; }
 .edit-ops button:hover { background: var(--bg-hover); }
+
+/* ═══════════ 消息悬浮操作（重新生成 / 删除）═══════════ */
+.msg-body { position: relative; display: flex; flex-direction: column; width: 100%; }
+.msg.user .msg-body { align-items: flex-end; }   /* 用户气泡右对齐（气泡 max-width 75% 语义保留） */
+.msg.assistant .msg-body { align-items: center; }
+.msg-ops { display: flex; gap: 4px; margin-top: 4px; opacity: 0.5; transition: opacity .15s; justify-content: flex-end; }
+.msg.assistant .msg-ops { justify-content: center; }
+.msg:hover .msg-ops, .msg-ops:hover { opacity: 1; }
+.op-btn { background: var(--bg-card); color: var(--ink-2); border: 1px solid var(--border); border-radius: 6px; width: 26px; height: 26px; font-size: 13px; line-height: 1; cursor: pointer; }
+.op-btn:hover { background: var(--bg-hover); color: var(--accent-ink); }
+.op-btn:disabled { opacity: .4; cursor: default; }
+
+/* ═══════════ 资产导入/导出（SessionSetup）═══════════ */
+.setup-cell { display: flex; gap: 4px; align-items: center; }
+.setup-cell .setup-item { flex: 1; min-width: 0; }
+.mini-btn { background: var(--bg-card); color: var(--ink-2); border: 1px solid var(--border); border-radius: 6px; width: 26px; height: 26px; font-size: 13px; cursor: pointer; flex-shrink: 0; }
+.mini-btn:hover { background: var(--bg-hover); color: var(--accent-ink); }
+.btn-file { display: inline-block; padding: 6px 14px; background: var(--accent); color: #fff; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; }
+.btn-file:hover { opacity: .9; }
+
+/* ═══════════ 会话列表操作（删除会话）═══════════ */
+.session-row { display: flex; gap: 4px; align-items: center; }
+.session-resume { flex: 1; min-width: 0; text-align: left; width: auto; }
+
+/* ═══════════ 剧情分支索引（AI 生成侧栏卡片）═══════════ */
+.story-box .story-index {
+  font-size: 12px; line-height: 1.7; color: var(--ink-2);
+  white-space: pre-wrap; word-break: break-word; max-height: 300px; overflow-y: auto;
+}
+.story-box .story-hint { font-size: 11px; color: var(--ink-4); margin-top: 6px; }
+
+/* ═══════════ HTML 消息（酒馆式：卡片 HTML 直接注入渲染）═══════════ */
+.html-msg { width: 100%; color: var(--ink-2); }
+.html-msg > :first-child { margin-top: 0; }
+.html-msg img { max-width: 100%; height: auto; border-radius: 8px; }

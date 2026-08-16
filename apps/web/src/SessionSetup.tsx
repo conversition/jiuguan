@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { StoryboardPanel } from './StoryboardPanel.tsx';
+import { downloadText, downloadBase64, readFileAsText, readFileAsBase64 } from './filetools.ts';
 
 const API = (import.meta as unknown as { env: Record<string, string> }).env?.VITE_API_BASE ?? '';
 
@@ -19,7 +20,10 @@ const STAGE_LABEL: Record<string, string> = {
 type CreateMode = 'nsfw' | 'nsf' | 'director';
 
 /** 新建创作前置面板（创作模式三项并列：NSFW / NSF / 导演分镜；对话走会话入参，分镜走编排器） */
-export function SessionSetup({ onCreated }: { onCreated: (sid: string, greeting: string, card: string, mode: string) => void }) {
+export function SessionSetup({ onCreated, onCardsChanged }: {
+  onCreated: (sid: string, greeting: string, card: string, mode: string) => void;
+  onCardsChanged?: () => void;
+}) {
   const [cards, setCards] = useState<CardInfo[] | null>(null);
   const [worldbooks, setWorldbooks] = useState<WorldbookInfo[] | null>(null);
   const [presets, setPresets] = useState<PresetInfo[] | null>(null);
@@ -70,6 +74,78 @@ export function SessionSetup({ onCreated }: { onCreated: (sid: string, greeting:
 
   const toggleBook = (id: string) => {
     setSelectedBooks((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+  };
+
+  // ── 可视化导入/导出（卡片 PNG 兼容酒馆 / 世界书 / 预设 JSON）──
+  const importCard = async (file: File) => {
+    try {
+      const isPng = /\.png$/i.test(file.name);
+      const data = isPng ? await readFileAsBase64(file) : await readFileAsText(file);
+      const r = await fetch(`${API}/api/card/import`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename: file.name, format: isPng ? 'png' : 'json', data }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error ?? `HTTP ${r.status}`);
+      setError('');
+      const c = await fetch(`${API}/api/cards`).then((x) => x.json());
+      setCards(c.cards ?? []);
+      onCardsChanged?.(); // 同步 App 侧栏卡列表，导入后立即可选
+    } catch (e) { setError((e as Error).message); }
+  };
+
+  const exportCard = async (c: CardInfo) => {
+    try {
+      const d = await fetch(`${API}/api/card/${encodeURIComponent(c.id)}/png`).then((r) => r.json());
+      if (d.error) throw new Error(d.error);
+      downloadBase64(d.pngFile ?? c.name + '.png', d.data_b64, 'image/png');
+    } catch (e) { setError((e as Error).message); }
+  };
+
+  const importWorldbook = async (file: File) => {
+    try {
+      const raw = await readFileAsText(file);
+      const r = await fetch(`${API}/api/worldbook/import`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename: file.name, raw }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error ?? `HTTP ${r.status}`);
+      setError('');
+      const w = await fetch(`${API}/api/worldbooks`).then((x) => x.json());
+      setWorldbooks(w.worldbooks ?? []);
+    } catch (e) { setError((e as Error).message); }
+  };
+
+  const exportWorldbook = async (id: string) => {
+    try {
+      const d = await fetch(`${API}/api/worldbook/${encodeURIComponent(id)}/raw`).then((r) => r.json());
+      if (d.error) throw new Error(d.error);
+      downloadText(id, d.raw);
+    } catch (e) { setError((e as Error).message); }
+  };
+
+  const importPreset = async (file: File) => {
+    try {
+      const raw = await readFileAsText(file);
+      const r = await fetch(`${API}/api/preset/import`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename: file.name, raw }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error ?? `HTTP ${r.status}`);
+      setError('');
+      const p = await fetch(`${API}/api/presets`).then((x) => x.json());
+      setPresets(p.presets ?? []);
+    } catch (e) { setError((e as Error).message); }
+  };
+
+  const exportPreset = async (id: string) => {
+    try {
+      const d = await fetch(`${API}/api/preset/${encodeURIComponent(id)}/raw`).then((r) => r.json());
+      if (d.error) throw new Error(d.error);
+      downloadText(id, d.raw);
+    } catch (e) { setError((e as Error).message); }
   };
 
   const create = async () => {
@@ -147,12 +223,21 @@ export function SessionSetup({ onCreated }: { onCreated: (sid: string, greeting:
         <>
           <section className="console-section">
             <h3>1. 角色卡</h3>
+            <div className="console-bar">
+              <label className="btn-file">导入卡片（.png / .json）
+                <input type="file" accept=".json,.png" style={{ display: 'none' }}
+                  onChange={(e) => { const f = e.target.files?.[0]; if (f) importCard(f); e.target.value = ''; }} />
+              </label>
+            </div>
             {cards === null ? <p className="hint">加载中…</p> : (
               <div className="setup-grid">
                 {cards.map((c) => (
-                  <button key={c.id} className={`setup-item${card === c.id ? ' setup-active' : ''}`} onClick={() => setCard(c.id)}>
-                    {c.name.replace(/\.json$/, '')}
-                  </button>
+                  <div key={c.id} className="setup-cell">
+                    <button className={`setup-item${card === c.id ? ' setup-active' : ''}`} onClick={() => setCard(c.id)}>
+                      {c.name}
+                    </button>
+                    <button className="mini-btn" title="导出为酒馆兼容 PNG" onClick={() => exportCard(c)}>⇩</button>
+                  </div>
                 ))}
               </div>
             )}
@@ -160,13 +245,22 @@ export function SessionSetup({ onCreated }: { onCreated: (sid: string, greeting:
 
           <section className="console-section">
             <h3>2. 世界书（多选；留空 = 按 content_mode 默认）</h3>
+            <div className="console-bar">
+              <label className="btn-file">导入世界书（.json）
+                <input type="file" accept=".json" style={{ display: 'none' }}
+                  onChange={(e) => { const f = e.target.files?.[0]; if (f) importWorldbook(f); e.target.value = ''; }} />
+              </label>
+            </div>
             {worldbooks === null ? <p className="hint">加载中…</p> : (
               <div className="setup-grid">
                 {worldbooks.map((w) => (
-                  <label key={w.id} className={`setup-item setup-check${selectedBooks.includes(w.id) ? ' setup-active' : ''}`}>
-                    <input type="checkbox" checked={selectedBooks.includes(w.id)} onChange={() => toggleBook(w.id)} />
-                    {w.name}
-                  </label>
+                  <div key={w.id} className="setup-cell">
+                    <label className={`setup-item setup-check${selectedBooks.includes(w.id) ? ' setup-active' : ''}`}>
+                      <input type="checkbox" checked={selectedBooks.includes(w.id)} onChange={() => toggleBook(w.id)} />
+                      {w.name}
+                    </label>
+                    <button className="mini-btn" title="导出" onClick={() => exportWorldbook(w.id)}>⇩</button>
+                  </div>
                 ))}
               </div>
             )}
@@ -174,10 +268,17 @@ export function SessionSetup({ onCreated }: { onCreated: (sid: string, greeting:
 
           <section className="console-section">
             <h3>3. 预设（可选；勾选生效块，未勾选 = 不加载预设）</h3>
-            <select value={preset} onChange={(e) => openPreset(e.target.value)}>
-              <option value="">（不加载预设）</option>
-              {(presets ?? []).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
-            </select>
+            <div className="console-bar">
+              <select value={preset} onChange={(e) => openPreset(e.target.value)}>
+                <option value="">（不加载预设）</option>
+                {(presets ?? []).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+              </select>
+              {preset && <button className="mini-btn" title="导出当前预设" onClick={() => exportPreset(preset)}>⇩</button>}
+              <label className="btn-file">导入预设
+                <input type="file" accept=".json" style={{ display: 'none' }}
+                  onChange={(e) => { const f = e.target.files?.[0]; if (f) importPreset(f); e.target.value = ''; }} />
+              </label>
+            </div>
             {blocks && (
               <div className="preset-blocks">
                 <div className="preset-block-head">

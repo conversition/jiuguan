@@ -7,6 +7,7 @@ import { SessionSetup } from './SessionSetup.tsx';
 import { EditorPanel } from './EditorPanel.tsx';
 import { SkillsPanel } from './SkillsPanel.tsx';
 import { MarkdownMessage } from './MarkdownMessage.tsx';
+import { HtmlMessage, looksLikeHtml } from './HtmlMessage.tsx';
 import { applyRegexRules } from '../../../packages/core/src/regex.ts';
 import type { RegexRule } from '../../../packages/core/src/regex.ts';
 
@@ -101,6 +102,12 @@ export function App() {
   const [theme, setTheme] = useState<Theme>(() => (localStorage.getItem('jg-theme') as Theme) || 'dark');
   const [readFs, setReadFs] = useState<number>(() => Number(localStorage.getItem('jg-read-fs')) || 16);
   const [turnState, setTurnState] = useState<TurnState | null>(null);
+  // 剧情分支索引（AI 生成，按轮缓存）
+  const [storyIndex, setStoryIndex] = useState<string>('');
+  const [storyIndexRound, setStoryIndexRound] = useState<number>(-1);
+  const [storyLoading, setStoryLoading] = useState(false);
+  // 流式生成时钉住正文起点（从头阅读）
+  const streamingMsgRef = useRef<HTMLDivElement>(null);
   // 生成计时器
   const [genSeconds, setGenSeconds] = useState(0);
   const genTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -124,12 +131,50 @@ export function App() {
     localStorage.setItem('jg-read-fs', String(readFs));
   }, [readFs]);
 
-  /** 拉取推进槽（会话创建/恢复/每轮结束后刷新） */
+  /** 拉取推进槽（会话创建/恢复/每轮结束后刷新）；顺带按轮拉取剧情分支索引（round>0 才拉，避免开场白空转一次 AI） */
   const fetchTurnState = async (sid: string) => {
     try {
       const d = await api<{ state: TurnState }>(`/api/session/${sid}/turn-state`);
       setTurnState(d.state ?? null);
+      if (d.state && d.state.round > 0) fetchStoryIndex(sid, d.state.round);
     } catch { /* 侧栏状态拉取失败不影响使用 */ }
+  };
+
+  /** 刷新角色卡列表（导入/切换建会话面板后同步侧栏） */
+  const refreshCards = async () => {
+    try {
+      const d = await api<{ cards: Card[] }>('/api/cards');
+      setCards(d.cards ?? []);
+    } catch { /* 静默 */ }
+  };
+
+  /** 拉取 AI 剧情分支索引（后端按轮缓存，重复请求零成本） */
+  const fetchStoryIndex = async (sid: string, round: number) => {
+    if (!sid || round < 0 || storyLoading) return;
+    setStoryLoading(true);
+    try {
+      const d = await api<{ content: string; round: number; fromCache: boolean }>(`/api/session/${sid}/story-index?round=${round}`);
+      setStoryIndex(d.content ?? '');
+      setStoryIndexRound(d.round ?? -1);
+    } catch { /* 索引失败不打扰 */ }
+    setStoryLoading(false);
+  };
+
+  /** 删除会话（历史全部清除，db 文件移除） */
+  const deleteSession = async (s: SessionInfo) => {
+    if (!window.confirm(`删除会话「${s.name}」？会清除该会话全部历史，不可恢复。`)) return;
+    try {
+      await api(`/api/session/${s.id}/delete`, { method: 'POST' });
+      setSessions((prev) => prev.filter((x) => x.id !== s.id));
+      if (sessionId === s.id) {
+        setSessionId(null);
+        setMessages([]);
+        setTurnState(null);
+        setStoryIndex('');
+        setStoryIndexRound(-1);
+        setTab('setup');
+      }
+    } catch (e) { setError((e as Error).message); }
   };
 
   useEffect(() => {
@@ -138,6 +183,9 @@ export function App() {
     api<{ rules: RegexRule[] }>('/api/regex-rules').then((d) => setRegexRules(d.rules ?? [])).catch(() => {});
   }, []);
 
+  // 每次切到"新建会话"面板时同步侧栏角色卡列表（导入后立即可见）
+  useEffect(() => { if (tab === 'setup') refreshCards(); }, [tab]);
+
   /** 显示层清洗：应用 display 范围正则（显示原文开关关闭时） */
   const cleanDisplay = (text: string): string => {
     if (showRaw || !regexRules) return text;
@@ -145,7 +193,12 @@ export function App() {
   };
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    // 流式生成时：钉在正在生成正文的起点，方便从头阅读；空闲/结束后回到底部
+    if (busy && streamingMsgRef.current) {
+      streamingMsgRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } else {
+      bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
   }, [messages, busy, initStage]);
 
   /** 会话创建完成回调（SessionSetup 面板 → 进入对话） */
@@ -194,10 +247,53 @@ export function App() {
         }
         if (ev.type === 'error') setError(String(ev.message ?? '回合失败'));
       });
-      // 回合结束 → 刷新推进槽（侧栏常驻）
+      // 回合结束 → 刷新推进槽（侧栏常驻）+ 拉真实 round（消息操作按 round 定位）
+      fetchTurnState(sessionId);
+      const h = await api<{ messages: { id: number; round: number; role: string; content: string }[] }>(`/api/session/${sessionId}/history`);
+      setMessages(h.messages.map((x) => ({ ...x, id: x.id ?? nextMsgId() })));
+    } catch (e) { setError((e as Error).message); }
+    stopGenTimer();
+    setBusy(false);
+  };
+
+  /** 重新生成某条 AI 回复（SSE 流式原地替换目标消息内容） */
+  const regenerateMessage = async (msg: Message) => {
+    if (!sessionId || busy) return;
+    setBusy(true);
+    setError('');
+    startGenTimer();
+    try {
+      await apiStream(`/api/session/${sessionId}/regenerate`, { round: msg.round }, (ev) => {
+        if (ev.type === 'delta' && typeof ev.text === 'string') {
+          setMessages((m) => m.map((x) => (x.round === msg.round && x.role === 'assistant' ? { ...x, content: x.content + ev.text } : x)));
+        }
+        if (ev.type === 'done' && typeof ev.prose === 'string') {
+          setMessages((m) => m.map((x) => (x.round === msg.round && x.role === 'assistant' ? { ...x, content: ev.prose } : x)));
+        }
+        if (ev.type === 'error') setError(String(ev.message ?? '重新生成失败'));
+      });
+      const h = await api<{ messages: { id: number; round: number; role: string; content: string }[] }>(`/api/session/${sessionId}/history`);
+      setMessages(h.messages.map((x) => ({ ...x, id: x.id ?? nextMsgId() })));
       fetchTurnState(sessionId);
     } catch (e) { setError((e as Error).message); }
     stopGenTimer();
+    setBusy(false);
+  };
+
+  /** 删除消息（round 整轮 / fromHere 从该轮到末尾），成功后刷新历史与状态 */
+  const deleteMessagesOp = async (round: number, mode: 'round' | 'fromHere') => {
+    if (!sessionId || busy) return;
+    setBusy(true);
+    setError('');
+    try {
+      await api(`/api/session/${sessionId}/message/delete`, {
+        method: 'POST',
+        body: JSON.stringify({ round, mode }),
+      });
+      const h = await api<{ messages: { id: number; round: number; role: string; content: string }[] }>(`/api/session/${sessionId}/history`);
+      setMessages(h.messages.map((x) => ({ ...x, id: x.id ?? nextMsgId() })));
+      fetchTurnState(sessionId);
+    } catch (e) { setError((e as Error).message); }
     setBusy(false);
   };
 
@@ -254,6 +350,17 @@ export function App() {
             </div>
           </div>
         )}
+        {storyIndex && (
+          <div className="status-box story-box">
+            <div className="status-head">
+              <span className="status-round">剧情分支索引</span>
+              <span className="status-event">R{storyIndexRound}</span>
+              <button className="mini-btn" title="重新生成剧情索引" onClick={() => { if (sessionId) fetchStoryIndex(sessionId, Math.max(storyIndexRound, turnState?.round ?? 0)); }} disabled={storyLoading}>↻</button>
+            </div>
+            <div className="story-index">{storyIndex}</div>
+            <p className="story-hint">AI 生成 · 帮助决定下一步</p>
+          </div>
+        )}
         <h2>角色卡</h2>
         <ul>
           <li><button onClick={() => setTab('setup')} disabled={busy}>＋ 新建会话（选卡/世界书/预设）</button></li>
@@ -266,8 +373,9 @@ export function App() {
         <h2>会话</h2>
         <ul>
           {sessions.map((s) => (
-            <li key={s.id}>
-              <button onClick={() => resumeSession(s.id)} disabled={busy}>↻ {s.name}</button>
+            <li key={s.id} className="session-row">
+              <button className="session-resume" onClick={() => resumeSession(s.id)} disabled={busy}>↻ {s.name}</button>
+              <button className="mini-btn" title="删除本会话（历史全部清除）" onClick={() => deleteSession(s)} disabled={busy}>🗑</button>
             </li>
           ))}
         </ul>
@@ -286,7 +394,7 @@ export function App() {
       </aside>
       <main className="chat">
         {tab === 'setup' ? (
-          <SessionSetup onCreated={onSessionCreated} />
+          <SessionSetup onCreated={onSessionCreated} onCardsChanged={refreshCards} />
         ) : tab === 'memory' ? (
           <MemoryConsole sessionId={sessionId} />
         ) : tab === 'provider' ? (
@@ -312,15 +420,34 @@ export function App() {
               )}
               {messages.map((m, i) => {
                 const streaming = busy && i === messages.length - 1 && m.role === 'assistant' && m.content.length > 0;
+                const lastAssistantRound = messages.reduce((mx, x) => (x.role === 'assistant' ? Math.max(mx, x.round) : mx), 0);
+                const isLastAssistant = m.role === 'assistant' && lastAssistantRound > 0 && m.round === lastAssistantRound;
                 return (
-                  <div key={m.id} className={`msg ${m.role}`}>
-                    {m.role === 'assistant' ? (
-                      <div className={`bubble read${streaming ? ' streaming' : ''}`}>
-                        <MarkdownMessage text={cleanDisplay(m.content)} />
+                  <div key={m.id} className={`msg ${m.role}`} ref={streaming ? streamingMsgRef : undefined}>
+                    <div className="msg-body">
+                      {m.role === 'assistant' ? (
+                        looksLikeHtml(cleanDisplay(m.content)) ? (
+                          <HtmlMessage text={cleanDisplay(m.content)} />
+                        ) : (
+                          <div className={`bubble read${streaming ? ' streaming' : ''}`}>
+                            <MarkdownMessage text={cleanDisplay(m.content)} />
+                          </div>
+                        )
+                      ) : (
+                        <div className="bubble">{cleanDisplay(m.content)}</div>
+                      )}
+                      <div className="msg-ops">
+                        {m.round > 0 && (
+                          <>
+                            {m.role === 'assistant' && isLastAssistant && (
+                              <button className="op-btn" title="重新生成上一条 AI 回复" onClick={() => regenerateMessage(m)} disabled={busy}>↻</button>
+                            )}
+                            <button className="op-btn" title="删除本轮（用户消息 + AI 回复）" onClick={() => deleteMessagesOp(m.round, 'round')} disabled={busy}>✕</button>
+                            <button className="op-btn" title="从本轮删到结尾" onClick={() => deleteMessagesOp(m.round, 'fromHere')} disabled={busy}>⧗</button>
+                          </>
+                        )}
                       </div>
-                    ) : (
-                      <div className="bubble">{cleanDisplay(m.content)}</div>
-                    )}
+                    </div>
                   </div>
                 );
               })}

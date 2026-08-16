@@ -109,6 +109,27 @@
 ### 正则管道
 - 内置默认库 12 条 + 卡片 regex_scripts 自动导入；前端渲染时屏蔽 `<think>/<UpdateVariable>/<era_data>` 等标记（「显示原文」开关可看原始）
 
+### 消息操作（重新生成 / 删除历史）
+- **重新生成任意轮 AI 回复**：回合账本 `round_ledger` 记录每轮写环前状态快照 + 本轮新写行（AM 码/事件/引擎/变量），重新生成=回滚该轮（保留用户行）→ 用存储的用户输入重放，状态精确还原、无双表孤儿
+- **删除历史**：单轮删除（用户+AI+状态回滚）/ 从该轮删到结尾；middle 轮删除为尽力回滚（与酒馆删中间消息一致容忍轻微不一致）
+- 前端消息悬浮操作：`↻ 重新生成`（最后一条 AI）/ `✕ 删除本轮` / `⧗ 从本轮删到结尾`
+
+### 资产导入导出（前端可视化）
+- 角色卡 **PNG 兼容酒馆**：导入认 `.json` / 真 `.png`（自动解包 chara tEXt），导出生成酒馆可直接拖入的 PNG（`buildCharaPng`）
+- 世界书 / 预设 JSON 导入导出；PNG 卡 / 世界书 / 预设均落**用户层** `data/`，不碰源目录；`/api/cards` 现支持源+用户双源、json+png 双格式
+
+### 长对话滑动窗口 + 滚动摘要
+- **近期原文窗口**：最近 N 条消息（默认 12 / 1500 token，env `JG_WINDOW_N`/`JG_WINDOW_TOKENS`）原文进 prompt（补上 `assembleTurn` 长期空置的 `chatHistory` 槽位），prompt 层正则清洗内部标记
+- **滚动摘要兜底**：滑出窗口的旧文在 `SUMMARY_ROUNDS` 轮后压缩成 ≤500 字长期摘要（`memory_meta.longterm`，env `JG_LONGTERM_TOKENS`/`JG_SUMMARY_ROUNDS`），随轮注入；上下文各块独立封顶，长对话不爆 token
+
+### 剧情分支索引（AI 生成）
+- 每轮对话后自动生成"当前局势 + 未解决伏笔 + 建议分支（2-4 个）"，帮助玩家决定下一步、减轻思考负担
+- 后端 `generateStoryIndex` 用当前记忆（大纲/事件/长期摘要/上轮规划/推进槽）喂给模型，结果按轮缓存 `story_index` 表（同轮重复请求零成本）；模型不可用时降级纯 DB 脉络
+- 前端侧栏"剧情分支索引"卡片随推进槽刷新自动拉取 + `↻` 手动重生成
+
+### 会话清理
+- 侧栏"会话"列表每项带 🗑 删除按钮（关 DB + 删 `data/session-*.db` + 移出内存）；消息级删除用 ✕（本轮）/ ⧗（从此删到结尾），操作按钮半透明常显、悬停加深
+
 ### 导演分镜编排器 `tools/cli/storyboard*.ts`（Commit B）
 - 平行于 prose 主循环的批量工作流引擎：**工作流 yaml 注册表**（`data/storyboard-workflows/`，新增工作流=丢一个 yaml 零代码改动）+ 批量召回（剧情 RAG ∥ 世界书 ∥ 分镜 Skill）+ 四阶段模型编排（导演读本→逐镜 Shot Contract→串联六段式→人类化改写，≤5 镜/调用超限并行）+ **五级校验内联**（VP0 读本/VP1 反陈词·设备词/VP2 SFX 禁 BGM）+ `memory_state(storyboard)` 落库
 - 用法：`pnpm storyboard --scene "深夜铁桥相拥" --shots 9 --voice 亲密极简`；`pnpm test:storyboard`（mock 端到端 22/22，绕 API 限流）
@@ -120,10 +141,10 @@
 
 | 区域 | 组件 | 功能 |
 |---|---|---|
-| 对话主区 | `App.tsx` | **SSE 流式打字机**（`▋` 光标）、assistant 用 **Markdown 阅读卡片**（720px 居中/字号行高可调/代码高亮）、user 紧凑气泡、消息淡入 |
+| 对话主区 | `App.tsx` | **SSE 流式打字机**（`▋` 光标）、assistant 用 **Markdown 阅读卡片**（720px 居中/字号行高可调/代码高亮）、user 紧凑气泡、消息淡入、**消息悬浮操作**（↻ 重新生成 / ✕ 删除本轮 / ⧗ 从此删到结尾） |
 | 主题/字号 | `App.tsx` | 深色/米黄/纸白三档（`data-theme` + CSS 变量）、A-/A+ 字号（`--read-fs`） |
-| 侧栏常驻 | `App.tsx` | **推进槽 4 条进度条** + 轮次/事件类型/NSFW 锁定（每轮后刷新）、角色卡/会话列表 |
-| 建会话 | `SessionSetup.tsx` | 选角色卡 + 世界书多选 + 预设块勾选 + content_mode → SSE 阶段进度（卡→世界书→向量化→引擎→就绪） |
+| 侧栏常驻 | `App.tsx` | **推进槽 4 条进度条** + 轮次/事件类型/NSFW 锁定（每轮后刷新）、**剧情分支索引卡片**（AI 生成，按轮缓存 + ↻ 重生成）、角色卡/会话列表（**会话可 🗑 删除**） |
+| 建会话 | `SessionSetup.tsx` | 选角色卡 + 世界书多选 + 预设块勾选 + content_mode → SSE 阶段进度（卡→世界书→向量化→引擎→就绪）；**卡片（PNG/JSON）/ 世界书 / 预设可视化导入导出** |
 | 记忆控制台 | `MemoryConsole.tsx` | 双通道检索测试（BM25/vec/RRF 分层得分）、状态表(表0-5)/大纲表(AM码)、世界书激活调试、VMS 变量分层 |
 | Provider | `ProviderPanel.tsx` | 显示 base/model/kind/key 状态 + **密码输入框写 key** + 测试连接 |
 | 资产 | `AssetsPanel.tsx` | 预设浏览器(块查看/勾选)、正则调试器、世界书条目浏览 |
@@ -140,9 +161,11 @@
 |---|---|
 | 会话 | `GET /api/cards` `GET /api/sessions` `POST /api/session/new`(SSE) `POST /api/session/resume` `GET /api/session/:id/history` `GET /api/session/:id/config` |
 | 回合 | `POST /api/turn`（**SSE**：thinking→streaming→delta→done） |
+| 消息操作 | `POST /api/session/:id/regenerate {round}`（SSE） `POST /api/session/:id/message/delete {round,mode:round\|fromHere}` |
+| 剧情/会话 | `GET /api/session/:id/story-index?round=N`（AI 剧情分支索引，按轮缓存） `POST /api/session/:id/delete`（删会话 db） |
 | 记忆 | `POST /api/session/:id/memory-search` `GET /api/session/:id/memory-state` `-memory-arc` `-memory-meta` |
 | 调试 | `POST /api/session/:id/lorebook-scan` `GET /api/session/:id/variables` `-turn-state` `-lorebook-entries` |
-| 资产 | `GET /api/presets` `GET /api/preset/:file` `GET /api/worldbooks` `GET /api/worldbook/:file` `POST /api/preset|worldbook/save|delete` |
+| 资产 | `GET /api/cards`（源+用户，json+png） `GET /api/card/:file/raw` `GET /api/card/:file/png` `POST /api/card/import` `GET /api/presets` `GET /api/preset/:file` `GET /api/preset/:file/raw` `POST /api/preset/import` `GET /api/worldbooks` `GET /api/worldbook/:file` `GET /api/worldbook/:file/raw` `POST /api/worldbook/import` `POST /api/preset|worldbook/save|delete` |
 | 正则 | `GET /api/regex-rules` `POST /api/regex-rules/save|delete|import-card` `POST /api/regex/test` |
 | Provider | `GET /api/provider` `POST /api/provider/test` `POST /api/provider/key` |
 | 插件 | `GET /api/plugins` `POST /api/plugins/install` `POST /api/plugins/:id/enable|disable|uninstall|update` |
