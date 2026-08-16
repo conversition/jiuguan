@@ -7,12 +7,12 @@ import { SessionSetup } from './SessionSetup.tsx';
 import { EditorPanel } from './EditorPanel.tsx';
 import { SkillsPanel } from './SkillsPanel.tsx';
 import { MarkdownMessage } from './MarkdownMessage.tsx';
-import { HtmlMessage, looksLikeHtml } from './HtmlMessage.tsx';
+import { HtmlMessage, looksLikeHtml, extractHtmlFromCodeFence } from './HtmlMessage.tsx';
 import { applyRegexRules } from '../../../packages/core/src/regex.ts';
 import type { RegexRule } from '../../../packages/core/src/regex.ts';
 
 interface Card { id: string; name: string }
-interface SessionInfo { id: string; name: string }
+interface SessionInfo { id: string; name: string; preview?: string; round?: number }
 interface Message { id: number; round: number; role: string; content: string }
 /** 推进槽 / 轮次状态（/api/session/:id/turn-state，侧栏常驻） */
 interface TurnState {
@@ -104,10 +104,14 @@ export function App() {
   const [turnState, setTurnState] = useState<TurnState | null>(null);
   // 剧情分支索引（AI 生成，按轮缓存）
   const [storyIndex, setStoryIndex] = useState<string>('');
+  const [storyBranches, setStoryBranches] = useState<string[]>([]);
   const [storyIndexRound, setStoryIndexRound] = useState<number>(-1);
   const [storyLoading, setStoryLoading] = useState(false);
   // 流式生成时钉住正文起点（从头阅读）
   const streamingMsgRef = useRef<HTMLDivElement>(null);
+  // 会话删除：两步内联确认
+  const [confirmDel, setConfirmDel] = useState<string | null>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   // 生成计时器
   const [genSeconds, setGenSeconds] = useState(0);
   const genTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -153,16 +157,32 @@ export function App() {
     if (!sid || round < 0 || storyLoading) return;
     setStoryLoading(true);
     try {
-      const d = await api<{ content: string; round: number; fromCache: boolean }>(`/api/session/${sid}/story-index?round=${round}`);
+      const d = await api<{ content: string; branches: string[]; round: number; fromCache: boolean }>(`/api/session/${sid}/story-index?round=${round}`);
       setStoryIndex(d.content ?? '');
+      setStoryBranches(d.branches ?? []);
       setStoryIndexRound(d.round ?? -1);
     } catch { /* 索引失败不打扰 */ }
     setStoryLoading(false);
   };
 
-  /** 删除会话（历史全部清除，db 文件移除） */
+  /** 刷新会话列表（标题/最新消息预览/轮次，来自服务端） */
+  const refreshSessions = async () => {
+    try {
+      const d = await api<{ sessions: SessionInfo[] }>('/api/sessions');
+      setSessions(d.sessions ?? []);
+    } catch { /* 静默 */ }
+  };
+
+  /** 剧情分支按钮：填入输入框并聚焦 */
+  const applyBranch = (branch: string) => {
+    setInput(branch);
+    inputRef.current?.focus();
+  };
+
+  /** 删除会话（两步内联确认；历史全部清除 + db 移除） */
   const deleteSession = async (s: SessionInfo) => {
-    if (!window.confirm(`删除会话「${s.name}」？会清除该会话全部历史，不可恢复。`)) return;
+    if (confirmDel !== s.id) { setConfirmDel(s.id); return; } // 第一次点击 → 进入确认态
+    setConfirmDel(null);
     try {
       await api(`/api/session/${s.id}/delete`, { method: 'POST' });
       setSessions((prev) => prev.filter((x) => x.id !== s.id));
@@ -171,6 +191,7 @@ export function App() {
         setMessages([]);
         setTurnState(null);
         setStoryIndex('');
+        setStoryBranches([]);
         setStoryIndexRound(-1);
         setTab('setup');
       }
@@ -179,7 +200,7 @@ export function App() {
 
   useEffect(() => {
     api<{ cards: Card[] }>('/api/cards').then((d) => setCards(d.cards)).catch((e) => setError(e.message));
-    api<{ sessions: SessionInfo[] }>('/api/sessions').then((d) => setSessions(d.sessions)).catch(() => {});
+    refreshSessions();
     api<{ rules: RegexRule[] }>('/api/regex-rules').then((d) => setRegexRules(d.rules ?? [])).catch(() => {});
   }, []);
 
@@ -206,7 +227,7 @@ export function App() {
     setSessionId(sid);
     setContentMode(mode === 'nsf' ? 'nsf' : 'nsfw');
     setMessages([{ id: nextMsgId(), round: 0, role: 'assistant', content: `${greeting}\n\n（角色卡：${cardName} · ${mode}）` }]);
-    setSessions((s) => [{ id: sid, name: cardName || sid }, ...s]);
+    refreshSessions();
     setTab('chat');
     fetchTurnState(sid);
   };
@@ -247,10 +268,11 @@ export function App() {
         }
         if (ev.type === 'error') setError(String(ev.message ?? '回合失败'));
       });
-      // 回合结束 → 刷新推进槽（侧栏常驻）+ 拉真实 round（消息操作按 round 定位）
+      // 回合结束 → 刷新推进槽（侧栏常驻）+ 拉真实 round（消息操作按 round 定位）+ 会话预览
       fetchTurnState(sessionId);
       const h = await api<{ messages: { id: number; round: number; role: string; content: string }[] }>(`/api/session/${sessionId}/history`);
       setMessages(h.messages.map((x) => ({ ...x, id: x.id ?? nextMsgId() })));
+      refreshSessions();
     } catch (e) { setError((e as Error).message); }
     stopGenTimer();
     setBusy(false);
@@ -275,6 +297,7 @@ export function App() {
       const h = await api<{ messages: { id: number; round: number; role: string; content: string }[] }>(`/api/session/${sessionId}/history`);
       setMessages(h.messages.map((x) => ({ ...x, id: x.id ?? nextMsgId() })));
       fetchTurnState(sessionId);
+      refreshSessions();
     } catch (e) { setError((e as Error).message); }
     stopGenTimer();
     setBusy(false);
@@ -293,6 +316,7 @@ export function App() {
       const h = await api<{ messages: { id: number; round: number; role: string; content: string }[] }>(`/api/session/${sessionId}/history`);
       setMessages(h.messages.map((x) => ({ ...x, id: x.id ?? nextMsgId() })));
       fetchTurnState(sessionId);
+      refreshSessions();
     } catch (e) { setError((e as Error).message); }
     setBusy(false);
   };
@@ -350,15 +374,22 @@ export function App() {
             </div>
           </div>
         )}
-        {storyIndex && (
+        {(storyIndex || storyBranches.length > 0) && (
           <div className="status-box story-box">
             <div className="status-head">
               <span className="status-round">剧情分支索引</span>
               <span className="status-event">R{storyIndexRound}</span>
               <button className="mini-btn" title="重新生成剧情索引" onClick={() => { if (sessionId) fetchStoryIndex(sessionId, Math.max(storyIndexRound, turnState?.round ?? 0)); }} disabled={storyLoading}>↻</button>
             </div>
-            <div className="story-index">{storyIndex}</div>
-            <p className="story-hint">AI 生成 · 帮助决定下一步</p>
+            {storyIndex && <div className="story-index">{storyIndex}</div>}
+            {storyBranches.length > 0 && (
+              <div className="story-branches">
+                {storyBranches.map((b, i) => (
+                  <button key={i} className="branch-btn" onClick={() => applyBranch(b)} disabled={busy}>{b}</button>
+                ))}
+              </div>
+            )}
+            <p className="story-hint">AI 生成 · 点击分支填入输入框</p>
           </div>
         )}
         <h2>角色卡</h2>
@@ -374,8 +405,15 @@ export function App() {
         <ul>
           {sessions.map((s) => (
             <li key={s.id} className="session-row">
-              <button className="session-resume" onClick={() => resumeSession(s.id)} disabled={busy}>↻ {s.name}</button>
-              <button className="mini-btn" title="删除本会话（历史全部清除）" onClick={() => deleteSession(s)} disabled={busy}>🗑</button>
+              <button className="session-resume" onClick={() => { setConfirmDel(null); resumeSession(s.id); }} disabled={busy}>
+                <span className="session-name">{s.name}</span>
+                {s.preview && <span className="session-preview">{s.preview}</span>}
+              </button>
+              <button
+                className={`mini-btn${confirmDel === s.id ? ' mini-btn-danger' : ''}`}
+                title={confirmDel === s.id ? '再点一次确认删除（历史不可恢复）' : '删除本会话'}
+                onClick={() => deleteSession(s)} disabled={busy}
+              >{confirmDel === s.id ? '✓?' : '🗑'}</button>
             </li>
           ))}
         </ul>
@@ -422,19 +460,21 @@ export function App() {
                 const streaming = busy && i === messages.length - 1 && m.role === 'assistant' && m.content.length > 0;
                 const lastAssistantRound = messages.reduce((mx, x) => (x.role === 'assistant' ? Math.max(mx, x.round) : mx), 0);
                 const isLastAssistant = m.role === 'assistant' && lastAssistantRound > 0 && m.round === lastAssistantRound;
+                const shown = cleanDisplay(m.content);
+                const msgHtml = m.role === 'assistant'
+                  ? extractHtmlFromCodeFence(shown) ?? (looksLikeHtml(shown) ? shown : null)
+                  : null;
                 return (
                   <div key={m.id} className={`msg ${m.role}`} ref={streaming ? streamingMsgRef : undefined}>
                     <div className="msg-body">
-                      {m.role === 'assistant' ? (
-                        looksLikeHtml(cleanDisplay(m.content)) ? (
-                          <HtmlMessage text={cleanDisplay(m.content)} />
-                        ) : (
-                          <div className={`bubble read${streaming ? ' streaming' : ''}`}>
-                            <MarkdownMessage text={cleanDisplay(m.content)} />
-                          </div>
-                        )
+                      {msgHtml ? (
+                        <HtmlMessage text={msgHtml} />
+                      ) : m.role === 'assistant' ? (
+                        <div className={`bubble read${streaming ? ' streaming' : ''}`}>
+                          <MarkdownMessage text={shown} />
+                        </div>
                       ) : (
-                        <div className="bubble">{cleanDisplay(m.content)}</div>
+                        <div className="bubble">{shown}</div>
                       )}
                       <div className="msg-ops">
                         {m.round > 0 && (
@@ -462,6 +502,7 @@ export function App() {
                 显示原文
               </label>
               <textarea
+                ref={inputRef}
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } }}

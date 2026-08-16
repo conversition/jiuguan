@@ -86,6 +86,39 @@ function parseArgs(argv: string[]): SessionArgs {
   };
 }
 
+/** 从 AI 剧情索引输出解析：content（局势/伏笔）+ branches（建议分支按钮，最多 4 个）
+ * 容错：段标记兼容【建议分支】/建议分支/建议分支：；无标记时兜底取文本末尾的连续 bullet 行 */
+function parseStoryIndex(text: string): { content: string; branches: string[] } {
+  const raw = text.split('\n');
+  const lines = raw.map((l) => l.trim());
+  const brkIdx = lines.findIndex((l) => /建议分支/.test(l));
+  const isBranchLine = (l: string) => /^[-•·*＊]/.test(l) || /^\d{1,2}[.、]/.test(l);
+  const clean = (l: string) => l
+    .replace(/^[-•·*＊\s]+/, '')
+    .replace(/^\d{1,2}[.、]\s*/, '')
+    .replace(/^分支\d+[：:、]\s*/, '')
+    .replace(/^行动\d+[：:、]\s*/, '')
+    .replace(/[）)]\s*$/, '')
+    .trim();
+
+  const content = (brkIdx >= 0 ? lines.slice(0, brkIdx) : lines).join('\n').trim();
+
+  let branches: string[] = [];
+  if (brkIdx >= 0) {
+    branches = lines.slice(brkIdx + 1).filter(isBranchLine).map(clean).filter((l) => l.length > 1);
+  }
+  // 兜底：无标记时取末尾连续 bullet 行（很多模型把分支放最后）
+  if (branches.length === 0) {
+    const trailing: string[] = [];
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (isBranchLine(lines[i])) trailing.unshift(lines[i]);
+      else if (trailing.length > 0) break;
+    }
+    branches = trailing.map(clean).filter((l) => l.length > 1);
+  }
+  return { content, branches: branches.slice(0, 4) };
+}
+
 export class ChatSession {
   private mem: MemoryDb;
   private writer: WriteLoop;
@@ -154,6 +187,17 @@ export class ChatSession {
   /** 关闭会话（释放 DB 文件句柄；服务端删除会话用） */
   close(): void {
     try { this.mem.close(); } catch { /* 已关闭 */ }
+  }
+
+  /** 卡名写入 memory_meta.config（会话列表标题用，避免依赖开场白文本/HTML） */
+  private persistCardName(): void {
+    if (!this.cardName) return;
+    try {
+      const row = this.mem.db.prepare('SELECT config FROM memory_meta WHERE id = 1').get() as { config: string } | undefined;
+      const cfg = row ? (JSON.parse(row.config ?? '{}') as Record<string, unknown>) : {};
+      cfg.card = this.cardName;
+      this.mem.db.prepare('UPDATE memory_meta SET config = ? WHERE id = 1').run(JSON.stringify(cfg));
+    } catch { /* 忽略 */ }
   }
 
   // ── 记忆控制台调试方法（Web 前端对接）──
@@ -411,6 +455,8 @@ export class ChatSession {
       if (!this.args.resume) {
         this.writer.initMeta({ personal: 0, accident: 0, main: 0, erotic: 0 }, {});
       }
+      // 会话标题持久化：卡名写入 memory_meta.config（会话列表标题用）
+      this.persistCardName();
       onStage?.('ready');
       console.log(`[角色卡] ${this.cardName}`);
       if (!this.args.resume && this.greeting) {
@@ -799,9 +845,9 @@ export class ChatSession {
   // ── 剧情分支索引（AI 生成，按轮缓存；帮助玩家决定下一步，减轻思考负担）──
 
   /** 生成第 round 轮的剧情分支索引：命中 story_index 缓存直接返回；否则由 AI 基于记忆生成 */
-  async generateStoryIndex(round: number): Promise<{ content: string; round: number; fromCache: boolean }> {
+  async generateStoryIndex(round: number): Promise<{ content: string; branches: string[]; round: number; fromCache: boolean }> {
     const cached = this.mem.db.prepare('SELECT content FROM story_index WHERE round = ?').get(round) as { content: string } | undefined;
-    if (cached) return { content: cached.content, round, fromCache: true };
+    if (cached) return { ...parseStoryIndex(cached.content), round, fromCache: true };
 
     // 从 DB 装配剧情记忆上下文（有界）
     const arcs = this.mem.db.prepare('SELECT title, summary FROM memory_arc ORDER BY id DESC LIMIT 10').all() as { title: string; summary: string }[];
@@ -825,11 +871,15 @@ export class ChatSession {
       nextPlan ? `上一轮规划的下轮焦点: ${nextPlan}` : '',
     ].filter(Boolean).join('\n\n');
 
-    const prompt = `基于以下剧情记忆，生成一份"剧情分支索引"，帮助玩家决定下一步行动。要求：
-1. 【当前局势】1-2 句话概括
-2. 【未解决伏笔 / 悬念】列出 2-4 个
-3. 【建议分支】给出 2-4 个可选行动分支，每行一个，格式 "- 分支名：做法（可能后果）"
-只输出索引正文，≤450 字，不用 XML，不加额外层级。
+    const prompt = `基于以下剧情记忆，生成一份"剧情分支索引"，帮助玩家决定下一步行动。必须严格按下面三段格式输出，段落标题必须是【当前局势】【未解决伏笔】【建议分支】：
+【当前局势】1-2 句话概括
+【未解决伏笔】
+- （列出伏笔，每行一个）
+【建议分支】
+- （一个玩家可执行的行动指令）
+- （另一个行动指令）
+- （又一个行动指令）
+要求：建议分支 3-4 个，每个必须结合剧情记忆生成、是当下最合理的行动，直接写玩家可执行的指令（如"- 前往旧校舍调查封印"），以 "- " 开头，不要加"分支1"等前缀，不要写后果括号；【未解决伏笔】不要用"- "之外的编号。整段 ≤450 字，不用 XML。
 
 ===剧情记忆===
 ${context}`;
@@ -854,8 +904,9 @@ ${context}`;
     if (content.length > 2000) content = content.slice(0, 2000);
     this.mem.db.prepare('INSERT OR REPLACE INTO story_index (round, content, created_at) VALUES (?, ?, ?)')
       .run(round, content, new Date().toISOString());
-    console.log(`[剧情索引] round ${round} AI 生成 ${content.length} 字`);
-    return { content, round, fromCache: false };
+    const parsed = parseStoryIndex(content);
+    console.log(`[剧情索引] round ${round} AI 生成 ${parsed.branches.length} 个分支`);
+    return { ...parsed, round, fromCache: false };
   }
 }
 

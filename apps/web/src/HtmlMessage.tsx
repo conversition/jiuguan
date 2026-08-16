@@ -25,6 +25,14 @@ export function looksLikeHtml(text: string): boolean {
   return tags >= 3;
 }
 
+/** 从 markdown 代码围栏（``` 包整页 HTML）中提取 HTML；非围栏/围栏内非 HTML 返回 null */
+export function extractHtmlFromCodeFence(text: string): string | null {
+  const s = text.trimStart();
+  if (!s.startsWith('```')) return null;
+  const inner = s.replace(/^```[^\n]*\n?/, '').replace(/```\s*$/, '');
+  return looksLikeHtml(inner) ? inner : null;
+}
+
 /** 渲染为真实 HTML（dangerouslySetInnerHTML） */
 export function HtmlMessage({ text }: { text: string }) {
   return <div className="html-msg" dangerouslySetInnerHTML={{ __html: sanitizeHtml(text) }} />;

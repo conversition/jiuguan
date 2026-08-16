@@ -325,7 +325,11 @@ body { font-family: system-ui, 'PingFang SC', 'Microsoft YaHei', sans-serif; bac
 
 /* ═══════════ 会话列表操作（删除会话）═══════════ */
 .session-row { display: flex; gap: 4px; align-items: center; }
-.session-resume { flex: 1; min-width: 0; text-align: left; width: auto; }
+.session-resume { flex: 1; min-width: 0; text-align: left; width: auto; display: flex; flex-direction: column; align-items: flex-start; gap: 2px; }
+.session-name { font-size: 13px; color: var(--ink-1); font-weight: 600; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-preview { font-size: 11px; color: var(--ink-3); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mini-btn-danger { background: var(--danger); color: #fff; border-color: var(--danger); }
+.mini-btn-danger:hover { background: var(--danger); color: #fff; }
 
 /* ═══════════ 剧情分支索引（AI 生成侧栏卡片）═══════════ */
 .story-box .story-index {
@@ -338,3 +342,13 @@ body { font-family: system-ui, 'PingFang SC', 'Microsoft YaHei', sans-serif; bac
 .html-msg { width: 100%; color: var(--ink-2); }
 .html-msg > :first-child { margin-top: 0; }
 .html-msg img { max-width: 100%; height: auto; border-radius: 8px; }
+
+/* ═══════════ 剧情分支按钮（AI 索引 → 点按填入输入框）═══════════ */
+.story-branches { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+.branch-btn {
+  text-align: left; padding: 8px 10px; font-size: 12px; color: var(--ink-1); cursor: pointer;
+  background: var(--bg-deep); border: 1px solid var(--border); border-left: 3px solid var(--accent);
+  border-radius: 8px; transition: all .15s; word-break: break-word;
+}
+.branch-btn:hover { background: var(--bg-hover); border-left-color: var(--accent-ink); transform: translateX(2px); }
+.branch-btn:disabled { opacity: .5; cursor: default; }

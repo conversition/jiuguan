@@ -33,7 +33,7 @@ class FakeClient {
     return { content: null, toolCalls: [{ id: 'tc1', name: 'game_turn', arguments: arg }], finishReason: 'tool_calls', usage: null, raw: {} };
   }
   async complete() {
-    return { content: '滚动摘要：角色经历关键事件，目标延续。', toolCalls: [], finishReason: 'stop', usage: null, raw: {} };
+    return { content: '【当前局势】局势紧张。\n【未解决伏笔】\n- 伏笔A\n【建议分支】\n- 前往图书馆调查古籍线索\n- 向莉娜坦白你的怀疑\n- 先行撤退布置陷阱', toolCalls: [], finishReason: 'stop', usage: null, raw: {} };
   }
 }
 
@@ -115,8 +115,11 @@ async function main() {
   const idx1 = await s2.generateStoryIndex(4);
   check('story-index 生成非空', idx1.content.length > 0, `got ${JSON.stringify(idx1.content.slice(0, 24))}`);
   check('story-index 首次为 AI 生成', idx1.fromCache === false);
+  check('story-index 解析出分支按钮', idx1.branches.length === 3, `got ${JSON.stringify(idx1.branches)}`);
+  check('story-index 分支已清洗前缀', idx1.branches.every((b) => !b.startsWith('- ') && !b.startsWith('分支')), `got ${JSON.stringify(idx1.branches)}`);
   const idx2 = await s2.generateStoryIndex(4);
   check('story-index 二次命中缓存', idx2.fromCache === true);
+  check('story-index 缓存分支一致', idx2.branches.length === idx1.branches.length);
   const idxMiss = await s2.generateStoryIndex(5);
   check('story-index 不同轮不误命中', idxMiss.fromCache === false);
 

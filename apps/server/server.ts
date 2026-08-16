@@ -84,14 +84,26 @@ function chunkText(text: string, size = 60): string[] {
 }
 
 /** 读取会话 DB 摘要名（首条 assistant 消息前 15 字） */
-function sessionSummary(dbPath: string): string {
+/** 读取会话摘要（卡名/最新消息预览/轮次；HTML 清洗后截断） */
+function readSessionMeta(dbPath: string): { card: string; preview: string; round: number } {
   try {
     const mem = new MemoryDb({ path: dbPath });
-    const row = mem.db.prepare("SELECT content FROM chat_log WHERE role='assistant' ORDER BY id LIMIT 1").get() as { content: string } | undefined;
+    const meta = mem.db.prepare('SELECT config FROM memory_meta WHERE id = 1').get() as { config: string } | undefined;
+    const cfg = meta ? (JSON.parse(meta.config ?? '{}') as { card?: string }) : {};
+    // 预览优先取"非开场白的最后一条 assistant"（开场白常含 HTML/CSS 围栏，预览难读）
+    const last = (
+      mem.db.prepare("SELECT content FROM chat_log WHERE role='assistant' AND round > 0 ORDER BY id DESC LIMIT 1").get()
+      ?? mem.db.prepare("SELECT content FROM chat_log WHERE role='assistant' ORDER BY id DESC LIMIT 1").get()
+    ) as { content: string } | undefined;
+    const r = mem.db.prepare('SELECT COALESCE(MAX(round), 0) AS m FROM chat_log').get() as { m: number };
     mem.db.close();
-    if (row?.content) return row.content.replace(/\s+/g, ' ').slice(0, 15);
-  } catch { /* 保持 id 名 */ }
-  return '';
+    const strip = (t: string) => t
+      .replace(/```[^\n]*\n?/g, ' ')     // markdown 代码围栏
+      .replace(/<[^>]+>/g, ' ')          // HTML 标签
+      .replace(/\/\*[\s\S]*?\*\//g, ' ') // CSS/注释
+      .replace(/\s+/g, ' ').trim();
+    return { card: cfg.card ?? '', preview: last?.content ? strip(last.content).slice(0, 42) : '', round: r?.m ?? 0 };
+  } catch { return { card: '', preview: '', round: 0 }; }
 }
 
 const server = createServer(async (req, res) => {
@@ -106,14 +118,15 @@ const server = createServer(async (req, res) => {
       return json(res, { cards: listCards().map((c) => ({ id: c.file, name: c.name, format: c.format, source: c.source })) });
     }
 
-    // 会话列表（data/*.db，含摘要名）
+    // 会话列表（data/*.db：卡名标题 + 最新消息预览 + 轮次）
     if (method === 'GET' && p === '/api/sessions') {
       if (!existsSync(DATA_DIR)) return json(res, { sessions: [] });
       const dbs = readdirSync(DATA_DIR).filter((f) => f.endsWith('.db'));
       const list = dbs.map((f) => {
         const dbPath = resolve(DATA_DIR, f);
-        const name = sessionSummary(dbPath) || f.replace(/\.db$/, '');
-        return { id: f.replace(/\.db$/, ''), file: f, name };
+        const meta = readSessionMeta(dbPath);
+        const id = f.replace(/\.db$/, '');
+        return { id, file: f, name: meta.card || id, preview: meta.preview, round: meta.round };
       });
       return json(res, { sessions: list });
     }
@@ -276,7 +289,7 @@ const server = createServer(async (req, res) => {
       if (!Number.isInteger(round) || round < 0) return json(res, { error: 'round 非法' }, 400);
       try {
         const r = await session.generateStoryIndex(round);
-        return json(res, { content: r.content, round: r.round, fromCache: r.fromCache });
+        return json(res, { content: r.content, branches: r.branches ?? [], round: r.round, fromCache: r.fromCache });
       } catch (e) {
         return json(res, { error: (e as Error).message.slice(0, 200) }, 400);
       }
@@ -291,7 +304,10 @@ const server = createServer(async (req, res) => {
       const dbPath = resolve(DATA_DIR, `${id}.db`);
       let removed = false;
       try {
-        if (existsSync(dbPath)) { rmSync(dbPath, { force: true }); removed = true; }
+        for (const suffix of ['', '-wal', '-shm']) {
+          const f = suffix ? `${dbPath}${suffix}` : dbPath;
+          if (existsSync(f)) { rmSync(f, { force: true }); removed = true; }
+        }
       } catch (e) {
         return json(res, { error: (e as Error).message.slice(0, 200) }, 400);
       }
