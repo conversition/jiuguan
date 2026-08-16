@@ -69,7 +69,7 @@ echo   浏览器已打开 http://localhost:5173
 echo   · 后端窗口: jiuguan-API(17800)   （终端可见每轮回合日志）
 echo   · 前端窗口: jiuguan-Web(5173)
 echo   · 首次使用: 若提示缺 key，在页面 "Provider" 面板粘贴保存
-echo   · 关闭: 直接关闭两个黑窗口即可
+echo   · 关闭: 直接关闭 两个黑窗口（API/Web）即可；关不掉就双击 停止.bat
 echo   · 换端口: 设 JG_WEB_PORT 后后端/vite 代理自动跟随
 echo ============================================================
 pause

@@ -14,20 +14,22 @@
 import { readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
-import { parseCharaCard } from '../../packages/core/src/chara.ts';
+import { parseCharaCard, extractCharaFromPng, pngPayloadToJson } from '../../packages/core/src/chara.ts';
 import { cardBookToLorebookRows, parseWorldBook, entryToLorebookRow } from '../../packages/core/src/worldbook.ts';
 import { parsePreset } from '../../packages/core/src/preset.ts';
 import { RegexLibrary } from '../../packages/core/src/regex-library.ts';
+import { applyRegexRules } from '../../packages/core/src/regex.ts';
 import { LorebookScanner } from '../../packages/core/src/scanner.ts';
 import { matchSkills, renderSkillBlock } from '../../packages/core/src/skills.ts';
 import { MemoryDb } from '../../packages/memory/src/db.ts';
 import { WriteLoop } from '../../packages/memory/src/writer.ts';
+import type { WriteResult } from '../../packages/memory/src/writer.ts';
 import { RetrievalEngine } from '../../packages/memory/src/retrieval.ts';
 import { Vectorizer } from '../../packages/memory/src/vectorize.ts';
 import { createEmbeddingProvider, HashEmbeddingProvider } from '../../packages/memory/src/embedding.ts';
 import { VariableManager } from '../../packages/variable/src/vms.ts';
 import { persistVariables, restoreVariables } from '../../packages/variable/src/persist.ts';
-import { assembleTurn, DEFAULT_SYSTEM_CORE } from '../../packages/prompt/src/assembly.ts';
+import { assembleTurn, DEFAULT_SYSTEM_CORE, estimateTokens } from '../../packages/prompt/src/assembly.ts';
 import { validateGameTurn, safeParseTurn, normalizeTurn, createProseStreamExtractor } from '../../packages/prompt/src/turn.ts';
 import type { GameTurn } from '../../packages/prompt/src/turn.ts';
 import { OpenAICompatibleClient, toolLoopMessages } from '../../packages/proxy/src/client.ts';
@@ -108,6 +110,11 @@ export class ChatSession {
   private plugins: PluginHost;
   /** 正则库（04 §4.3：卡片 regex_scripts 自动导入 + 前端屏蔽隐藏规则） */
   private regexLib: RegexLibrary;
+  /** 滑动窗口配置（长对话防爆 token；env 可覆盖） */
+  private windowN = Number(process.env.JG_WINDOW_N ?? 12);
+  private windowTokens = Number(process.env.JG_WINDOW_TOKENS ?? 1500);
+  private longtermTokens = Number(process.env.JG_LONGTERM_TOKENS ?? 800);
+  private summaryRounds = Number(process.env.JG_SUMMARY_ROUNDS ?? 20);
 
   /** 内容模式模块加载（WP14：可编辑文件 data/content-modes.json） */
   private loadContentModes(): void {
@@ -142,6 +149,11 @@ export class ChatSession {
   }
   getMemory(): { mem: MemoryDb; round: number } {
     return { mem: this.mem, round: this.round };
+  }
+
+  /** 关闭会话（释放 DB 文件句柄；服务端删除会话用） */
+  close(): void {
+    try { this.mem.close(); } catch { /* 已关闭 */ }
   }
 
   // ── 记忆控制台调试方法（Web 前端对接）──
@@ -229,14 +241,18 @@ export class ChatSession {
     };
   }
 
-  /** 当前回合状态（推进槽/事件类型/NSFW 锁定） */
-  getTurnState(): { bars: Record<string, number>; event_type: string; nsfw_lock: { locked: boolean; round: number }; round: number } {
+  /** 当前回合状态（推进槽/事件类型/NSFW 锁定 + 滑动窗口/长期摘要统计） */
+  getTurnState(): { bars: Record<string, number>; event_type: string; nsfw_lock: { locked: boolean; round: number }; round: number; window: { count: number; tokens: number; truncated: boolean }; longterm: number } {
     const meta = this.getMeta();
+    const window = this.buildChatWindow(this.round - 1);
+    const longRow = this.mem.db.prepare('SELECT longterm FROM memory_meta WHERE id = 1').get() as { longterm: string } | undefined;
     return {
       bars: meta ? JSON.parse(meta.bars ?? '{}') as Record<string, number> : {},
       event_type: this.lastEventType,
       nsfw_lock: this.lastNsfwLock,
       round: this.round,
+      window: { count: window.messages.length, tokens: window.tokens, truncated: window.truncated },
+      longterm: (longRow?.longterm ?? '').length,
     };
   }
 
@@ -352,7 +368,16 @@ export class ChatSession {
     if (restored > 0) console.log(`[变量] 从快照恢复 ${restored} 个变量`);
     if (this.args.card) {
       onStage?.('card');
-      const parsed = parseCharaCard(readFileSync(this.args.card, 'utf8'));
+      // 角色卡解析：PNG 卡自动解包 chara tEXt（酒馆 PNG 首次可用）
+      const cardBuf = readFileSync(this.args.card);
+      const cardText = this.args.card.toLowerCase().endsWith('.png')
+        ? (() => {
+            const payload = extractCharaFromPng(cardBuf);
+            if (!payload) throw new Error(`PNG 卡无 chara 元数据: ${this.args.card}`);
+            return pngPayloadToJson(payload);
+          })()
+        : cardBuf.toString('utf8');
+      const parsed = parseCharaCard(cardText);
       // 正则库：自动导入卡片 regex_scripts（隐藏类启用 / 美化类禁用），前端据此屏蔽隐藏
       const rgx = this.regexLib.importFromCard(parsed.regexScripts);
       if (rgx.imported > 0) console.log(`[正则] 卡片导入 ${rgx.imported} 条（跳过重复 ${rgx.skipped}，库共 ${this.regexLib.list().length} 条）`);
@@ -400,9 +425,9 @@ export class ChatSession {
     this.plugins.start({ card: this.cardName, resume: this.args.resume });
   }
 
-  private logChat(role: string, content: string, round: number): void {
-    this.mem.db.prepare('INSERT INTO chat_log (round, role, content, created_at) VALUES (?,?,?,?)')
-      .run(round, role, content, new Date().toISOString());
+  private logChat(role: string, content: string, round: number): number {
+    return this.mem.db.prepare('INSERT INTO chat_log (round, role, content, created_at) VALUES (?,?,?,?)')
+      .run(round, role, content, new Date().toISOString()).lastInsertRowid as number;
   }
 
   /** 单轮对话
@@ -411,9 +436,21 @@ export class ChatSession {
    */
   async turn(userInput: string, contentMode?: 'nsfw' | 'nsf', onProse?: (chunk: string) => void): Promise<string> {
     this.round++;
-    const round = this.round;
-    const mode = contentMode ?? this.args.contentMode ?? 'nsfw';
+    return this.runTurnCore(this.round, userInput, contentMode ?? this.args.contentMode ?? 'nsfw', onProse, { logUser: true });
+  }
+
+  /** 每轮核心（turn / regenerate 共用）：预计算→装配→模型→写环→引擎 tick→持久化→账本 */
+  private async runTurnCore(
+    round: number, userInput: string, mode: 'nsfw' | 'nsf',
+    onProse: ((chunk: string) => void) | undefined,
+    opts: { logUser: boolean },
+  ): Promise<string> {
+    this.round = round;
     const emit = onProse ?? (() => {});
+    // 0. 回合账本：写环前快照（重新生成/删除可精确回滚）+ 滑动窗口 + 滚动摘要
+    const pre = this.snapshotPre();
+    const windowInfo = this.buildChatWindow(round - 1);
+    await this.maybeRollingSummarize(round, windowInfo);
 
     // ① 平台预计算（并行：检索 + 扫描 + 变量 + Skill 自觉匹配）
     const [recall, scan, skillMatches] = await Promise.all([
@@ -425,7 +462,7 @@ export class ChatSession {
     const skillBlock = renderSkillBlock(skillMatches);
     if (skillMatches.length > 0) console.log(`[Skill] 命中 ${skillMatches.map((m) => `${m.skill.name}(${m.score.toFixed(2)})`).join(', ')}`);
     const vmsResult = this.vms.evaluate();
-    console.log(`[预计算] 检索 ${recall.hits.length} 条 / 世界书 ${scan.activated.length} 条 / 变量 ${Object.keys(vmsResult.values).length} 个`);
+    console.log(`[预计算] 检索 ${recall.hits.length} 条 / 世界书 ${scan.activated.length} 条 / 变量 ${Object.keys(vmsResult.values).length} 个 / 窗口 ${windowInfo.messages.length} 条 ${windowInfo.tokens}t${windowInfo.truncated ? '（截断）' : ''}`);
 
     // ② 装配
     // 推进槽：从 memory_meta 读实际值（引擎状态块随动态状态注入）
@@ -448,13 +485,15 @@ export class ChatSession {
       dynamicState,
       presetBlocks: this.presetBlocks,
       memoryBlock: recall.injectedBlock,
+      longTermBlock: this.getLongTermBlock(),
+      chatHistory: windowInfo.messages,
       lastTurn: this.lastTurn,
       userInput: userContent,
       useTools: true,
       variableValues,
       nsfwModule: this.nsfwModuleFor(mode),
     });
-    this.logChat('user', userInput, round);
+    if (opts.logUser) this.logChat('user', userInput, round);
 
     // ③ 模型调用（真流式）+ 校验 + 错误召回重试（统一：最多 2 次尝试，每次均过 归一化→校验；重试消息用首轮 tool_call 注入错误）
     const attemptTurn = async (messages: import('../../packages/proxy/src/client.ts').ChatMessage[]):
@@ -498,6 +537,8 @@ export class ChatSession {
     if (!turn) {
       const msg = '（本轮回合生成失败，请重试）';
       this.logChat('assistant', msg, round);
+      // 失败轮也记账本（created 空），后续删除该轮不崩
+      this.writeLedger(round, pre, { mainCode: '', eventCodes: [], eventIds: [] }, 0, 0);
       return msg;
     }
 
@@ -528,7 +569,293 @@ export class ChatSession {
     // ⑥ VMS 快照落库（引擎 tick 变更的叶子即刻持久化，不依赖下一次 evaluate）
     persistVariables(this.mem, this.vms, round);
     this.mem.checkpoint();
+    // ⑦ 回合账本：记录本轮新写行 + 写环前快照
+    const userMsgId = this.mem.db.prepare('SELECT id FROM chat_log WHERE round = ? AND role = ? ORDER BY id DESC LIMIT 1')
+      .get(round, 'user') as { id: number } | undefined;
+    const assistMsgId = this.mem.db.prepare("SELECT id FROM chat_log WHERE round = ? AND role = 'assistant' ORDER BY id DESC LIMIT 1")
+      .get(round) as { id: number } | undefined;
+    this.writeLedger(round, pre, {
+      summaryId: wr.summaryId, mainCode: wr.insertedCodes[0] ?? '', arcId: wr.arcId,
+      eventCodes: wr.insertedCodes.slice(1), eventIds: wr.eventIds,
+    }, userMsgId?.id ?? 0, assistMsgId?.id ?? 0);
     return turn.prose;
+  }
+
+  // ── 重新生成 / 删除历史（round 账本机制）──
+
+  /** 重新生成第 round 轮 AI 回复：回滚该轮状态（保留用户行）→ 用存储的用户输入重放 */
+  async regenerate(round: number, onProse?: (chunk: string) => void): Promise<{ prose: string; round: number; assistantMsgId: number | null }> {
+    const userRow = this.mem.db.prepare('SELECT content FROM chat_log WHERE round = ? AND role = ? ORDER BY id DESC LIMIT 1')
+      .get(round, 'user') as { content: string } | undefined;
+    if (!userRow) throw new Error(`round ${round} 无用户消息，无法重新生成`);
+    this.rollbackStateOnly(round);
+    const prose = await this.runTurnCore(round, userRow.content, this.args.contentMode ?? 'nsfw', onProse, { logUser: false });
+    const aid = this.mem.db.prepare("SELECT id FROM chat_log WHERE round = ? AND role = 'assistant' ORDER BY id DESC LIMIT 1")
+      .get(round) as { id: number } | undefined;
+    return { prose, round, assistantMsgId: aid?.id ?? null };
+  }
+
+  /** 删除消息（round=整轮 user+assistant+状态回滚；fromHere=从该轮到末尾全删） */
+  deleteMessages(round: number, mode: 'round' | 'fromHere'): { ok: boolean; round: number } {
+    if (round < 1) throw new Error('round 0（开场白）不可删除');
+    if (mode === 'fromHere') {
+      const max = this.loadRound();
+      for (let r = max; r >= round; r--) this.rollbackRound(r);
+    } else {
+      this.rollbackRound(round);
+    }
+    this.round = (this.mem.db.prepare('SELECT COALESCE(MAX(round), 0) AS m FROM chat_log').get() as { m: number }).m;
+    return { ok: true, round };
+  }
+
+  /** 写环前快照：memory_meta 单行 + memory_state 全量 + 内存态（供回滚精确还原） */
+  private snapshotPre(): {
+    meta: Record<string, unknown> | null;
+    state: { entity_type: string; entity_id: string; name: string; state_json: string; updated_round: number }[];
+    round: number; lastTurn?: string; lastEventType: string; lastNsfwLock: { locked: boolean; round: number };
+  } {
+    const meta = this.mem.db.prepare('SELECT arc_id, stage, plot_round, bars, config, longterm, summary_round FROM memory_meta WHERE id = 1')
+      .get() as Record<string, unknown> | undefined;
+    const state = this.mem.db.prepare('SELECT entity_type, entity_id, name, state_json, updated_round FROM memory_state').all() as {
+      entity_type: string; entity_id: string; name: string; state_json: string; updated_round: number;
+    }[];
+    return {
+      meta: meta ?? null,
+      state,
+      round: this.round, lastTurn: this.lastTurn, lastEventType: this.lastEventType, lastNsfwLock: this.lastNsfwLock,
+    };
+  }
+
+  private writeLedger(
+    round: number,
+    pre: ReturnType<ChatSession['snapshotPre']>,
+    created: { summaryId?: number; mainCode: string; arcId?: number; eventCodes: string[]; eventIds: number[] },
+    userMsgId: number, assistantMsgId: number,
+  ): void {
+    // meta_snapshot 附带内存态字段（_last*），回滚一并还原
+    const metaSnap = {
+      ...(pre.meta ?? {}),
+      _lastTurn: pre.lastTurn,
+      _lastEventType: pre.lastEventType,
+      _lastNsfwLock: pre.lastNsfwLock,
+    };
+    this.mem.db.prepare(
+      `INSERT OR REPLACE INTO round_ledger (round, user_msg_id, assistant_msg_id, meta_snapshot, state_snapshot, created, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).run(round, userMsgId, assistantMsgId, JSON.stringify(metaSnap), JSON.stringify(pre.state), JSON.stringify(created), new Date().toISOString());
+  }
+
+  /** 回滚第 round 轮：删本轮新写行 + 恢复写环前状态；keepUser=true 保留用户行（重新生成路径） */
+  private restoreFromLedger(round: number, keepUser: boolean): void {
+    const ledger = this.mem.db.prepare('SELECT meta_snapshot, state_snapshot, created FROM round_ledger WHERE round = ?')
+      .get(round) as { meta_snapshot: string; state_snapshot: string; created: string } | undefined;
+    if (!ledger) return;
+    let meta: Record<string, unknown> | null;
+    let state: { entity_type: string; entity_id: string; name: string; state_json: string; updated_round: number }[];
+    let created: { summaryId?: number; mainCode: string; arcId?: number; eventCodes: string[]; eventIds: number[] };
+    try { meta = JSON.parse(ledger.meta_snapshot) as Record<string, unknown> | null; } catch { return; }
+    try { state = JSON.parse(ledger.state_snapshot) as typeof state; } catch { state = []; }
+    try { created = JSON.parse(ledger.created) as typeof created; } catch { created = { mainCode: '', eventCodes: [], eventIds: [] }; }
+
+    // 1. chat_log
+    if (keepUser) this.mem.db.prepare("DELETE FROM chat_log WHERE round = ? AND role = 'assistant'").run(round);
+    else this.mem.db.prepare('DELETE FROM chat_log WHERE round = ?').run(round);
+    // 2. memory_summary（round 精确；FTS 触发器自动清）
+    this.mem.db.prepare('DELETE FROM memory_summary WHERE round = ?').run(round);
+    // 3. memory_arc（主码 + title 兜底，避免双表孤儿）
+    if (created.mainCode) this.mem.db.prepare('DELETE FROM memory_arc WHERE code = ?').run(created.mainCode);
+    this.mem.db.prepare('DELETE FROM memory_arc WHERE title = ?').run(`R${round}`);
+    // 4. memory_event（本轮新事件码）
+    const evCodes = (created.eventCodes ?? []).filter((c) => c);
+    if (evCodes.length > 0) {
+      this.mem.db.prepare(`DELETE FROM memory_event WHERE code IN (${evCodes.map(() => '?').join(',')})`).run(...evCodes);
+    }
+    // 5. vec_memory（源行删除）
+    const vecIds = [created.summaryId, created.arcId, ...(created.eventIds ?? [])]
+      .filter((x): x is number => typeof x === 'number' && x > 0);
+    if (vecIds.length > 0) {
+      this.mem.db.prepare(`DELETE FROM vec_memory WHERE row_id IN (${vecIds.map(() => '?').join(',')})`).run(...vecIds);
+    }
+    // 5b. 剧情索引缓存随轮删除（rollback 后该轮索引失效，下次按需重建）
+    this.mem.db.prepare('DELETE FROM story_index WHERE round = ?').run(round);
+    // 6. memory_state 全量恢复（行数少，直接重建；FTS 触发器自动清）
+    this.mem.db.prepare('DELETE FROM memory_state').run();
+    const insState = this.mem.db.prepare(
+      'INSERT INTO memory_state (entity_type, entity_id, name, state_json, updated_round) VALUES (?, ?, ?, ?, ?)'
+    );
+    const newIds: number[] = [];
+    for (const s of state) newIds.push(Number(insState.run(s.entity_type, s.entity_id, s.name, s.state_json, s.updated_round).lastInsertRowid));
+    // idx_entity.state 重建（行 id 已变）
+    this.mem.db.prepare("DELETE FROM idx_entity WHERE category = 'state'").run();
+    const insIdx = this.mem.db.prepare('INSERT OR REPLACE INTO idx_entity (entity, category, row_id, weight) VALUES (?, ?, ?, ?)');
+    state.forEach((s, i) => insIdx.run(s.entity_id, 'state', newIds[i], 1.0));
+    // 7. memory_meta 整行还原（含 longterm/summary_round）
+    this.mem.db.prepare('DELETE FROM memory_meta').run();
+    this.mem.db.prepare(
+      'INSERT INTO memory_meta (id, arc_id, stage, plot_round, bars, config, longterm, summary_round) VALUES (1, ?, ?, ?, ?, ?, ?, ?)'
+    ).run(meta.arc_id ?? 'arc-1', meta.stage ?? 'setup', meta.plot_round ?? 0, meta.bars ?? '{}',
+      meta.config ?? '{}', meta.longterm ?? '', meta.summary_round ?? 0);
+    // 8. 内存态 + VMS 重载（restoreVariables 按快照重注册 literal，来源随后覆盖）
+    this.round = Number(meta.plot_round ?? 0);
+    this.lastTurn = typeof meta._lastTurn === 'string' ? meta._lastTurn : undefined;
+    this.lastEventType = (meta._lastEventType as string) ?? 'normal';
+    this.lastNsfwLock = (meta._lastNsfwLock as { locked: boolean; round: number }) ?? { locked: false, round: 0 };
+    restoreVariables(this.mem, this.vms);
+  }
+
+  /** 重新生成路径：仅删 assistant + 回滚状态，保留用户行 */
+  private rollbackStateOnly(round: number): void {
+    this.restoreFromLedger(round, true);
+  }
+
+  /** 删除整轮：删 user+assistant + 回滚状态 */
+  private rollbackRound(round: number): void {
+    this.restoreFromLedger(round, false);
+  }
+
+  // ── 滑动窗口 + 滚动摘要（长对话防爆 token）──
+
+  /** 近期对话窗口：从新往旧累积，token/条数预算内保持正序；prompt 层正则清洗内部标记 */
+  private buildChatWindow(maxRound: number): { messages: { role: string; content: string }[]; truncated: boolean; tokens: number; startRound: number } {
+    const rows = this.mem.db.prepare('SELECT round, role, content FROM chat_log WHERE round <= ? ORDER BY id ASC').all(maxRound) as {
+      round: number; role: string; content: string;
+    }[];
+    const kept: { round: number; role: string; content: string }[] = [];
+    let tokens = 0;
+    let truncated = false;
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const r = rows[i];
+      if (kept.length >= this.windowN) { truncated = true; break; }
+      const clean = applyRegexRules(r.content, this.regexLib.list(), 'prompt').text;
+      const t = estimateTokens(clean);
+      if (tokens + t > this.windowTokens && kept.length > 0) { truncated = true; break; }
+      kept.push({ round: r.round, role: r.role, content: clean });
+      tokens += t;
+    }
+    kept.reverse();
+    return {
+      messages: kept.map(({ round: _r, role, content }) => ({ role, content })),
+      truncated, tokens,
+      startRound: kept.length > 0 ? kept[0].round : 0,
+    };
+  }
+
+  /** 只读长期摘要（memory_meta.longterm），按 longtermTokens 预算截断 */
+  private getLongTermBlock(): string {
+    const row = this.mem.db.prepare('SELECT longterm FROM memory_meta WHERE id = 1').get() as { longterm: string } | undefined;
+    const lt = (row?.longterm ?? '').trim();
+    if (!lt) return '';
+    let out = lt;
+    while (estimateTokens(out) > this.longtermTokens && out.length > 80) out = out.slice(0, Math.floor(out.length * 0.8));
+    return `<长期摘要>\n${out}${out !== lt ? '…' : ''}\n</长期摘要>`;
+  }
+
+  /** 滚动摘要触发：窗口真实截断 & 距上次摘要 ≥ SUMMARY_ROUNDS */
+  private async maybeRollingSummarize(round: number, window: { truncated: boolean; startRound: number }): Promise<void> {
+    if (!window.truncated) return;
+    const meta = this.mem.db.prepare('SELECT summary_round FROM memory_meta WHERE id = 1').get() as { summary_round: number } | undefined;
+    const last = meta?.summary_round ?? 0;
+    if (round - last < this.summaryRounds) return;
+    await this.rollingSummarize(round, window.startRound);
+  }
+
+  /** 压缩滑出窗口的旧文 + 旧 longterm → 新 longterm（+1 次模型往返，阈值才触发） */
+  private async rollingSummarize(round: number, windowStartRound: number): Promise<void> {
+    const rows = this.mem.db.prepare('SELECT role, content FROM chat_log WHERE round >= 2 AND round < ? ORDER BY id DESC')
+      .all(windowStartRound) as { role: string; content: string }[];
+    const lines: string[] = [];
+    let chars = 0;
+    for (const r of rows) {
+      const line = `${r.role === 'user' ? '玩家' : '角色'}: ${r.content}`;
+      if (chars + line.length > 4000) break;
+      lines.unshift(line);
+      chars += line.length;
+    }
+    if (lines.length === 0) return;
+    const oldLong = this.getLongTermBlock();
+    const prompt = `以下是从对话窗口中滑出的近期剧情（按时间正序）：\n\n${lines.join('\n')}\n\n${oldLong ? `旧的长期摘要：\n${oldLong}\n\n` : ''}请输出合并去重后的新长期摘要，聚焦：角色关系、当前处境与目标、关键事件、未解决伏笔、已获物品/技能。要求：正文 ≤500 字，不含任何 XML/标签。`;
+    let summary = '';
+    try {
+      const res = await this.client.complete({
+        messages: [
+          { role: 'system', content: '你是剧情记忆压缩器，只输出摘要正文，禁止解释、禁止输出对话。' },
+          { role: 'user', content: prompt },
+        ],
+        temperature: 0.3,
+        max_tokens: 700,
+      });
+      summary = (res.content ?? '').trim();
+    } catch (e) {
+      console.warn(`[摘要] 压缩失败，跳过本轮: ${(e as Error).message.slice(0, 80)}`);
+      return;
+    }
+    if (!summary) return;
+    let kept = summary.replace(/<[^>]{0,40}>/g, '');
+    while (estimateTokens(kept) > this.longtermTokens && kept.length > 80) kept = kept.slice(0, Math.floor(kept.length * 0.8));
+    this.mem.db.prepare('UPDATE memory_meta SET longterm = ?, summary_round = ? WHERE id = 1').run(kept, round);
+    console.log(`[摘要] 滚动压缩 ${lines.length} 条旧文 → ${kept.length} 字（第 ${round} 轮触发）`);
+  }
+
+  // ── 剧情分支索引（AI 生成，按轮缓存；帮助玩家决定下一步，减轻思考负担）──
+
+  /** 生成第 round 轮的剧情分支索引：命中 story_index 缓存直接返回；否则由 AI 基于记忆生成 */
+  async generateStoryIndex(round: number): Promise<{ content: string; round: number; fromCache: boolean }> {
+    const cached = this.mem.db.prepare('SELECT content FROM story_index WHERE round = ?').get(round) as { content: string } | undefined;
+    if (cached) return { content: cached.content, round, fromCache: true };
+
+    // 从 DB 装配剧情记忆上下文（有界）
+    const arcs = this.mem.db.prepare('SELECT title, summary FROM memory_arc ORDER BY id DESC LIMIT 10').all() as { title: string; summary: string }[];
+    const events = this.mem.db.prepare('SELECT description FROM memory_event ORDER BY id DESC LIMIT 10').all() as { description: string }[];
+    const meta = this.getMeta();
+    const bars = meta ? JSON.parse(meta.bars ?? '{}') as Record<string, number> : {};
+    const longterm = this.getLongTermBlock();
+    let nextPlan = '';
+    try {
+      const last = this.lastTurn ? JSON.parse(this.lastTurn) as { next_plan?: string } : undefined;
+      nextPlan = last?.next_plan ?? '';
+    } catch { /* 忽略坏 JSON */ }
+    const arcText = arcs.reverse().map((a) => `· ${a.title}: ${a.summary.slice(0, 120)}`).join('\n') || '（暂无）';
+    const eventText = events.reverse().map((e) => `· ${e.description.slice(0, 120)}`).join('\n') || '（暂无）';
+    const context = [
+      `当前轮次: ${round}`,
+      `推进槽: ${JSON.stringify(bars)}`,
+      longterm ? `长期摘要:\n${longterm}` : '',
+      `主线脉络（大纲表）:\n${arcText}`,
+      `关键事件:\n${eventText}`,
+      nextPlan ? `上一轮规划的下轮焦点: ${nextPlan}` : '',
+    ].filter(Boolean).join('\n\n');
+
+    const prompt = `基于以下剧情记忆，生成一份"剧情分支索引"，帮助玩家决定下一步行动。要求：
+1. 【当前局势】1-2 句话概括
+2. 【未解决伏笔 / 悬念】列出 2-4 个
+3. 【建议分支】给出 2-4 个可选行动分支，每行一个，格式 "- 分支名：做法（可能后果）"
+只输出索引正文，≤450 字，不用 XML，不加额外层级。
+
+===剧情记忆===
+${context}`;
+
+    let content = '';
+    try {
+      const res = await this.client.complete({
+        messages: [
+          { role: 'system', content: '你是剧情参谋，输出精炼的剧情分支索引，帮助玩家选下一步。' },
+          { role: 'user', content: prompt },
+        ],
+        temperature: 0.7,
+        max_tokens: 600,
+      });
+      content = (res.content ?? '').trim();
+    } catch (e) {
+      console.warn(`[剧情索引] AI 生成失败，降级 DB 索引: ${(e as Error).message.slice(0, 80)}`);
+    }
+    if (!content) {
+      content = `（AI 索引暂不可用，展示剧情脉络）\n\n【主线脉络】\n${arcText}\n\n【关键事件】\n${eventText}`;
+    }
+    if (content.length > 2000) content = content.slice(0, 2000);
+    this.mem.db.prepare('INSERT OR REPLACE INTO story_index (round, content, created_at) VALUES (?, ?, ?)')
+      .run(round, content, new Date().toISOString());
+    console.log(`[剧情索引] round ${round} AI 生成 ${content.length} 字`);
+    return { content, round, fromCache: false };
   }
 }
 

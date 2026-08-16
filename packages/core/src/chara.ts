@@ -168,7 +168,6 @@ export function extractCharaFromPng(buffer: Buffer): string | null {
           let payload = buffer.toString('utf8', nullIdx + 1, dataEnd);
           if (type === 'zTXt') {
             try {
-              const { inflateSync } = awaitImportZlib();
               payload = inflateSync(buffer.subarray(nullIdx + 2, dataEnd)).toString('utf8');
             } catch { /* 解压失败返回 null */ }
           }
@@ -181,8 +180,57 @@ export function extractCharaFromPng(buffer: Buffer): string | null {
   return null;
 }
 
-/** 延迟导入 zlib（避免顶层依赖） */
-function awaitImportZlib(): { inflateSync: (b: Buffer) => Buffer } {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  return require('node:zlib') as { inflateSync: (b: Buffer) => Buffer };
+/** 延迟导入 zlib 的旧辅助已移除（ESM 下 require 不可用）；改用顶层 import */
+import { inflateSync, deflateSync } from 'node:zlib';
+
+// ── PNG 角色卡导出（酒馆兼容：chara tEXt 块，base64 JSON）──
+
+/** 从酒馆 PNG 中提取的 tEXt payload → 角色卡 JSON 文本（payload 为 base64，需解码） */
+export function pngPayloadToJson(payload: string): string {
+  const trimmed = payload.trim();
+  if (trimmed.startsWith('{')) return trimmed;
+  return Buffer.from(trimmed, 'base64').toString('utf8');
+}
+
+/** CRC32（PNG 块校验） */
+function crc32(buf: Buffer): number {
+  let c = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) {
+    c ^= buf[i];
+    for (let k = 0; k < 8; k++) c = (c >>> 1) ^ (0xedb88320 & -(c & 1));
+  }
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+/** PNG 块：length + type + data + crc */
+function pngChunk(type: string, data: Buffer): Buffer {
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(data.length, 0);
+  const typeBuf = Buffer.from(type, 'ascii');
+  const crcBuf = Buffer.alloc(4);
+  crcBuf.writeUInt32BE(crc32(Buffer.concat([typeBuf, data])), 0);
+  return Buffer.concat([len, typeBuf, data, crcBuf]);
+}
+
+/** 角色卡 JSON → 酒馆兼容 PNG（chara tEXt 元数据 + 1×1 占位图）。酒馆只读取 tEXt 元数据，图画尺寸无关 */
+export function buildCharaPng(json: string): Buffer {
+  const pngSignature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(1, 0);   // width
+  ihdr.writeUInt32BE(1, 4);   // height
+  ihdr[8] = 8;                // bit depth
+  ihdr[9] = 2;                // color type: truecolor RGB
+  ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+  const rawScanline = Buffer.from([0x00, 0x22, 0x22, 0x33]); // filter 0 + 1px RGB
+  const idat = deflateSync(rawScanline);
+  const charaKey = Buffer.from('chara\0', 'ascii');
+  charaKey.writeUInt8(0, 5);
+  const charaVal = Buffer.from(Buffer.from(json, 'utf8').toString('base64'), 'ascii');
+  return Buffer.concat([
+    pngSignature,
+    pngChunk('IHDR', ihdr),
+    pngChunk('tEXt', Buffer.concat([charaKey, charaVal])),
+    pngChunk('IDAT', idat),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]);
 }

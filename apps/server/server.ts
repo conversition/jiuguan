@@ -10,13 +10,15 @@
  * 会话实例进程内 Map + DB 文件持久化。
  */
 import { createServer, IncomingMessage, ServerResponse } from 'node:http';
-import { readdirSync, existsSync, statSync, readFileSync } from 'node:fs';
+import { readdirSync, existsSync, readFileSync, rmSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { ChatSession } from '../../tools/cli/session.ts';
 import { MemoryDb } from '../../packages/memory/src/db.ts';
 import { PluginRegistry } from '../../packages/plugin/src/registry.ts';
-import { listAssets, readAsset, saveUserAsset, deleteUserAsset } from '../../packages/core/src/asset-paths.ts';
+import { listAssets, readAsset, saveUserAsset, deleteUserAsset, listCards, resolveCard, readCardText, saveAssetBuffer } from '../../packages/core/src/asset-paths.ts';
 import { parseWorldBook } from '../../packages/core/src/worldbook.ts';
+import { parsePreset } from '../../packages/core/src/preset.ts';
+import { parseCharaCard, extractCharaFromPng, pngPayloadToJson, buildCharaPng } from '../../packages/core/src/chara.ts';
 import { RegexLibrary } from '../../packages/core/src/regex-library.ts';
 import { StoryboardOrchestrator, StoryboardRegistry, DEFAULT_WORKFLOW } from '../../tools/cli/storyboard-orchestrator.ts';
 import { OpenAICompatibleClient } from '../../packages/proxy/src/client.ts';
@@ -28,7 +30,6 @@ import { VariableManager } from '../../packages/variable/src/vms.ts';
 const PORT = Number(process.env.JG_WEB_PORT ?? 17800);
 const HOST = '127.0.0.1';
 const DATA_DIR = resolve('data');
-const CARDS_DIR = 'E:/claude cade test/project/jiuguanlike/剧本方案/角色卡';
 
 const sessions = new Map<string, ChatSession>();
 /** 插件注册表（插件市场：git URL 安装 / 启停 / 卸载 / 更新，数据在 data/plugins） */
@@ -102,8 +103,7 @@ const server = createServer(async (req, res) => {
 
     // 角色卡列表
     if (method === 'GET' && p === '/api/cards') {
-      const files = readdirSync(CARDS_DIR).filter((f) => f.endsWith('.json'));
-      return json(res, { cards: files.map((f) => ({ id: f, name: f.replace(/\.json$/, '') })) });
+      return json(res, { cards: listCards().map((c) => ({ id: c.file, name: c.name, format: c.format, source: c.source })) });
     }
 
     // 会话列表（data/*.db，含摘要名）
@@ -154,10 +154,11 @@ const server = createServer(async (req, res) => {
     if (method === 'POST' && p === '/api/session/new') {
       const body = await readBody(req);
       const cardFile = body.card ?? '';
-      const cardPath = resolve(CARDS_DIR, cardFile);
-      if (!cardFile || !existsSync(cardPath) || !statSync(cardPath).isFile()) {
+      const cardRes = resolveCard(cardFile);
+      if (!cardFile || !cardRes) {
         return json(res, { error: `角色卡不存在: ${cardFile}` }, 404);
       }
+      // 卡片导入会话（PNG 卡由 ChatSession 内部解包，见 tools/cli/session.ts init）
       sse(res);
       const dbName = `session-${Date.now()}.db`;
       const dbPath = resolve(DATA_DIR, dbName);
@@ -167,7 +168,7 @@ const server = createServer(async (req, res) => {
         presetOverrides = body.preset_overrides as Record<string, boolean>;
       }
       const session = new ChatSession({
-        card: cardPath, db: dbPath, resume: false, useBge: true, contentMode: mode,
+        card: cardRes.path, db: dbPath, resume: false, useBge: true, contentMode: mode,
         worldbooks: Array.isArray(body.worldbooks) ? body.worldbooks.map(String) : undefined,
         preset: typeof body.preset === 'string' && body.preset ? body.preset : undefined,
         presetOverrides,
@@ -221,6 +222,80 @@ const server = createServer(async (req, res) => {
       }
       res.end();
       return;
+    }
+
+    // 重新生成 AI 回复（回滚该轮状态 + 重放，SSE 流式同 /api/turn）
+    if (method === 'POST' && p.startsWith('/api/session/') && p.endsWith('/regenerate')) {
+      const id = p.split('/')[3];
+      const session = sessions.get(id);
+      if (!session) return json(res, { error: '会话不存在' }, 404);
+      const body = await readBody(req);
+      const round = Number(body.round ?? 0);
+      if (!Number.isInteger(round) || round < 1) return json(res, { error: 'round 非法' }, 400);
+      sse(res);
+      sseSend(res, { type: 'status', stage: 'thinking' });
+      try {
+        let streamStarted = false;
+        const r = await session.regenerate(round, (chunk) => {
+          if (!streamStarted) { sseSend(res, { type: 'status', stage: 'streaming' }); streamStarted = true; }
+          sseSend(res, { type: 'delta', text: chunk });
+        });
+        if (!streamStarted) sseSend(res, { type: 'status', stage: 'streaming' });
+        sseSend(res, { type: 'done', prose: r.prose, assistantMsgId: r.assistantMsgId, round: r.round });
+      } catch (e) {
+        sseSend(res, { type: 'error', message: (e as Error).message.slice(0, 200) });
+      }
+      res.end();
+      return;
+    }
+
+    // 删除消息（round=整轮 / fromHere=从该轮到末尾；状态按回合账本回滚）
+    if (method === 'POST' && p.startsWith('/api/session/') && p.endsWith('/message/delete')) {
+      const id = p.split('/')[3];
+      const session = sessions.get(id);
+      if (!session) return json(res, { error: '会话不存在' }, 404);
+      const body = await readBody(req);
+      const round = Number(body.round ?? 0);
+      const mode = body.mode === 'fromHere' ? 'fromHere' : 'round';
+      if (!Number.isInteger(round) || round < 1) return json(res, { error: 'round 非法' }, 400);
+      try {
+        const r = session.deleteMessages(round, mode);
+        return json(res, { ok: true, round: r.round, mode });
+      } catch (e) {
+        return json(res, { error: (e as Error).message.slice(0, 200) }, 400);
+      }
+    }
+
+    // 剧情分支索引（AI 生成，按轮缓存；?round=N）
+    if (method === 'GET' && p.startsWith('/api/session/') && p.endsWith('/story-index')) {
+      const id = p.split('/')[3];
+      const session = sessions.get(id);
+      if (!session) return json(res, { error: '会话不存在' }, 404);
+      const urlQ = new URL(req.url ?? '/', `http://${req.headers.host}`);
+      const round = Number(urlQ.searchParams.get('round') ?? 0);
+      if (!Number.isInteger(round) || round < 0) return json(res, { error: 'round 非法' }, 400);
+      try {
+        const r = await session.generateStoryIndex(round);
+        return json(res, { content: r.content, round: r.round, fromCache: r.fromCache });
+      } catch (e) {
+        return json(res, { error: (e as Error).message.slice(0, 200) }, 400);
+      }
+    }
+
+    // 删除会话（关 DB + 删 data/session-*.db + 移出内存 Map）
+    if (method === 'POST' && p.startsWith('/api/session/') && p.endsWith('/delete')) {
+      const id = p.split('/')[3];
+      const session = sessions.get(id);
+      if (session) { try { session.close(); } catch { /* 忽略 */ } }
+      sessions.delete(id);
+      const dbPath = resolve(DATA_DIR, `${id}.db`);
+      let removed = false;
+      try {
+        if (existsSync(dbPath)) { rmSync(dbPath, { force: true }); removed = true; }
+      } catch (e) {
+        return json(res, { error: (e as Error).message.slice(0, 200) }, 400);
+      }
+      return json(res, { ok: true, removed, id });
     }
 
     // 会话历史
@@ -399,14 +474,127 @@ const server = createServer(async (req, res) => {
     if (method === 'POST' && p === '/api/regex-rules/import-card') {
       const body = await readBody(req);
       const cardFile = (body.card ?? '').toString();
-      const cardPath = resolve(CARDS_DIR, cardFile);
-      if (!cardFile || !existsSync(cardPath) || !statSync(cardPath).isFile()) {
+      const cardRes = resolveCard(cardFile);
+      if (!cardFile || !cardRes) {
         return json(res, { error: `角色卡不存在: ${cardFile}` }, 404);
       }
-      const { parseCharaCard } = await import('../../packages/core/src/chara.ts');
-      const parsed = parseCharaCard(readFileSync(cardPath, 'utf8'));
+      const parsed = parseCharaCard(readCardText(cardFile)?.raw ?? '');
       const result = regexLibrary.importFromCard(parsed.regexScripts);
       return json(res, { ok: true, ...result, total: regexLibrary.list().length });
+    }
+
+    // ── 资产导入/导出（前端可视化；JSON 原文 / 卡片 PNG base64，无 multipart 依赖）──
+    const MAX_IMPORT = 5 * 1024 * 1024;
+
+    // 角色卡导入（JSON 或 PNG；PNG 自动解包 chara 元数据，强校验后写用户层 data/cards/）
+    if (method === 'POST' && p === '/api/card/import') {
+      const body = await readBody(req);
+      const filename = (body.filename ?? '').toString().trim();
+      const format = body.format === 'png' ? 'png' : 'json';
+      const data = (body.data ?? '').toString();
+      if (!filename) return json(res, { error: '缺少文件名' }, 400);
+      if (!data || data.length > MAX_IMPORT) return json(res, { error: '文件过大或为空' }, 400);
+      const name = filename.replace(/\.(json|png)$/i, '');
+      if (!name) return json(res, { error: '文件名非法' }, 400);
+      let cardJson: string;
+      let pngBuf: Buffer | null = null;
+      if (format === 'png') {
+        pngBuf = Buffer.from(data, 'base64');
+        const payload = extractCharaFromPng(pngBuf);
+        if (!payload) return json(res, { error: 'PNG 卡无 chara 元数据' }, 400);
+        cardJson = pngPayloadToJson(payload);
+      } else {
+        cardJson = data;
+      }
+      try {
+        parseCharaCard(cardJson);
+      } catch (e) {
+        return json(res, { error: `角色卡校验失败: ${(e as Error).message.slice(0, 120)}` }, 400);
+      }
+      const jsonFile = `${name}.json`;
+      saveUserAsset('card', jsonFile, cardJson);
+      if (pngBuf) saveAssetBuffer('card', `${name}.png`, pngBuf);
+      return json(res, { ok: true, file: jsonFile, name, format: 'json', pngSaved: Boolean(pngBuf) });
+    }
+
+    // 角色卡原文导出（JSON / PNG → 角色卡 JSON 文本）
+    if (method === 'GET' && p.startsWith('/api/card/') && p.endsWith('/raw')) {
+      const file = decodeURIComponent(p.slice('/api/card/'.length, -'/raw'.length));
+      try {
+        const card = readCardText(file);
+        if (!card) return json(res, { error: '角色卡不存在' }, 404);
+        return json(res, { raw: card.raw, format: card.format, file });
+      } catch (e) {
+        return json(res, { error: (e as Error).message.slice(0, 120) }, 400);
+      }
+    }
+
+    // 角色卡导出为酒馆兼容 PNG（PNG 卡直接用原件；JSON 卡动态封装 chara tEXt）
+    if (method === 'GET' && p.startsWith('/api/card/') && p.endsWith('/png')) {
+      const file = decodeURIComponent(p.slice('/api/card/'.length, -'/png'.length));
+      try {
+        const src = resolveCard(file);
+        if (!src) return json(res, { error: '角色卡不存在' }, 404);
+        const buf = src.format === 'png'
+          ? readFileSync(src.path)
+          : buildCharaPng(readCardText(file)?.raw ?? '');
+        if (!buf || buf.length === 0) return json(res, { error: '角色卡读取失败' }, 404);
+        return json(res, {
+          data_b64: buf.toString('base64'),
+          file,
+          pngFile: src.format === 'png' ? (src.path.split(/[\\/]/).pop() ?? '') : `${file.replace(/\.json$/i, '')}.png`,
+        });
+      } catch (e) {
+        return json(res, { error: (e as Error).message.slice(0, 120) }, 400);
+      }
+    }
+
+    // 预设导入（校验 parsePreset 后写用户层）
+    if (method === 'POST' && p === '/api/preset/import') {
+      const body = await readBody(req);
+      const filename = (body.filename ?? '').toString().trim();
+      const raw = (body.raw ?? '').toString();
+      if (!/\.json$/i.test(filename)) return json(res, { error: '文件名需 .json' }, 400);
+      if (!raw || raw.length > MAX_IMPORT) return json(res, { error: '文件过大或为空' }, 400);
+      try {
+        parsePreset(raw, {});
+      } catch (e) {
+        return json(res, { error: `预设校验失败: ${(e as Error).message.slice(0, 120)}` }, 400);
+      }
+      saveUserAsset('preset', filename, raw);
+      return json(res, { ok: true, file: filename });
+    }
+
+    // 预设原文导出
+    if (method === 'GET' && p.startsWith('/api/preset/') && p.endsWith('/raw')) {
+      const file = decodeURIComponent(p.slice('/api/preset/'.length, -'/raw'.length));
+      const asset = readAsset('preset', file);
+      if (!asset) return json(res, { error: '预设不存在' }, 404);
+      return json(res, { raw: asset.raw, file, source: asset.source });
+    }
+
+    // 世界书导入（校验 parseWorldBook 后写用户层）
+    if (method === 'POST' && p === '/api/worldbook/import') {
+      const body = await readBody(req);
+      const filename = (body.filename ?? '').toString().trim();
+      const raw = (body.raw ?? '').toString();
+      if (!/\.json$/i.test(filename)) return json(res, { error: '文件名需 .json' }, 400);
+      if (!raw || raw.length > MAX_IMPORT) return json(res, { error: '文件过大或为空' }, 400);
+      try {
+        parseWorldBook(raw);
+      } catch (e) {
+        return json(res, { error: `世界书校验失败: ${(e as Error).message.slice(0, 120)}` }, 400);
+      }
+      saveUserAsset('worldbook', filename, raw);
+      return json(res, { ok: true, file: filename });
+    }
+
+    // 世界书原文导出
+    if (method === 'GET' && p.startsWith('/api/worldbook/') && p.endsWith('/raw')) {
+      const file = decodeURIComponent(p.slice('/api/worldbook/'.length, -'/raw'.length));
+      const asset = readAsset('worldbook', file);
+      if (!asset) return json(res, { error: '世界书不存在' }, 404);
+      return json(res, { raw: asset.raw, file, source: asset.source });
     }
 
     // ── 资产编辑器（P2 非只读：用户层 data/{presets,worldbooks} 优先于源）──

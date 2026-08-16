@@ -30,6 +30,8 @@ export interface WriteResult {
   warnings: string[];
   arcId?: number;
   summaryId?: number;
+  /** 本轮新建 event 行 id（账本回滚删 vec/恢复用） */
+  eventIds: number[];
 }
 
 export class WriteLoop {
@@ -74,12 +76,14 @@ export class WriteLoop {
 
     // 5. 新事件（可分配独立 AM 码或并入本轮码）
     const insertedCodes: string[] = [code];
+    const eventIds: number[] = [];
     for (const ev of delta.new_events ?? []) {
       const evCode = nextAmCode(this.allCodes());
-      this.mem.db.prepare(
+      const evId = this.mem.db.prepare(
         'INSERT INTO memory_event (code, description, characters, refs, resolved) VALUES (?, ?, ?, ?, 0)'
-      ).run(evCode, ev.description.slice(0, 400), ev.characters ?? '[]', '[]');
+      ).run(evCode, ev.description.slice(0, 400), ev.characters ?? '[]', '[]').lastInsertRowid as number;
       insertedCodes.push(evCode);
+      eventIds.push(evId);
     }
 
     // 6. 状态表 diff（表0-5 语义 upsert/delete）
@@ -116,6 +120,7 @@ export class WriteLoop {
       warnings,
       arcId,
       summaryId,
+      eventIds,
     };
   }
 

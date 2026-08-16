@@ -20,6 +20,8 @@ export interface AssembleInput {
   dynamicState?: string;
   /** L3 记忆召回块（<记忆召回> 注入块，来自记忆服务） */
   memoryBlock?: string;
+  /** L3 前置：滚动长期摘要（memory_meta.longterm，远史骨架；放在记忆召回之前） */
+  longTermBlock?: string;
   /** 对话历史（近 N 轮原文 + 更早滚动摘要） */
   chatHistory?: Message[];
   /** 用户本轮输入（已包裹 <最新互动>） */
@@ -100,8 +102,9 @@ export function assembleTurn(input: AssembleInput): AssembleResult {
   // 2. 对话历史（user/assistant 交替）
   if (input.chatHistory) messages.push(...input.chatHistory);
 
-  // 3. 用户输入（记忆块 + 上轮结果 + 输入，均为易变尾部）；宏展开（VMS 变量）
+  // 3. 用户输入（长期摘要 + 记忆块 + 上轮结果 + 输入，均为易变尾部）；宏展开（VMS 变量）
   let userContent = '';
+  if (input.longTermBlock) userContent += `${input.longTermBlock}\n\n`;
   if (input.memoryBlock) userContent += `${input.memoryBlock}\n\n`;
   if (input.lastTurn) userContent += `<上一轮编排>\n${input.lastTurn}\n</上一轮编排>\n\n`;
   const inputExpanded = input.variableValues ? expandVariables(input.userInput, input.variableValues) : input.userInput;

@@ -96,6 +96,19 @@ CREATE TABLE IF NOT EXISTS chat_log (
 );
 CREATE INDEX IF NOT EXISTS idx_chat_round ON chat_log(round);
 
+-- 回合账本（重新生成/删除历史回滚：每轮写环前快照 + 本轮新写行）
+CREATE TABLE IF NOT EXISTS round_ledger (
+  round INTEGER PRIMARY KEY,
+  user_msg_id INTEGER, assistant_msg_id INTEGER,
+  meta_snapshot TEXT, state_snapshot TEXT, created TEXT, created_at TEXT
+);
+
+-- 剧情分支索引（AI 生成缓存，按轮次；供前端"剧情索引"面板）
+CREATE TABLE IF NOT EXISTS story_index (
+  round INTEGER PRIMARY KEY,
+  content TEXT, created_at TEXT
+);
+
 -- ── FTS5 外部内容表：memory_arc ──
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_arc USING fts5(
   content, category,

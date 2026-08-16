@@ -6,22 +6,26 @@
  */
 import { existsSync, readdirSync, readFileSync, mkdirSync, writeFileSync, rmSync, statSync } from 'node:fs';
 import { resolve, basename } from 'node:path';
+import { extractCharaFromPng, pngPayloadToJson } from './chara.ts';
 
-export type AssetKind = 'preset' | 'worldbook';
+export type AssetKind = 'preset' | 'worldbook' | 'card';
 
 export const ASSET_BASE = 'E:/claude cade test/project/jiuguanlike/剧本方案';
 export const ASSET_PRESET_DIR = resolve(ASSET_BASE, '预设');
 export const ASSET_WORLDBOOK_DIR = resolve(ASSET_BASE, '世界书');
+export const ASSET_CARD_DIR = resolve(ASSET_BASE, '角色卡');
 
 export const USER_DATA_DIR = process.env.JG_USER_DATA_DIR
   ? resolve(process.env.JG_USER_DATA_DIR)
   : resolve(process.cwd(), 'data');
 export const USER_PRESET_DIR = resolve(USER_DATA_DIR, 'presets');
 export const USER_WORLDBOOK_DIR = resolve(USER_DATA_DIR, 'worldbooks');
+export const USER_CARD_DIR = resolve(USER_DATA_DIR, 'cards');
 
 export function assetDir(kind: AssetKind, user: boolean): string {
   if (kind === 'preset') return user ? USER_PRESET_DIR : ASSET_PRESET_DIR;
-  return user ? USER_WORLDBOOK_DIR : ASSET_WORLDBOOK_DIR;
+  if (kind === 'worldbook') return user ? USER_WORLDBOOK_DIR : ASSET_WORLDBOOK_DIR;
+  return user ? USER_CARD_DIR : ASSET_CARD_DIR;
 }
 
 /** 解析资产文件路径（用户层优先；返回 {path, source} 或 null） */
@@ -74,4 +78,75 @@ export function deleteUserAsset(kind: AssetKind, file: string): boolean {
   if (!existsSync(user)) return false;
   rmSync(user, { force: true });
   return true;
+}
+
+/** 保存二进制到用户层（PNG 卡原件；文件名校验同 saveUserAsset） */
+export function saveAssetBuffer(kind: AssetKind, file: string, buf: Buffer): string {
+  if (basename(file) !== file || !/^[^\\/]+\.[a-zA-Z0-9]+$/.test(file)) {
+    throw new Error(`非法文件名: ${file}`);
+  }
+  const dir = assetDir(kind, true);
+  mkdirSync(dir, { recursive: true });
+  const target = resolve(dir, file);
+  writeFileSync(target, buf);
+  return target;
+}
+
+// ── 角色卡资产族（用户层 + PNG 元数据解包）──
+
+export interface CardInfo { file: string; name: string; format: 'json' | 'png'; source: 'user' | 'asset' }
+
+/** 解析卡文件路径（用户层优先；.json/.png 均可） */
+export function resolveCard(file: string): { path: string; source: 'user' | 'asset'; format: 'json' | 'png' } | null {
+  const isPng = file.toLowerCase().endsWith('.png');
+  for (const user of [true, false]) {
+    const p = resolve(assetDir('card', user), file);
+    if (existsSync(p) && statSync(p).isFile()) return { path: p, source: user ? 'user' : 'asset', format: isPng ? 'png' : 'json' };
+  }
+  return null;
+}
+
+/** 角色卡 PNG 签名（8 字节）；假 PNG（如 JPEG 改名）无 chara 元数据，不可作卡 */
+function isRealPng(path: string): boolean {
+  try {
+    const sig = readFileSync(path).subarray(0, 8);
+    return sig.length === 8 && sig[0] === 0x89 && sig[1] === 0x50 && sig[2] === 0x4e && sig[3] === 0x47;
+  } catch { return false; }
+}
+
+/** 列出角色卡（源 + 用户，json + 真 png；假 PNG 过滤） */
+export function listCards(sortByLatest = false): CardInfo[] {
+  const seen = new Set<string>();
+  const out: CardInfo[] = [];
+  for (const user of [true, false]) {
+    const dir = assetDir('card', user);
+    if (!existsSync(dir)) continue;
+    for (const f of readdirSync(dir)) {
+      const lower = f.toLowerCase();
+      if (lower.endsWith('.json')) {
+        if (seen.has(f)) continue;
+        seen.add(f);
+        out.push({ file: f, name: f.replace(/\.json$/i, ''), format: 'json', source: user ? 'user' : 'asset' });
+      } else if (lower.endsWith('.png')) {
+        if (seen.has(f)) continue;
+        const p = resolve(dir, f);
+        if (!isRealPng(p)) continue; // 假 PNG（JPEG 改名）无 chara 元数据，不可作卡
+        seen.add(f);
+        out.push({ file: f, name: f.replace(/\.png$/i, ''), format: 'png', source: user ? 'user' : 'asset' });
+      }
+    }
+  }
+  return out;
+}
+
+/** 读取卡为 JSON 文本（PNG 自动解包 chara tEXt → base64 解码 → JSON） */
+export function readCardText(file: string): { path: string; source: 'user' | 'asset'; raw: string; format: 'json' | 'png' } | null {
+  const r = resolveCard(file);
+  if (!r) return null;
+  if (r.format === 'png') {
+    const payload = extractCharaFromPng(readFileSync(r.path));
+    if (!payload) throw new Error(`PNG 卡无 chara 元数据: ${file}`);
+    return { path: r.path, source: r.source, format: 'png', raw: pngPayloadToJson(payload) };
+  }
+  return { path: r.path, source: r.source, format: 'json', raw: readFileSync(r.path, 'utf8') };
 }
