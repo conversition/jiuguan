@@ -31,7 +31,7 @@
     "test:rollback": "node --experimental-strip-types --experimental-transform-types tools/cli/verify-rollback.ts",
     "test:abort": "node --experimental-strip-types --experimental-transform-types tools/cli/verify-abort.ts",
     "test:fallback": "node --experimental-strip-types --experimental-transform-types tools/cli/verify-fallback.ts",
-    "test:context": "node --experimental-strip-types --experimental-transform-types tools/cli/verify-context-lifecycle.ts"
+    "test:context": "node --experimental-strip-types --experimental-transform-types tools/cli/verify-context-lifecycle.ts && node --experimental-strip-types --experimental-transform-types tools/cli/verify-scheduler.ts"
   },
   "engines": {
     "node": ">=22.5.0"
