@@ -51,6 +51,14 @@ export class OpenAICompatibleError extends Error {
   }
 }
 
+/** 回合中止信号错误：用户主动停止生成时由 stream 抛出，调用方捕获后落库部分正文 */
+export class AbortTurnError extends Error {
+  constructor() {
+    super('回合生成已中止');
+    this.name = 'AbortTurnError';
+  }
+}
+
 /** SSE 流式解析：逐行读 response.body，回调 data 块 */
 export async function streamSSE(body: ReadableStream<Uint8Array>, onData: (json: unknown) => void): Promise<void> {
   const reader = body.getReader();
@@ -131,12 +139,17 @@ export class OpenAICompatibleClient {
   /** 流式调用（正文渲染：逐块回调 delta）
    *  @param onDelta   content 增量（assistant 正文逐字）
    *  @param onToolArg 工具参数增量（function.arguments 分片，用于真流式提取 prose）
+   *  @param signal    外部中止信号（用户停止生成；中止时抛 AbortTurnError，调用方落库部分正文）
    */
   async stream(
     req: ChatRequest,
     onDelta: (delta: string) => void,
     onToolArg?: (name: string, argsDelta: string) => void,
+    signal?: AbortSignal,
   ): Promise<ChatResponse> {
+    // 外部取消与超时合并：任一触发即中止（Node 22 AbortSignal.any）
+    const timeoutSignal = AbortSignal.timeout(this.cfg.timeoutMs);
+    const combined = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
     const res = await fetch(`${this.base}/chat/completions`, {
       method: 'POST',
       headers: this.headers(),
@@ -149,7 +162,7 @@ export class OpenAICompatibleClient {
         stream: true,
         ...req.extraBody,
       }),
-      signal: AbortSignal.timeout(this.cfg.timeoutMs),
+      signal: combined,
     });
 
     if (!res.ok) {
@@ -163,32 +176,39 @@ export class OpenAICompatibleClient {
     let usage: ChatResponse['usage'] = null;
     const toolCalls: ToolCall[] = [];
 
-    await streamSSE(res.body, (json) => {
-      const chunk = json as {
-        choices?: { delta?: { content?: string | null; tool_calls?: unknown[] }; finish_reason?: string | null }[];
-        usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
-      };
-      const choice = chunk.choices?.[0];
-      if (!choice) return;
-      if (choice.delta?.content) {
-        content += choice.delta.content;
-        onDelta(choice.delta.content);
-      }
-      if (choice.delta?.tool_calls) {
-        for (const tc of choice.delta.tool_calls as { index?: number; id?: string; function?: { name?: string; arguments?: string } }[]) {
-          const idx = tc.index ?? 0;
-          toolCalls[idx] = toolCalls[idx] ?? { id: tc.id ?? '', name: '', arguments: '' };
-          if (tc.id) toolCalls[idx].id = tc.id;
-          if (tc.function?.name) toolCalls[idx].name += tc.function.name;
-          if (tc.function?.arguments) {
-            toolCalls[idx].arguments += tc.function.arguments;
-            if (onToolArg && toolCalls[idx].name) onToolArg(toolCalls[idx].name, tc.function.arguments);
+    try {
+      await streamSSE(res.body, (json) => {
+        const chunk = json as {
+          choices?: { delta?: { content?: string | null; tool_calls?: unknown[] }; finish_reason?: string | null }[];
+          usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
+        };
+        const choice = chunk.choices?.[0];
+        if (!choice) return;
+        if (signal?.aborted) throw new AbortTurnError();
+        if (choice.delta?.content) {
+          content += choice.delta.content;
+          onDelta(choice.delta.content);
+        }
+        if (choice.delta?.tool_calls) {
+          for (const tc of choice.delta.tool_calls as { index?: number; id?: string; function?: { name?: string; arguments?: string } }[]) {
+            const idx = tc.index ?? 0;
+            toolCalls[idx] = toolCalls[idx] ?? { id: tc.id ?? '', name: '', arguments: '' };
+            if (tc.id) toolCalls[idx].id = tc.id;
+            if (tc.function?.name) toolCalls[idx].name += tc.function.name;
+            if (tc.function?.arguments) {
+              toolCalls[idx].arguments += tc.function.arguments;
+              if (onToolArg && toolCalls[idx].name) onToolArg(toolCalls[idx].name, tc.function.arguments);
+            }
           }
         }
-      }
-      if (choice.finish_reason) finishReason = choice.finish_reason;
-      if (chunk.usage) usage = chunk.usage;
-    });
+        if (choice.finish_reason) finishReason = choice.finish_reason;
+        if (chunk.usage) usage = chunk.usage;
+      });
+    } catch (err) {
+      // 外部中止 → AbortTurnError（区别于超时/网络错误）
+      if (signal?.aborted) throw new AbortTurnError();
+      throw err;
+    }
 
     return {
       content: content || null,

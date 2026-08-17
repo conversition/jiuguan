@@ -180,6 +180,14 @@ export function App() {
   const streamBufRef = useRef('');
   const streamRafRef = useRef<number | null>(null);
   const streamTargetRef = useRef<{ kind: 'id'; id: number } | { kind: 'round'; round: number } | null>(null);
+  // 中止生成：busy 期间持有当前回合的 AbortController（发送键变停止键 + Esc）
+  const abortRef = useRef<AbortController | null>(null);
+  const stopGenerating = () => { abortRef.current?.abort(); };
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && busy) stopGenerating(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [busy]);
   const flushStream = () => {
     streamRafRef.current = null;
     const chunk = streamBufRef.current;
@@ -328,6 +336,17 @@ export function App() {
     setMessages((prev) => mergeHistory(prev, h.messages));
   };
 
+  /** 中止收尾：通知后端把已生成的部分正文落库（幂等，/turn/abort 等待进行中的 turn 完成后落库）并刷新 */
+  const finalizeAbort = async (sid: string, round: number) => {
+    if (round < 1) return;
+    try {
+      await api(`/api/session/${sid}/turn/abort`, { method: 'POST', body: JSON.stringify({ round }) });
+      await fetchHistory(sid);
+      fetchTurnState(sid);
+      refreshSessions();
+    } catch { /* 中止落库失败不阻塞后续刷新 */ }
+  };
+
   const resumeSession = async (sid: string) => {
     setBusy(true);
     setError('');
@@ -352,6 +371,8 @@ export function App() {
     const replyId = nextMsgId();
     setMessages((m) => [...m, { id: replyId, round: 0, role: 'assistant', content: '' }]);
     streamTargetRef.current = { kind: 'id', id: replyId };
+    const ac = new AbortController();
+    abortRef.current = ac;
     try {
       await apiStream('/api/turn', { session: sessionId, input: text, content_mode: contentMode }, (ev) => {
         if (ev.type === 'delta' && typeof ev.text === 'string') {
@@ -365,24 +386,37 @@ export function App() {
           setMessages((m) => m.map((x) => (x.id === replyId ? { ...x, content: prose } : x)));
         }
         if (ev.type === 'error') setError(String(ev.message ?? '回合失败'));
-      });
+      }, ac.signal);
       // 回合结束 → 刷新推进槽（侧栏常驻）+ 拉真实 round（消息操作按 round 定位）+ 会话预览
       fetchTurnState(sessionId);
       await fetchHistory(sessionId);
       refreshSessions();
-    } catch (e) { setError((e as Error).message); }
+    } catch (e) {
+      if ((e as { name?: string }).name === 'AbortError') {
+        // 用户停止：后端已通过 req close 触发部分正文落库；此处幂等兜底 + 刷新
+        try {
+          const ts = await api<{ state: TurnState | null }>(`/api/session/${sessionId}/turn-state`);
+          await finalizeAbort(sessionId, ts.state?.round ?? 0);
+        } catch { /* 中止兜底失败不阻塞 */ }
+      } else {
+        setError((e as Error).message);
+      }
+    }
+    abortRef.current = null;
     stopStream();
     stopGenTimer();
     setBusy(false);
   };
 
-  /** 重新生成某条 AI 回复（SSE 流式原地替换目标消息内容） */
+  /** 重新生成某条 AI 回复（SSE 流式原地替换目标消息内容；可中止） */
   const regenerateMessage = async (msg: Message) => {
     if (!sessionId || busy) return;
     setBusy(true);
     setError('');
     startGenTimer();
     streamTargetRef.current = { kind: 'round', round: msg.round };
+    const ac = new AbortController();
+    abortRef.current = ac;
     try {
       await apiStream(`/api/session/${sessionId}/regenerate`, { round: msg.round }, (ev) => {
         if (ev.type === 'delta' && typeof ev.text === 'string') pushStream(ev.text);
@@ -392,11 +426,19 @@ export function App() {
           setMessages((m) => m.map((x) => (x.round === msg.round && x.role === 'assistant' ? { ...x, content: prose } : x)));
         }
         if (ev.type === 'error') setError(String(ev.message ?? '重新生成失败'));
-      });
+      }, ac.signal);
       await fetchHistory(sessionId);
       fetchTurnState(sessionId);
       refreshSessions();
-    } catch (e) { setError((e as Error).message); }
+    } catch (e) {
+      if ((e as { name?: string }).name === 'AbortError') {
+        // 用户停止重新生成：round 已知，幂等兜底落库 + 刷新
+        await finalizeAbort(sessionId, msg.round);
+      } else {
+        setError((e as Error).message);
+      }
+    }
+    abortRef.current = null;
     stopStream();
     stopGenTimer();
     setBusy(false);
@@ -599,11 +641,20 @@ export function App() {
                 ref={inputRef}
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+                  if (e.key === 'Escape' && busy) { e.preventDefault(); stopGenerating(); }
+                }}
                 placeholder={sessionId ? '输入你的行动或对话…' : '请先选择角色卡'}
                 rows={2}
               />
-              <button onClick={send} disabled={!sessionId || busy}>发送</button>
+              <button
+                className={busy ? 'btn-stop' : ''}
+                onClick={busy ? stopGenerating : send}
+                disabled={!sessionId}
+              >
+                {busy ? '停止' : '发送'}
+              </button>
             </div>
           </>
         )}

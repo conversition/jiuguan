@@ -32,7 +32,7 @@ import { persistVariables, restoreVariables } from '../../packages/variable/src/
 import { assembleTurn, DEFAULT_SYSTEM_CORE, estimateTokens } from '../../packages/prompt/src/assembly.ts';
 import { validateGameTurn, safeParseTurn, normalizeTurn, createProseStreamExtractor } from '../../packages/prompt/src/turn.ts';
 import type { GameTurn } from '../../packages/prompt/src/turn.ts';
-import { OpenAICompatibleClient, toolLoopMessages } from '../../packages/proxy/src/client.ts';
+import { OpenAICompatibleClient, toolLoopMessages, AbortTurnError } from '../../packages/proxy/src/client.ts';
 import { loadProviderConfig, assertProviderReady } from '../../packages/proxy/src/config.ts';
 import { MvuBridge } from '../../packages/sandbox/src/mvu-bridge.ts';
 import { PluginRegistry, PluginHost } from '../../packages/plugin/src/index.ts';
@@ -479,17 +479,21 @@ export class ChatSession {
   /** 单轮对话
    *  @param contentMode 内容分支（缺省用会话配置）
    *  @param onProse     真流式回调：模型生成正文时逐字/逐块回调（prose 增量；未传入则完整返回时一次性给）
+   *  @param signal      外部中止信号（用户停止生成；中止时保留已生成正文落库，不写记忆）
    */
-  async turn(userInput: string, contentMode?: 'nsfw' | 'nsf', onProse?: (chunk: string) => void): Promise<string> {
+  async turn(userInput: string, contentMode?: 'nsfw' | 'nsf', onProse?: (chunk: string) => void, signal?: AbortSignal): Promise<string> {
     this.round++;
-    return this.runTurnCore(this.round, userInput, contentMode ?? this.args.contentMode ?? 'nsfw', onProse, { logUser: true });
+    return this.runTurnCore(this.round, userInput, contentMode ?? this.args.contentMode ?? 'nsfw', onProse, { logUser: true }, signal);
   }
 
-  /** 每轮核心（turn / regenerate 共用）：预计算→装配→模型→写环→引擎 tick→持久化→账本 */
+  /** 每轮核心（turn / regenerate 共用）：预计算→装配→模型→写环→引擎 tick→持久化→账本
+   *  @param signal 外部中止信号：用户停止生成时，保留已流式生成的正文落库，不写记忆（07 铁律1）
+   */
   private async runTurnCore(
     round: number, userInput: string, mode: 'nsfw' | 'nsf',
     onProse: ((chunk: string) => void) | undefined,
     opts: { logUser: boolean },
+    signal?: AbortSignal,
   ): Promise<string> {
     this.round = round;
     const emit = onProse ?? (() => {});
@@ -542,19 +546,28 @@ export class ChatSession {
     if (opts.logUser) this.logChat('user', userInput, round);
 
     // ③ 模型调用（真流式）+ 校验 + 错误召回重试（统一：最多 2 次尝试，每次均过 归一化→校验；重试消息用首轮 tool_call 注入错误）
+    // sentProse：已流式发出的正文累积（用户停止生成时保留该部分落库）
+    let sentProse = '';
     const attemptTurn = async (messages: import('../../packages/proxy/src/client.ts').ChatMessage[]):
-      Promise<{ turn: GameTurn | null; tc: import('../../packages/proxy/src/client.ts').ToolCall | null }> => {
+      Promise<{ turn: GameTurn | null; tc: import('../../packages/proxy/src/client.ts').ToolCall | null; aborted?: boolean }> => {
       const extractor = createProseStreamExtractor();
-      const res = await this.client.stream(
-        { messages, tools: assembled.tools, temperature: 0.9 },
-        () => {},   // content 增量忽略（prose 在 game_turn 工具参数里；content 多为模型思考/闲话）
-        (name, argDelta) => {
-          if (name === 'game_turn') {
-            const p = extractor(argDelta);
-            if (p) emit(p);
-          }
-        },
-      );
+      let res: import('../../packages/proxy/src/client.ts').ChatResponse;
+      try {
+        res = await this.client.stream(
+          { messages, tools: assembled.tools, temperature: 0.9 },
+          () => {},   // content 增量忽略（prose 在 game_turn 工具参数里；content 多为模型思考/闲话）
+          (name, argDelta) => {
+            if (name === 'game_turn') {
+              const p = extractor(argDelta);
+              if (p) { emit(p); sentProse += p; }
+            }
+          },
+          signal,
+        );
+      } catch (e) {
+        if (e instanceof AbortTurnError) return { turn: null, tc: null, aborted: true };
+        throw e;
+      }
       const tc = res.toolCalls.find((t) => t.name === 'game_turn') ?? null;
       if (!tc) {
         console.log(`  ⚠ 未返回 game_turn（finish=${res.finishReason}）`);
@@ -574,10 +587,13 @@ export class ChatSession {
     };
 
     const first = await attemptTurn(assembled.messages);
+    if (first.aborted) return this.finalizeAborted(round, sentProse, pre);
     let turn = first.turn;
     if (!turn && first.tc) {
       console.log('  ⚠ 首轮失败，错误召回重试一次...');
-      turn = (await attemptTurn(toolLoopMessages(assembled.messages, first.tc, '输出校验失败，请重新生成完整的 game_turn 参数'))).turn;
+      const retry = await attemptTurn(toolLoopMessages(assembled.messages, first.tc, '输出校验失败，请重新生成完整的 game_turn 参数'));
+      if (retry.aborted) return this.finalizeAborted(round, sentProse, pre);
+      turn = retry.turn;
     }
 
     if (!turn) {
@@ -629,13 +645,14 @@ export class ChatSession {
 
   // ── 重新生成 / 删除历史（round 账本机制）──
 
-  /** 重新生成第 round 轮 AI 回复：回滚该轮状态（保留用户行）→ 用存储的用户输入重放 */
-  async regenerate(round: number, onProse?: (chunk: string) => void): Promise<{ prose: string; round: number; assistantMsgId: number | null }> {
+  /** 重新生成第 round 轮 AI 回复：回滚该轮状态（保留用户行）→ 用存储的用户输入重放
+   *  @param signal 外部中止信号（同 turn：中止时保留已生成正文落库） */
+  async regenerate(round: number, onProse?: (chunk: string) => void, signal?: AbortSignal): Promise<{ prose: string; round: number; assistantMsgId: number | null }> {
     const userRow = this.mem.db.prepare('SELECT content FROM chat_log WHERE round = ? AND role = ? ORDER BY id DESC LIMIT 1')
       .get(round, 'user') as { content: string } | undefined;
     if (!userRow) throw new Error(`round ${round} 无用户消息，无法重新生成`);
     this.rollbackStateOnly(round);
-    const prose = await this.runTurnCore(round, userRow.content, this.args.contentMode ?? 'nsfw', onProse, { logUser: false });
+    const prose = await this.runTurnCore(round, userRow.content, this.args.contentMode ?? 'nsfw', onProse, { logUser: false }, signal);
     const aid = this.mem.db.prepare("SELECT id FROM chat_log WHERE round = ? AND role = 'assistant' ORDER BY id DESC LIMIT 1")
       .get(round) as { id: number } | undefined;
     return { prose, round, assistantMsgId: aid?.id ?? null };
@@ -689,6 +706,46 @@ export class ChatSession {
       `INSERT OR REPLACE INTO round_ledger (round, user_msg_id, assistant_msg_id, meta_snapshot, state_snapshot, created, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?)`
     ).run(round, userMsgId, assistantMsgId, JSON.stringify(metaSnap), JSON.stringify(pre.state), JSON.stringify(created), new Date().toISOString());
+  }
+
+  /** 中止收尾（用户停止生成）：保留已流式生成的正文落库，不写记忆/引擎/变量（07 铁律1：不完整 turn 不写环）
+   *  幂等：若该轮已有 assistant 落库（正常完成或已中止过）则跳过
+   *  @param prose  已流式发出的正文（可能为空串，落库占位符）
+   *  @param pre    写环前快照（round_ledger 回滚锚点，保证重新生成/删除不产生孤儿） */
+  private finalizeAborted(round: number, prose: string, pre: ReturnType<ChatSession['snapshotPre']>): string {
+    const existing = this.mem.db.prepare("SELECT id FROM chat_log WHERE round = ? AND role = 'assistant'").get(round) as { id: number } | undefined;
+    if (existing) return prose.trim() || '（已停止生成）';
+    const text = prose.trim() || '（已停止生成）';
+    this.logChat('assistant', text, round);
+    const userMsgId = this.mem.db.prepare('SELECT id FROM chat_log WHERE round = ? AND role = ? ORDER BY id DESC LIMIT 1')
+      .get(round, 'user') as { id: number } | undefined;
+    const assistMsgId = this.mem.db.prepare("SELECT id FROM chat_log WHERE round = ? AND role = 'assistant' ORDER BY id DESC LIMIT 1")
+      .get(round) as { id: number } | undefined;
+    this.writeLedger(round, pre, { mainCode: '', eventCodes: [], eventIds: [] }, userMsgId?.id ?? 0, assistMsgId?.id ?? 0);
+    console.log(`[中止] round ${round} 保留部分正文 ${text.length} 字（记忆未写）`);
+    return text;
+  }
+
+  /** 前端停止后兜底落库（Web /turn/abort）：幂等等待进行中的 turn 完成中止落库
+   *  若该轮 assistant 已落库（正常完成/已中止）则跳过；等待超时且 user 已入库 → 落库占位符，防孤儿 user 行 */
+  async finalizeAbortedRound(round: number): Promise<{ round: number; kept: boolean; waited: boolean }> {
+    const hasAssistant = () => Boolean(this.mem.db.prepare("SELECT id FROM chat_log WHERE round = ? AND role = 'assistant'").get(round));
+    if (hasAssistant()) return { round, kept: false, waited: false };
+    // 等待进行中的 turn 完成中止落库（最多 1s，每 100ms 检查一次；保证部分正文优先于占位符）
+    const ABORT_WAIT_MS = 1000;
+    const ABORT_POLL_MS = 100;
+    let waited = false;
+    const deadline = Date.now() + ABORT_WAIT_MS;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, ABORT_POLL_MS));
+      waited = true;
+      if (hasAssistant()) return { round, kept: false, waited };
+    }
+    const userRow = this.mem.db.prepare('SELECT id FROM chat_log WHERE round = ? AND role = ?').get(round, 'user') as { id: number } | undefined;
+    if (!userRow) return { round, kept: false, waited };
+    const pre = this.snapshotPre();
+    this.finalizeAborted(round, '', pre);
+    return { round, kept: true, waited };
   }
 
   /** 回滚第 round 轮：删本轮新写行 + 恢复写环前状态；keepUser=true 保留用户行（重新生成路径） */

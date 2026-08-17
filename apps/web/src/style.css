@@ -180,6 +180,9 @@ body { font-family: system-ui, 'PingFang SC', 'Microsoft YaHei', sans-serif; bac
   font-size: 14px; cursor: pointer; height: 40px;
 }
 .inputbar button:disabled { opacity: 0.5; cursor: not-allowed; }
+/* 生成中：发送按钮变停止键（红色） */
+.inputbar button.btn-stop { background: var(--danger); }
+.inputbar button.btn-stop:hover { opacity: 0.9; }
 
 /* ═══════════ tabbar ═══════════ */
 .tabbar { display: flex; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; }

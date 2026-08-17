@@ -55,7 +55,9 @@ function sse(res: ServerResponse): void {
   res.setHeader('Access-Control-Allow-Origin', '*');
 }
 function sseSend(res: ServerResponse, obj: unknown): void {
-  res.write(`data: ${JSON.stringify(obj)}\n\n`);
+  // 客户端已断开/响应已结束时不写（中止生成后 res 可能已 close）
+  if (res.writableEnded || res.destroyed) return;
+  try { res.write(`data: ${JSON.stringify(obj)}\n\n`); } catch { /* 客户端已断开 */ }
 }
 
 function readBody(req: IncomingMessage): Promise<Record<string, string>> {
@@ -207,7 +209,7 @@ const server = createServer(async (req, res) => {
       return json(res, { id });
     }
 
-    // 单轮对话（SSE：状态 + 模拟流式正文）
+    // 单轮对话（SSE：状态 + 模拟流式正文；req 断开 → 中止上游，前端停止按钮）
     if (method === 'POST' && p === '/api/turn') {
       const body = await readBody(req);
       const session = sessions.get(body.session ?? '');
@@ -217,6 +219,9 @@ const server = createServer(async (req, res) => {
 
       sse(res);
       sseSend(res, { type: 'status', stage: 'thinking' });
+      const ac = new AbortController();
+      const onClose = () => ac.abort();
+      req.on('close', onClose);
       try {
         const mode = body.content_mode === 'nsf' ? 'nsf' : 'nsfw';
         let streamStarted = false;
@@ -227,17 +232,18 @@ const server = createServer(async (req, res) => {
             streamStarted = true;
           }
           sseSend(res, { type: 'delta', text: chunk });
-        });
+        }, ac.signal);
         if (!streamStarted) sseSend(res, { type: 'status', stage: 'streaming' });
         sseSend(res, { type: 'done', prose });
       } catch (e) {
-        sseSend(res, { type: 'error', message: (e as Error).message.slice(0, 200) });
+        if (!ac.signal.aborted) sseSend(res, { type: 'error', message: (e as Error).message.slice(0, 200) });
       }
+      req.off('close', onClose);
       res.end();
       return;
     }
 
-    // 重新生成 AI 回复（回滚该轮状态 + 重放，SSE 流式同 /api/turn）
+    // 重新生成 AI 回复（回滚该轮状态 + 重放，SSE 流式同 /api/turn；req 断开 → 中止上游）
     if (method === 'POST' && p.startsWith('/api/session/') && p.endsWith('/regenerate')) {
       const id = p.split('/')[3];
       const session = sessions.get(id);
@@ -247,19 +253,39 @@ const server = createServer(async (req, res) => {
       if (!Number.isInteger(round) || round < 1) return json(res, { error: 'round 非法' }, 400);
       sse(res);
       sseSend(res, { type: 'status', stage: 'thinking' });
+      const ac = new AbortController();
+      const onClose = () => ac.abort();
+      req.on('close', onClose);
       try {
         let streamStarted = false;
         const r = await session.regenerate(round, (chunk) => {
           if (!streamStarted) { sseSend(res, { type: 'status', stage: 'streaming' }); streamStarted = true; }
           sseSend(res, { type: 'delta', text: chunk });
-        });
+        }, ac.signal);
         if (!streamStarted) sseSend(res, { type: 'status', stage: 'streaming' });
         sseSend(res, { type: 'done', prose: r.prose, assistantMsgId: r.assistantMsgId, round: r.round });
       } catch (e) {
-        sseSend(res, { type: 'error', message: (e as Error).message.slice(0, 200) });
+        if (!ac.signal.aborted) sseSend(res, { type: 'error', message: (e as Error).message.slice(0, 200) });
       }
+      req.off('close', onClose);
       res.end();
       return;
+    }
+
+    // 中止回合落库（前端停止生成后调用，幂等：该轮若已有 assistant 落库则跳过）
+    if (method === 'POST' && p.startsWith('/api/session/') && p.endsWith('/turn/abort')) {
+      const id = p.split('/')[3];
+      const session = sessions.get(id);
+      if (!session) return json(res, { error: '会话不存在' }, 404);
+      const body = await readBody(req);
+      const round = Number(body.round ?? 0);
+      if (!Number.isInteger(round) || round < 1) return json(res, { error: 'round 非法' }, 400);
+      try {
+        const r = session.finalizeAbortedRound(round);
+        return json(res, { ok: true, ...r });
+      } catch (e) {
+        return json(res, { error: (e as Error).message.slice(0, 200) }, 400);
+      }
     }
 
     // 删除消息（round=整轮 / fromHere=从该轮到末尾；状态按回合账本回滚）
