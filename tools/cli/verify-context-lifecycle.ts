@@ -20,28 +20,29 @@ function main() {
   // ---- 场景1：依赖满足驱动激活 + 场景切换干净撤销 ----
   const rt = new ContextProviderRuntime();
   const events: string[] = [];
+  const mark = (e: string) => () => { events.push(e); };
   // 场景块：仅在 tavern 激活，provide scene
   const sceneFib: ContextProviderFiber = {
     id: 'scene:tavern',
     provide: { scene: true },
     deps: (f) => f.scene === 'tavern',
     build: (f, _p, accum) => {
-      accum.effect(() => events.push('inv:scene:setup'));
+      accum.effect(mark('inv:scene:setup'));
       events.push('build:scene');
-      return `[场景酒馆] 昏黄灯火，吧台后酒保擦杯`;
+      return '[场景酒馆] 昏黄灯火，吧台后酒保擦杯';
     },
-    teardown: () => { events.push('teardown:scene'); },
+    teardown: mark('teardown:scene'),
   };
   // 依序块：inject scene → 依赖场景存在才激活
   const tavernBlock: ContextProviderFiber = {
     id: 'tavern-entrylist',
     inject: ['scene'],
     build: (_f, _p, accum) => {
-      accum.effect(() => events.push('inv:entries:close'));
+      accum.effect(mark('inv:entries:close'));
       events.push('build:entries');
-      return `[酒馆条目] 麦酒·奶酪·醉汉桌`;
+      return '[酒馆条目] 麦酒·奶酪·醉汉桌';
     },
-    teardown: () => { events.push('teardown:entries'); },
+    teardown: mark('teardown:entries'),
   };
   rt.register(sceneFib);
   rt.register(tavernBlock);
@@ -64,31 +65,32 @@ function main() {
   rt.beginTurn(focusFor('tavern'));
   check('场景1 切回重激活', rt.activeIds().length === 2, `active=${JSON.stringify(rt.activeIds())}`);
 
-  // ---- 场景2：同场景内逐步骤逆操作 LIFO ----
+  // ---- 场景2：同场景内逐步骤逆操作 LIFO（unregister 触发撤销） ----
   const rt2 = new ContextProviderRuntime();
   const order2: string[] = [];
+  const mark2 = (e: string) => () => { order2.push(e); };
   rt2.register({
     id: 'multi-effect',
     build: (_f, _p, accum) => {
-      accum.effect(() => order2.push('inv1'));
-      accum.effect(() => order2.push('inv2'));
+      accum.effect(mark2('inv1'));
+      accum.effect(mark2('inv2'));
       return '两步骤初始化';
     },
   } as ContextProviderFiber);
   rt2.beginTurn(focusFor('tavern'));
-  rt2.beginTurn(focusFor('palace')); // 无条件块场景无关 → 仍激活；改用 unregister 触发撤销
   rt2.unregister('multi-effect');
   check('场景2 逆操作 LIFO（inv2 先于 inv1）', order2.join(',') === 'inv2,inv1', `order=${order2.join(',')}`);
 
   // ---- 场景3：build 抛错 → 已累积逆操作逆序回滚 + 状态 inactive ----
   const rt3 = new ContextProviderRuntime();
   const rolled: string[] = [];
+  const mark3 = (e: string) => () => { rolled.push(e); };
   rt3.register({
     id: 'explode',
     deps: (f) => f.scene === 'tavern',
     build: (_f, _p, accum) => {
-      accum.effect(() => rolled.push('r2'));
-      accum.effect(() => rolled.push('r1'));
+      accum.effect(mark3('r2'));
+      accum.effect(mark3('r1'));
       throw new Error('初始化到一半失败');
     },
   } as ContextProviderFiber);
@@ -101,12 +103,19 @@ function main() {
   // ---- 场景4：一个 provider 提供多键，多个 consumer 全部先退 ----
   const rt4 = new ContextProviderRuntime();
   const events4: string[] = [];
+  const mark4 = (e: string) => () => { events4.push(e); };
   const mk = (id: string, inject: string[]): ContextProviderFiber => ({
     id, inject,
-    build: (f, _p, accum) => { accum.effect(() => events4.push(`inv:${id}`)); return `${id}:${f.scene}`; },
-    teardown: () => { events4.push(`teardown:${id}`); },
+    build: (f, _p, accum) => {
+      accum.effect(mark4(`inv:${id}`));
+      return `${id}:${f.scene}`;
+    },
+    teardown: mark4(`teardown:${id}`),
   });
-  rt4.register({ id: 'core', provide: { a: 1, b: 2 }, deps: (f) => f.scene === 'tavern', build: () => 'core', teardown: () => events4.push('teardown:core') });
+  rt4.register({
+    id: 'core', provide: { a: 1, b: 2 }, deps: (f) => f.scene === 'tavern',
+    build: () => 'core', teardown: mark4('teardown:core'),
+  });
   rt4.register(mk('consumer-a', ['a']));
   rt4.register(mk('consumer-b', ['b']));
   rt4.beginTurn(focusFor('tavern'));

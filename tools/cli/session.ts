@@ -36,6 +36,12 @@ import { OpenAICompatibleClient, toolLoopMessages, AbortTurnError } from '../../
 import { loadProviderConfig, assertProviderReady } from '../../packages/proxy/src/config.ts';
 import { MvuBridge } from '../../packages/sandbox/src/mvu-bridge.ts';
 import { PluginRegistry, PluginHost } from '../../packages/plugin/src/index.ts';
+import type { RecallResult } from '../../packages/memory/src/retrieval.ts';
+import type { ScanResult } from '../../packages/core/src/scanner.ts';
+import { ContextProviderRuntime } from '../../packages/prompt/src/context-provider-runtime.ts';
+import type { TurnFocus, ContextProviderFiber } from '../../packages/prompt/src/context-provider-runtime.ts';
+import { scheduleContext } from '../../packages/prompt/src/context-scheduler.ts';
+import type { ContextBlock } from '../../packages/prompt/src/context-scheduler.ts';
 import { resolveAsset, listAssets } from '../../packages/core/src/asset-paths.ts';
 import type { AssetKind } from '../../packages/core/src/asset-paths.ts';
 
@@ -148,6 +154,12 @@ export class ChatSession {
   private windowTokens = Number(process.env.JG_WINDOW_TOKENS ?? 1500);
   private longtermTokens = Number(process.env.JG_LONGTERM_TOKENS ?? 800);
   private summaryRounds = Number(process.env.JG_SUMMARY_ROUNDS ?? 20);
+  /** 上下文提供者运行时（L1：依赖满足激活 + 干净撤销）与 cost/priority 台账（L2 调度） */
+  private ctxRuntime = new ContextProviderRuntime();
+  private ctxCost = new Map<string, { cost: number; priority: number }>();
+  /** 每回合预计算结果暂存（provider build 闭包读取：L3 内容源） */
+  private turnInput: { recall: RecallResult | null; scan: ScanResult | null; bars: Record<string, number>; vmsValues: Record<string, string | number | boolean> } =
+    { recall: null, scan: null, bars: {}, vmsValues: {} };
 
   /** 内容模式模块加载（WP14：可编辑文件 data/content-modes.json） */
   private loadContentModes(): void {
@@ -346,6 +358,105 @@ export class ChatSession {
     this.plugins = new PluginHost(new PluginRegistry(resolve('data', 'plugins')));
     // 正则库（04 §4.3：data/regex-rules.json，卡片正则自动导入）
     this.regexLib = new RegexLibrary();
+    // L1 上下文 provider 注册（Cordis 底座：依存判定 + cost/priority 台账）
+    this.initContextProviders();
+  }
+
+  /** 注册上下文 provider（L1 fiber）：每块声明 deps/build + 登记 cost/priority（L2）。
+   *  build 读取 this.turnInput 预计算源（回合前由 runTurnCore 汇入），产注入片段。 */
+  private initContextProviders(): void {
+    this.regProvider('memory', 400, 75, {
+      build: () => this.turnInput.recall?.injectedBlock ?? '',
+    });
+    this.regProvider('longterm', 800, 70, {
+      build: () => this.getLongTermBlock(),
+    });
+    this.regProvider('worldbook', 1200, 60, {
+      build: (focus) => this.gatedWorldbookBlock(focus),
+    });
+    this.regProvider('worldstate', 500, 90, {
+      build: (focus) => this.worldStateBlock(focus),
+    });
+  }
+
+  /** 登记单个 provider（成本/优先级进台账，fiber 进运行时） */
+  private regProvider(id: string, cost: number, priority: number, fiber: Omit<ContextProviderFiber, 'id'>): void {
+    this.ctxCost.set(id, { cost, priority });
+    this.ctxRuntime.register({ id, ...fiber });
+  }
+
+  /** 当前场景标识：上轮 plan 的 scene/next_plan（无则空字符串） */
+  private currentScene(): string {
+    if (!this.lastTurn) return '';
+    try {
+      const p = JSON.parse(this.lastTurn) as { scene?: unknown; next_plan?: unknown };
+      if (typeof p.scene === 'string') return p.scene;
+      if (typeof p.next_plan === 'string') return p.next_plan.slice(0, 24);
+    } catch { /* 忽略坏 JSON */ }
+    return '';
+  }
+
+  /** 在场实体：输入去标点分词（2-8 字连续段），限 6 个 */
+  private presentEntities(input: string): string[] {
+    return input.split(/[，。！？、,.!?\s]+/).filter((s) => s.length >= 2 && s.length <= 8).slice(0, 6);
+  }
+
+  /** 检索 query 增强：完整输入 + 在场实体 + 推进槽（替代仅 24 字截断），预算内截断 */
+  private buildRecallQuery(input: string, bars: Record<string, number>): string {
+    const parts = [
+      input,
+      ...this.presentEntities(input).map((e) => `实体:${e}`),
+      Object.entries(bars).map(([k, v]) => `${k}:${v}`).join(' '),
+    ].filter(Boolean);
+    return parts.join(' ').slice(0, 120);
+  }
+
+  /** 世界状态块：结构化场景/在场/推进槽/变量（L2 规范化呈现，模型可直接遵循） */
+  private worldStateBlock(focus: TurnFocus): string {
+    const vars = Object.entries(this.turnInput.vmsValues).slice(0, 24).map(([k, v]) => `${k}=${v}`).join('; ');
+    return [
+      '<世界状态>',
+      `场景: ${focus.scene || '（未知）'}`,
+      `在场: ${focus.present.join('、') || '（无）'}`,
+      `推进槽: ${JSON.stringify(focus.bars)}`,
+      vars ? `变量: ${vars}` : '',
+      '</世界状态>',
+    ].filter(Boolean).join('\n');
+  }
+
+  /** 世界书条件化门控：按在场实体/场景过滤已扫描条目（只注入相关条目；恒常条目保留） */
+  private gatedWorldbookBlock(focus: TurnFocus): string {
+    const scan = this.turnInput.scan;
+    if (!scan || scan.activated.length === 0) return '';
+    const relevant = scan.activated.filter((e) => {
+      if (e.constant) return true;
+      const text = `${e.comment} ${e.content}`;
+      return focus.present.some((p) => text.includes(p))
+        || (focus.scene.length > 0 && text.includes(focus.scene));
+    });
+    if (relevant.length === 0) return '';
+    return relevant.map((e) => `[${e.constant ? '恒定' : e.matchType}] ${e.comment}: ${e.content.slice(0, 200)}`).join('\n');
+  }
+
+  /** 回合上下文调度：L1 激活（beginTurn）→ 收集激活块 → L2 全局预算裁剪 → 各槽位片段 */
+  private scheduleTurnContext(focus: TurnFocus): {
+    memoryBlock: string; longTermBlock: string; worldbookBlock: string; worldStateBlock: string; dropped: string[];
+  } {
+    this.ctxRuntime.beginTurn(focus);
+    const blocks: ContextBlock[] = this.ctxRuntime.activeFragments().map(({ id, fragment }) => {
+      const c = this.ctxCost.get(id) ?? { cost: 400, priority: 50 };
+      return { id, fragment, cost: c.cost, priority: c.priority };
+    });
+    const sched = scheduleContext(blocks);
+    if (sched.dropped.length > 0) console.log(`[调度] 预算裁剪: ${sched.dropped.map((d) => `${d.id}(${d.reason})`).join(', ')}`);
+    const pick = (id: string): string => sched.blocks.find((b) => b.id === id)?.fragment ?? '';
+    return {
+      memoryBlock: pick('memory'),
+      longTermBlock: pick('longterm'),
+      worldbookBlock: pick('worldbook'),
+      worldStateBlock: pick('worldstate'),
+      dropped: sched.dropped.map((d) => d.id),
+    };
   }
 
   private loadRound(): number {
@@ -503,8 +614,11 @@ export class ChatSession {
     await this.maybeRollingSummarize(round, windowInfo);
 
     // ① 平台预计算（并行：检索 + 扫描 + 变量 + Skill 自觉匹配）
+    // 推进槽（bars）：先于检索读取（焦点合成/检索 query 增强复用）
+    const meta = this.getMeta();
+    const bars = meta ? JSON.parse(meta.bars ?? '{}') as Record<string, number> : {};
     const [recall, scan, skillMatches] = await Promise.all([
-      this.ret.recallAsync({ query: userInput.slice(0, 24), round, budgetTokens: 400 }),
+      this.ret.recallAsync({ query: this.buildRecallQuery(userInput, bars), round, budgetTokens: 400 }),
       Promise.resolve(this.scanner.scan({ text: userInput, seed: round, budgetTokens: 1200 })),
       // Skill 系统：语义匹配用户输入 vs 各 skill 描述（阈值/topK），命中读取指令正文
       Promise.resolve(matchSkills(userInput)),
@@ -514,11 +628,13 @@ export class ChatSession {
     const vmsResult = this.vms.evaluate();
     console.log(`[预计算] 检索 ${recall.hits.length} 条 / 世界书 ${scan.activated.length} 条 / 变量 ${Object.keys(vmsResult.values).length} 个 / 窗口 ${windowInfo.messages.length} 条 ${windowInfo.tokens}t${windowInfo.truncated ? '（截断）' : ''}`);
 
-    // ② 装配
-    // 推进槽：从 memory_meta 读实际值（引擎状态块随动态状态注入）
-    const meta = this.getMeta();
-    const bars = meta ? JSON.parse(meta.bars ?? '{}') as Record<string, number> : {};
-    let dynamicState = `轮次: ${round}\n推进槽: ${JSON.stringify({
+    // ② 装配（L1/L2：焦点 → 依赖激活 → 全局预算调度 → 各槽位片段）
+    const variableValues = { ...vmsResult.values, ...(this.bridge?.getFlat() ?? {}) };
+    this.turnInput = { recall, scan, bars, vmsValues: variableValues };
+    const focus: TurnFocus = { round, scene: this.currentScene(), present: this.presentEntities(userInput), bars, input: userInput };
+    const ctx = this.scheduleTurnContext(focus);
+    // 动态状态：优先世界状态结构化块（L2 规范化呈现）；被预算裁掉则退回紧凑推进槽
+    let dynamicState = ctx.worldStateBlock || `轮次: ${round}\n推进槽: ${JSON.stringify({
       personal: bars.personal ?? 0, accident: bars.accident ?? 0, main: bars.main ?? 0, erotic: bars.erotic ?? 0,
     })}`;
     if (this.bridge) dynamicState += `\n${this.bridge.getStateBlock(600)}`;
@@ -526,16 +642,14 @@ export class ChatSession {
     const pluginInject = this.plugins.callHook('onMessageSend', { userInput, round, mode })
       .flatMap((r) => (typeof (r as { promptInject?: unknown }).promptInject === 'string' ? [(r as { promptInject: string }).promptInject] : []))
       .filter((s) => s.length > 0);
-    // 变量值：VMS 全量 + 引擎叶子（完整名 session:mvu:<path>，宏展开走后缀匹配）
-    const variableValues = { ...vmsResult.values, ...(this.bridge?.getFlat() ?? {}) };
     const userContent = `<最新互动>\n${userInput}\n</最新互动>${pluginInject.length ? `\n<插件注入>\n${pluginInject.join('\n')}\n</插件注入>` : ''}${skillBlock ? `\n${skillBlock}` : ''}`;
     const assembled = assembleTurn({
       systemCore: DEFAULT_SYSTEM_CORE,
-      staticSettings: `角色卡：${this.cardName}\n${this.cardDesc.slice(0, 400)}${scan.injectedBlock ? `\n\n<世界书激活>\n${scan.injectedBlock}\n</世界书激活>` : ''}`,
+      staticSettings: `角色卡：${this.cardName}\n${this.cardDesc.slice(0, 400)}${ctx.worldbookBlock ? `\n\n<世界书激活>\n${ctx.worldbookBlock}\n</世界书激活>` : ''}`,
       dynamicState,
       presetBlocks: this.presetBlocks,
-      memoryBlock: recall.injectedBlock,
-      longTermBlock: this.getLongTermBlock(),
+      memoryBlock: ctx.memoryBlock,
+      longTermBlock: ctx.longTermBlock,
       chatHistory: windowInfo.messages,
       lastTurn: this.lastTurn,
       userInput: userContent,
