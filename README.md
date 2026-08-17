@@ -6,6 +6,25 @@
 
 ---
 
+## v0.2.0 变更（2026-08）
+
+**多轮流式体验修复**
+- 流式期纯文本预览（`StreamText` + rAF 批合并），不再逐字全量 re-parse markdown/HTML，长对话不再卡死
+- 消息行 `React.memo` + 稳定 key（round+role 匹配保留前端 id），流式只重渲最后一条、回合结束不重挂 DOM
+- `fetchHistory` 统一抽取，send/regenerate/delete/resume 复用，减少前后端状态漂移
+
+**生成中止（自己选择终止）**
+- 发送按钮在生成中变为红色「停止」，Esc 亦可触发
+- 贯通：前端 `AbortController` → `/api/turn` req close → 上游 `client.stream` 外部 signal（`AbortSignal.any` 合并超时）
+- 中止保留已生成部分正文落库该轮，**不写记忆**（07 铁律 1：不完整 turn 的 memory_delta 属涌现内容，禁止写环）；回合账本记空 created，可重新生成
+
+**失败兜底 + 孤儿修复**
+- 模型异常（非中止）不再残留「有 user 无 assistant」孤儿轮：删孤儿 user 行 + 轮次回退 + 清空账本，前端清乐观气泡可重发
+- `buildChatWindow` 双保险跳过历史遗留孤儿轮，旧库续聊不记忆断裂
+- regenerate 失败写占位 assistant 成对，无孤儿
+
+---
+
 ## 1. 定位
 
 | 维度 | 说明 |
