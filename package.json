@@ -1,7 +1,7 @@
 {
   "name": "jiuguan",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "酒馆提示词Agent - 下一代剧本游玩平台（headless-first MVP）",
   "type": "module",
   "workspaces": [
@@ -19,7 +19,7 @@
     "test:sandbox": "node --experimental-strip-types --experimental-transform-types packages/sandbox/tests/verify.ts && node --experimental-strip-types --experimental-transform-types packages/sandbox/tests/verify-bridge.ts",
     "test:plugin": "node --experimental-strip-types --experimental-transform-types packages/plugin/tests/verify.ts && node --experimental-strip-types --experimental-transform-types packages/plugin/tests/verify-runtime.ts && node --experimental-strip-types --experimental-transform-types packages/plugin/tests/verify-install.ts",
     "test:storyboard": "node --experimental-strip-types --experimental-transform-types tools/cli/verify-storyboard.ts",
-    "test": "pnpm test:memory && pnpm test:core && pnpm test:proxy && pnpm test:prompt && pnpm test:variable && pnpm test:sandbox && pnpm test:plugin && pnpm test:storyboard && pnpm test:rollback && pnpm test:abort && pnpm test:fallback && pnpm test:context",
+    "test": "pnpm test:memory && pnpm test:core && pnpm test:proxy && pnpm test:prompt && pnpm test:variable && pnpm test:sandbox && pnpm test:plugin && pnpm test:storyboard && pnpm test:rollback && pnpm test:abort && pnpm test:fallback && pnpm test:context && pnpm test:ab",
     "storyboard": "node --experimental-strip-types --experimental-transform-types tools/cli/storyboard.ts",
     "turn-loop": "node --experimental-strip-types --experimental-transform-types tools/cli/turn-loop.ts",
     "turn-runner": "node --experimental-strip-types --experimental-transform-types tools/cli/turn-runner.ts",
@@ -31,7 +31,8 @@
     "test:rollback": "node --experimental-strip-types --experimental-transform-types tools/cli/verify-rollback.ts",
     "test:abort": "node --experimental-strip-types --experimental-transform-types tools/cli/verify-abort.ts",
     "test:fallback": "node --experimental-strip-types --experimental-transform-types tools/cli/verify-fallback.ts",
-    "test:context": "node --experimental-strip-types --experimental-transform-types tools/cli/verify-context-lifecycle.ts && node --experimental-strip-types --experimental-transform-types tools/cli/verify-scheduler.ts"
+    "test:context": "node --experimental-strip-types --experimental-transform-types tools/cli/verify-context-lifecycle.ts && node --experimental-strip-types --experimental-transform-types tools/cli/verify-scheduler.ts",
+    "test:ab": "node --experimental-strip-types --experimental-transform-types tools/evaluator/ab.ts"
   },
   "engines": {
     "node": ">=22.5.0"

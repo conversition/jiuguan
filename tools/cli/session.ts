@@ -401,11 +401,12 @@ export class ChatSession {
     return input.split(/[，。！？、,.!?\s]+/).filter((s) => s.length >= 2 && s.length <= 8).slice(0, 6);
   }
 
-  /** 检索 query 增强：完整输入 + 在场实体 + 推进槽（替代仅 24 字截断），预算内截断 */
+  /** 检索 query 增强：完整输入 + 在场实体裸词 + 推进槽（替代仅 24 字截断），预算内截断
+   *  实体裸词（不加前缀）：与内容同词形，FTS/LIKE 才能命中；<120 字预算 */
   private buildRecallQuery(input: string, bars: Record<string, number>): string {
     const parts = [
       input,
-      ...this.presentEntities(input).map((e) => `实体:${e}`),
+      ...this.presentEntities(input),
       Object.entries(bars).map(([k, v]) => `${k}:${v}`).join(' '),
     ].filter(Boolean);
     return parts.join(' ').slice(0, 120);

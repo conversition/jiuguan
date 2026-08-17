@@ -6,6 +6,17 @@
 
 ---
 
+## v0.3.0 变更（2026-08）
+
+**上下文依赖调度 —— 让 AI 回复更聪明、更沉浸、省 token（Cordis 思想引入）**
+- **L1 上下文提供者生命周期**（`packages/prompt/context-provider-runtime.ts`）：把 Cordis 的 coeffect 依赖满足 + revertible effects 迁移到上下文装配层。每个上下文来源（记忆/世界书/长期摘要/世界状态）声明为 provider fiber（inject 依赖 + provide 服务 + build 片段 + teardown 逆操作）；每回合依焦点做依赖求值、激活/撤销，**consumer 先退、provider 后撤，LIFO 逆操作**——旧场景上下文干净撤销、不残留、不串线。
+- **L2 调度层**（`packages/prompt/context-scheduler.ts`）：只对符合条件的块按 cost/priority 排序 → 全局 `CONTEXT_BUDGET_TOKENS` 总闸裁剪（宁丢勿裁）——**省 token 主杠杆**。
+- **内容改进**：检索 query 由 24 字截断 → 完整输入 + 在场实体裸词 + 推进槽（召回命中更准）；世界书按在场实体/场景条件化门控（只注入相关条目）；动态状态结构化为 `<世界状态>` 块（模型可直接遵循）。
+- **评测**：`tools/evaluator/ab.ts` A/B（mock 零 API）——召回基线 1/3 → 增强 3/3；注入 token 门控后不高于基线；全局预算裁剪低优先级块。
+- **分层责任**：Cordis 底座只解决「哪些进、哪些出、怎么干净出」；成本/优先级/预算为自研调度层；变量问题按规划于二期处理（本期仅以世界状态块参与装配）。
+
+---
+
 ## v0.2.0 变更（2026-08）
 
 **多轮流式体验修复**
