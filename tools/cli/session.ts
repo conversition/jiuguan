@@ -646,13 +646,22 @@ export class ChatSession {
   // ── 重新生成 / 删除历史（round 账本机制）──
 
   /** 重新生成第 round 轮 AI 回复：回滚该轮状态（保留用户行）→ 用存储的用户输入重放
-   *  @param signal 外部中止信号（同 turn：中止时保留已生成正文落库） */
+   *  @param signal 外部中止信号（同 turn：中止时保留已生成正文落库）
+   *  模型异常（非中止）：原正文已被回滚，写占位 assistant 防孤儿 user 行，再抛出让上层报错 */
   async regenerate(round: number, onProse?: (chunk: string) => void, signal?: AbortSignal): Promise<{ prose: string; round: number; assistantMsgId: number | null }> {
     const userRow = this.mem.db.prepare('SELECT content FROM chat_log WHERE round = ? AND role = ? ORDER BY id DESC LIMIT 1')
       .get(round, 'user') as { content: string } | undefined;
     if (!userRow) throw new Error(`round ${round} 无用户消息，无法重新生成`);
     this.rollbackStateOnly(round);
-    const prose = await this.runTurnCore(round, userRow.content, this.args.contentMode ?? 'nsfw', onProse, { logUser: false }, signal);
+    let prose: string;
+    try {
+      prose = await this.runTurnCore(round, userRow.content, this.args.contentMode ?? 'nsfw', onProse, { logUser: false }, signal);
+    } catch (e) {
+      // 回滚已删原 assistant，此处补占位（与 runTurnCore !turn 分支一致），保证该轮成对
+      this.logChat('assistant', '（本轮回合生成失败，请重试）', round);
+      this.writeLedger(round, this.snapshotPre(), { mainCode: '', eventCodes: [], eventIds: [] }, 0, 0);
+      throw e;
+    }
     const aid = this.mem.db.prepare("SELECT id FROM chat_log WHERE round = ? AND role = 'assistant' ORDER BY id DESC LIMIT 1")
       .get(round) as { id: number } | undefined;
     return { prose, round, assistantMsgId: aid?.id ?? null };
@@ -748,6 +757,29 @@ export class ChatSession {
     return { round, kept: true, waited };
   }
 
+  /** 回合失败兜底（模型异常/网络错误，非中止）：清除本轮孤儿 user 行 + 回退轮次计数 + 清空账本
+   *  幂等：仅清理「有 user 无 assistant」的最大孤儿轮；正常完成/已中止轮不动。
+   *  目的：孤儿 user 行会被下次 buildChatWindow 带入装配上下文 → 记忆断裂；清理后该轮视为未发生。 */
+  rollbackFailedTurn(): { round: number; cleaned: boolean } {
+    const orphan = this.mem.db.prepare(
+      `SELECT r.round AS round
+       FROM (SELECT DISTINCT round FROM chat_log WHERE role = 'user') r
+       LEFT JOIN (SELECT DISTINCT round FROM chat_log WHERE role = 'assistant') a ON a.round = r.round
+       WHERE a.round IS NULL
+       ORDER BY r.round DESC LIMIT 1`,
+    ).get() as { round: number } | undefined;
+    if (!orphan) return { round: this.round, cleaned: false };
+    const round = orphan.round;
+    // 回合未完成：该轮 ledger 若已写（created 为空占位）一并清除，避免残留空账本
+    this.mem.db.prepare('DELETE FROM round_ledger WHERE round = ?').run(round);
+    // 轮次计数回退（当前正卡在该失败轮 → 回退到上一轮，下次 turn 重新递增）
+    if (this.round >= round) this.round = round - 1;
+    // 删除孤儿 user 行
+    this.mem.db.prepare("DELETE FROM chat_log WHERE round = ? AND role = 'user'").run(round);
+    console.log(`[兜底] 清理失败轮 round ${round} 孤儿 user 行（轮次回退 ${round - 1}）`);
+    return { round, cleaned: true };
+  }
+
   /** 回滚第 round 轮：删本轮新写行 + 恢复写环前状态；keepUser=true 保留用户行（重新生成路径） */
   private restoreFromLedger(round: number, keepUser: boolean): void {
     const ledger = this.mem.db.prepare('SELECT meta_snapshot, state_snapshot, created FROM round_ledger WHERE round = ?')
@@ -818,17 +850,27 @@ export class ChatSession {
 
   // ── 滑动窗口 + 滚动摘要（长对话防爆 token）──
 
-  /** 近期对话窗口：从新往旧累积，token/条数预算内保持正序；prompt 层正则清洗内部标记 */
+  /** 近期对话窗口：从新往旧累积，token/条数预算内保持正序；prompt 层正则清洗内部标记
+   *  双保险：跳过孤儿轮（有 user 无 assistant，历史遗留或失败残留），避免带入装配上下文致记忆断裂 */
   private buildChatWindow(maxRound: number): { messages: { role: string; content: string }[]; truncated: boolean; tokens: number; startRound: number } {
     const rows = this.mem.db.prepare('SELECT round, role, content FROM chat_log WHERE round <= ? ORDER BY id ASC').all(maxRound) as {
       round: number; role: string; content: string;
     }[];
+    const orphanRounds = new Set(
+      (this.mem.db.prepare(
+        `SELECT r.round AS round
+         FROM (SELECT DISTINCT round FROM chat_log WHERE role = 'user') r
+         LEFT JOIN (SELECT DISTINCT round FROM chat_log WHERE role = 'assistant') a ON a.round = r.round
+         WHERE a.round IS NULL`,
+      ).all() as { round: number }[]).map((x) => x.round),
+    );
     const kept: { round: number; role: string; content: string }[] = [];
     let tokens = 0;
     let truncated = false;
     for (let i = rows.length - 1; i >= 0; i--) {
       const r = rows[i];
       if (kept.length >= this.windowN) { truncated = true; break; }
+      if (orphanRounds.has(r.round)) continue;
       const clean = applyRegexRules(r.content, this.regexLib.list(), 'prompt').text;
       const t = estimateTokens(clean);
       if (tokens + t > this.windowTokens && kept.length > 0) { truncated = true; break; }

@@ -400,6 +400,10 @@ export function App() {
         } catch { /* 中止兜底失败不阻塞 */ }
       } else {
         setError((e as Error).message);
+        // 网络级异常：后端已清理失败轮孤儿 → 刷新历史移除乐观气泡（round 0 user+assistant），避免残留空回复
+        try { await fetchHistory(sessionId); } catch { /* 刷新失败不阻塞报错 */ }
+        fetchTurnState(sessionId);
+        refreshSessions();
       }
     }
     abortRef.current = null;
@@ -436,6 +440,10 @@ export function App() {
         await finalizeAbort(sessionId, msg.round);
       } else {
         setError((e as Error).message);
+        // 网络级异常：后端已写占位 assistant → 刷新历史对齐，避免前后端状态漂移
+        try { await fetchHistory(sessionId); } catch { /* 刷新失败不阻塞报错 */ }
+        fetchTurnState(sessionId);
+        refreshSessions();
       }
     }
     abortRef.current = null;

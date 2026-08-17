@@ -236,7 +236,11 @@ const server = createServer(async (req, res) => {
         if (!streamStarted) sseSend(res, { type: 'status', stage: 'streaming' });
         sseSend(res, { type: 'done', prose });
       } catch (e) {
-        if (!ac.signal.aborted) sseSend(res, { type: 'error', message: (e as Error).message.slice(0, 200) });
+        // 非中止失败：清理本轮孤儿 user 行（模型异常下 runTurnCore 已写 user、无 assistant，会致记忆断裂）
+        if (!ac.signal.aborted) {
+          session.rollbackFailedTurn();
+          sseSend(res, { type: 'error', message: (e as Error).message.slice(0, 200) });
+        }
       }
       req.off('close', onClose);
       res.end();
