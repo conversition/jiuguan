@@ -30,6 +30,18 @@ export interface RuleRunResult {
 /** 每轮规则执行步数上限（防异常死循环） */
 export const MAX_RULES_STEPS = 64;
 
+/** 变量全名 → 裸名（去 scope:source: 前缀；紧凑注入显示用） */
+export function bareVarName(full: string): string {
+  const i = full.lastIndexOf(':');
+  return i > 0 ? full.slice(i + 1) : full;
+}
+
+/** 变化集 → 紧凑注入段（只含变化的变量）：`变量: 好感度=7; 地点=酒馆`；无变化返回空串 */
+export function formatVarDelta(effects: RuleEffect[]): string {
+  if (effects.length === 0) return '';
+  return effects.map((e) => `${bareVarName(e.name)}=${e.new}`).join('; ');
+}
+
 /**
  * 执行规则集：对 events 顺序跑每条的 trigger/action；返回变化集。
  * 事件键以 `{event_<key>}` 引用（DSL ident 不支持点号，故用下划线）。

@@ -29,6 +29,11 @@ import { Vectorizer } from '../../packages/memory/src/vectorize.ts';
 import { createEmbeddingProvider, HashEmbeddingProvider } from '../../packages/memory/src/embedding.ts';
 import { VariableManager } from '../../packages/variable/src/vms.ts';
 import { persistVariables, restoreVariables } from '../../packages/variable/src/persist.ts';
+import { VariableCompiler, detectCardSource } from '../../packages/variable/src/compiler.ts';
+import type { CardVariableSpec } from '../../packages/variable/src/compiler.ts';
+import { executeRules, formatVarDelta, bareVarName } from '../../packages/variable/src/rules.ts';
+import type { RuleEffect } from '../../packages/variable/src/rules.ts';
+import type { VariableManifestRule, VariableManifest } from '../../packages/variable/src/manifest.ts';
 import { assembleTurn, DEFAULT_SYSTEM_CORE, estimateTokens } from '../../packages/prompt/src/assembly.ts';
 import { validateGameTurn, safeParseTurn, normalizeTurn, createProseStreamExtractor } from '../../packages/prompt/src/turn.ts';
 import type { GameTurn } from '../../packages/prompt/src/turn.ts';
@@ -160,6 +165,11 @@ export class ChatSession {
   /** 每回合预计算结果暂存（provider build 闭包读取：L3 内容源） */
   private turnInput: { recall: RecallResult | null; scan: ScanResult | null; bars: Record<string, number>; vmsValues: Record<string, string | number | boolean> } =
     { recall: null, scan: null, bars: {}, vmsValues: {} };
+  /** 变量编译调度器（0.4.0：卡 NL 变量规则 → manifest；Active 后运行期规则执行） */
+  private varCompiler: VariableCompiler | null = null;
+  private varRules: VariableManifestRule[] = [];
+  /** 上轮规则执行变化集（紧凑注入：只注入变化的变量；首轮为空则全量紧凑兜底） */
+  private lastVarEffects: RuleEffect[] = [];
 
   /** 内容模式模块加载（WP14：可编辑文件 data/content-modes.json） */
   private loadContentModes(): void {
@@ -413,8 +423,11 @@ export class ChatSession {
   }
 
   /** 世界状态块：结构化场景/在场/推进槽/变量（L2 规范化呈现，模型可直接遵循） */
+  /** 世界状态块：场景/在场/推进槽 + 紧凑变量段（只注入上轮变化集；首轮全量紧凑，长期不变省略） */
   private worldStateBlock(focus: TurnFocus): string {
-    const vars = Object.entries(this.turnInput.vmsValues).slice(0, 24).map(([k, v]) => `${k}=${v}`).join('; ');
+    const vars = this.lastVarEffects.length > 0
+      ? formatVarDelta(this.lastVarEffects)
+      : Object.entries(this.turnInput.vmsValues).slice(0, 12).map(([k, v]) => `${bareVarName(k)}=${v}`).join('; ');
     return [
       '<世界状态>',
       `场景: ${focus.scene || '（未知）'}`,
@@ -458,6 +471,66 @@ export class ChatSession {
       worldStateBlock: pick('worldstate'),
       dropped: sched.dropped.map((d) => d.id),
     };
+  }
+
+  // ── 变量后台自治（0.4.0：编译期一次性翻译 + 运行期确定性规则）──
+
+  /** 卡变量编译接线：检测卡类型 → 结构化直注 / NL 走编译器 / MVU 直连桥（不进编译） */
+  private async compileCardVariables(engineScript?: string): Promise<void> {
+    const src = detectCardSource({ cardId: this.cardName, cardText: this.cardDesc, engineScript });
+    if (src === 'none' || src === 'mvu') return; // MVU 卡由桥 tick，不进编译
+    const spec: CardVariableSpec = { cardId: this.cardName, cardText: this.cardDesc, engineScript };
+    if (src === 'structured') {
+      this.registerVarSpecs(spec.structured ?? []);
+      console.log(`[变量] 结构化声明 ${spec.structured?.length ?? 0} 项（直注，无编译）`);
+      return;
+    }
+    // nl / mixed：编译器 LLM seam（缓存命中免 token；失败降级变量静止）
+    this.varCompiler = new VariableCompiler(this.cardName, resolve('data', 'var-cache'), this.compileFromLlm.bind(this));
+    const r = await this.varCompiler.compile(spec);
+    if (r.state === 'active' && r.manifest) {
+      this.registerVarSpecs(r.manifest.vars.map((v) => ({ name: v.name, type: v.type, default: v.default })));
+      this.varRules = r.manifest.rules.filter((x) => !x.requires_ai);
+      console.log(`[变量] 编译 ${r.manifest.source} 卡 → ${r.manifest.vars.length} 变量 / ${this.varRules.length} 规则${r.cacheHit ? '（缓存命中）' : ''}`);
+    } else {
+      console.log(`[变量] 编译降级（${r.state}）：${this.varCompiler.lastErrorOf()}`);
+    }
+  }
+
+  /** 注册清单变量（literal 默认值；derived 规则由 VMS 表达式另算） */
+  private registerVarSpecs(specs: { name: string; type: 'number' | 'string' | 'boolean'; default?: number | string | boolean }[]): void {
+    for (const s of specs) {
+      try {
+        this.vms.register({ scope: 'session', source: 'card', name: s.name, type: 'literal', value: s.default ?? (s.type === 'number' ? 0 : s.type === 'boolean' ? false : '') });
+      } catch { /* 冲突/坏名跳过，不阻断 */ }
+    }
+  }
+
+  /** 编译器 LLM seam：卡 NL 变量规则 → VariableManifest JSON；无 provider key / 解析失败 → null（降级） */
+  private async compileFromLlm(spec: CardVariableSpec, lastError?: string): Promise<VariableManifest | null> {
+    if (!this.cfg.apiKey) return null;
+    const prompt = [
+      '把以下角色卡的变量规则编译为 JSON（VariableManifest）。',
+      '格式：{"cardId":string,"source":"nl","vars":[{"name","type","default?"}],"rules":[{"trigger","action"}]}',
+      '要求：变量名小写字母/下划线/中文；trigger 为 DSL 布尔表达式（可用 contains({event_user_input},"词")、{变量名}、算术/比较/逻辑）；action 为 "变量 = DSL表达式" 赋值，只能用已声明变量做左值；无规则则 rules:[]。',
+      '只输出 JSON，不要解释。',
+      lastError ? `\n上次编译被拒，原因：${lastError}\n请修正后重新输出完整 JSON。` : '',
+      `\n规则文本：\n${spec.cardText.slice(0, 4000)}`,
+    ].join('');
+    try {
+      const res = await this.client.complete({
+        messages: [
+          { role: 'system', content: '你是角色扮演变量规则编译器，只输出合法 JSON。' },
+          { role: 'user', content: prompt },
+        ],
+        temperature: 0.2,
+        max_tokens: 2000,
+      });
+      const text = (res.content ?? '').replace(/```(json)?/g, '').trim();
+      return JSON.parse(text) as VariableManifest;
+    } catch {
+      return null;
+    }
   }
 
   private loadRound(): number {
@@ -564,6 +637,8 @@ export class ChatSession {
         await this.bridge.start();
         console.log(`[引擎] ${engineScript.name} 接入回合（ready=${this.bridge.isReady()}，叶子 ${Object.keys(this.bridge.getFlat()).length}）`);
       }
+      // 变量后台自治（0.4.0）：卡变量规则编译（缓存命中免 token；MVU 卡直连桥）
+      await this.compileCardVariables(engineScript?.content);
       if (!this.args.resume) {
         this.writer.initMeta({ personal: 0, accident: 0, main: 0, erotic: 0 }, {});
       }
@@ -738,6 +813,13 @@ export class ChatSession {
     }
     turn.prose = finalProse;
     this.logChat('assistant', turn.prose, round);
+    // ④b 确定性变量规则（0.4.0：后台自治，零 token）→ 上轮变化集供下一轮紧凑注入
+    if (this.varRules.length > 0) {
+      const rr = executeRules(this.varRules, { user_input: userInput, location: this.currentScene(), event_type: this.lastEventType }, this.vms);
+      this.lastVarEffects = rr.effects;
+      if (rr.effects.length > 0) console.log(`[变量] 规则更新 ${rr.effects.map((e) => `${bareVarName(e.name)}:${e.old}→${e.new}`).join(', ')}`);
+      if (rr.errors.length > 0) console.warn(`[变量] 规则异常 ${rr.errors.length} 条：${rr.errors[0].message.slice(0, 80)}`);
+    }
     // ⑤ MVU 引擎回合后计算：assistant 消息已落库 → 驱动引擎 tick（确定性演化 → VMS + 持久化）
     if (this.bridge) {
       const tick = this.bridge.tickAfterAiTurn(this.getChatForEngine(), round);
