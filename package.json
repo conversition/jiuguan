@@ -1,7 +1,7 @@
 {
   "name": "jiuguan",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "酒馆提示词Agent - 下一代剧本游玩平台（headless-first MVP）",
   "type": "module",
   "workspaces": [
@@ -15,7 +15,7 @@
     "test:core": "node --experimental-strip-types --experimental-transform-types packages/core/tests/verify.ts && node --experimental-strip-types --experimental-transform-types packages/core/tests/verify-scanner.ts && node --experimental-strip-types --experimental-transform-types packages/core/tests/verify-preset.ts && node --experimental-strip-types --experimental-transform-types packages/core/tests/verify-assets.ts && node --experimental-strip-types --experimental-transform-types packages/core/tests/verify-regex.ts && node --experimental-strip-types --experimental-transform-types packages/core/tests/verify-skills.ts",
     "test:proxy": "node --experimental-strip-types --experimental-transform-types packages/proxy/tests/verify-config.ts",
     "test:prompt": "node --experimental-strip-types --experimental-transform-types packages/prompt/tests/verify.ts && node --experimental-strip-types --experimental-transform-types packages/prompt/tests/verify-stream.ts",
-    "test:variable": "node --experimental-strip-types --experimental-transform-types packages/variable/tests/verify.ts && node --experimental-strip-types --experimental-transform-types packages/variable/tests/verify-integration.ts && node --experimental-strip-types --experimental-transform-types packages/variable/tests/verify-persist.ts",
+    "test:variable": "node --experimental-strip-types --experimental-transform-types packages/variable/tests/verify.ts && node --experimental-strip-types --experimental-transform-types packages/variable/tests/verify-integration.ts && node --experimental-strip-types --experimental-transform-types packages/variable/tests/verify-persist.ts && node --experimental-strip-types --experimental-transform-types tools/cli/verify-variable-compiler.ts && node --experimental-strip-types --experimental-transform-types tools/cli/verify-variable-rules.ts && node --experimental-strip-types --experimental-transform-types tools/cli/verify-compact-inject.ts",
     "test:sandbox": "node --experimental-strip-types --experimental-transform-types packages/sandbox/tests/verify.ts && node --experimental-strip-types --experimental-transform-types packages/sandbox/tests/verify-bridge.ts",
     "test:plugin": "node --experimental-strip-types --experimental-transform-types packages/plugin/tests/verify.ts && node --experimental-strip-types --experimental-transform-types packages/plugin/tests/verify-runtime.ts && node --experimental-strip-types --experimental-transform-types packages/plugin/tests/verify-install.ts",
     "test:storyboard": "node --experimental-strip-types --experimental-transform-types tools/cli/verify-storyboard.ts",

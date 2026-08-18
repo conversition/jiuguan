@@ -6,6 +6,18 @@
 
 ---
 
+## v0.4.0 变更（2026-08）
+
+**变量后台自治服务 —— 编译期一次性翻译 + 运行期确定性执行 + 紧凑按需注入**
+- **编译调度器**（`packages/variable/compiler.ts`）：卡片加载时检测类型（MVU 引擎直连桥 / 结构化声明直注 / 纯 NL 规则走编译器 / 混合 / 无），编译状态机 `Idle→Compiling→Active|Fallback`，编译器 LLM ≤2 次 + 2000 token 预算 + 产物静态校验，**磁盘缓存**（内容指纹失效，下次加载免 token）。编译产物**绝不进对话 prompt**。
+- **确定性规则执行器**（`packages/variable/rules.ts`）：`trigger`（DSL 布尔，含新增 `contains()`）+ `action`（`lhs=rhs` 赋值）；回合末事件驱动执行，**零 token**；返回 old→new 变化集；步数上限防异常。
+- **紧凑按需注入**：世界状态块的变量段从「扁平全量」改为「只注入本轮回变化集」——A/B 实测**省约 91% token**（134t → 12t）。
+- **降级策略**：编译 Fallback（无 key/失败）→ 变量静止、会话正常；部分规则失败剔除标记 requires_ai；运行异常跳轮 + 日志。
+- **会话接线**：init 编译注册变量 + 回合末 `executeRules`；A/B 评测器增「维度3：变化集 vs 全量」。
+- **后续**（不进本期）：requires_ai 模糊变量批量小模型、监管面板、变量作为 Cordis effect/coeffect 完整集成。
+
+---
+
 ## v0.3.0 变更（2026-08）
 
 **上下文依赖调度 —— 让 AI 回复更聪明、更沉浸、省 token（Cordis 思想引入）**
