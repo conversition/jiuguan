@@ -110,6 +110,11 @@ export class VariableManager {
     return this.decls.get(fullName);
   }
 
+  /** 裸名 → 最高优先级 fullName（规则执行器等以裸名引用的入口；未索引返回 undefined） */
+  resolveBare(name: string): string | undefined {
+    return this.nameIndex.get(name);
+  }
+
   /** 设置 literal 值（触发版本号递增；derived 不可直接 set） */
   set(fullName: string, value: VarValue): void {
     const d = this.decls.get(fullName);

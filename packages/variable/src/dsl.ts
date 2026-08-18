@@ -36,6 +36,8 @@ export const WHITELIST_FUNCS: Record<string, (args: VarValue[]) => VarValue> = {
   ceil: ([v]) => Math.ceil(Number(v)),
   len: ([s]) => String(s).length,
   concat: (a) => a.map((x) => String(x)).join(''),
+  // 字符串包含（NL 变量规则 trigger 常用：如 contains({event_user_input}, "礼物")）
+  contains: ([text, sub]) => String(text).includes(String(sub)),
   // roll("d20") | roll("2d6+3") | roll(1,6)
   // 非确定性：全局 Math.random，结果不参与缓存/重放（见 06 文档 §4.4）
   roll: (a) => {
