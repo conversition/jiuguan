@@ -37,12 +37,24 @@ export interface WriteResult {
 export class WriteLoop {
   constructor(private mem: MemoryDb) {}
 
-  /** 执行一轮写环 */
+  /** 执行一轮写环（0.5.0：整体落 BEGIN IMMEDIATE 事务，中途失败 ROLLBACK 无部分写入） */
   execute(delta: MemoryDelta): WriteResult {
     const warnings: string[] = [];
     const round = delta.round ?? this.currentRound() + 1;
     const scene = delta.scene ?? '';
 
+    // 单写事务：所有本轮写入要么全成、要么全回滚（多表强一致，0.5.0 migration/事务统一）
+    const db = this.mem.db;
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      return this.executeInTx(delta, round, scene, warnings, db);
+    } catch (e) {
+      try { db.exec('ROLLBACK'); } catch { /* 已回滚 */ }
+      throw e;
+    }
+  }
+
+  private executeInTx(delta: MemoryDelta, round: number, scene: string, warnings: string[], db: MemoryDb['db']): WriteResult {
     // 1. 平台分配 AM 码
     const allCodes = this.allCodes();
     const code = nextAmCode(allCodes);
@@ -56,20 +68,20 @@ export class WriteLoop {
 
     // 3. 写入总结表（memory_summary，新 AM 码）
     const now = new Date().toISOString();
-    const summaryId = this.mem.db.prepare(
+    const summaryId = db.prepare(
       'INSERT INTO memory_summary (code, round, delta, scene, created_at) VALUES (?, ?, ?, ?, ?)'
     ).run(code, round, summary, scene, now).lastInsertRowid as number;
 
     // 4. 写入/更新大纲表（memory_arc，同 AM 码 → 双表一致）
     let arcId: number | undefined;
-    const arcRow = this.mem.db.prepare('SELECT id FROM memory_arc WHERE code = ?').get(code) as { id: number } | undefined;
+    const arcRow = db.prepare('SELECT id FROM memory_arc WHERE code = ?').get(code) as { id: number } | undefined;
     if (arcRow) {
-      this.mem.db.prepare('UPDATE memory_arc SET summary = ?, chapter = COALESCE(chapter, ?) WHERE id = ?')
+      db.prepare('UPDATE memory_arc SET summary = ?, chapter = COALESCE(chapter, ?) WHERE id = ?')
         .run(summary, scene, arcRow.id);
       arcId = arcRow.id;
     } else {
       const seq = this.maxSeq() + 1;
-      arcId = this.mem.db.prepare(
+      arcId = db.prepare(
         'INSERT INTO memory_arc (code, chapter, title, summary, status, seq) VALUES (?, ?, ?, ?, ?, ?)'
       ).run(code, scene, `R${round}`, summary, 'active', seq).lastInsertRowid as number;
     }
@@ -79,7 +91,7 @@ export class WriteLoop {
     const eventIds: number[] = [];
     for (const ev of delta.new_events ?? []) {
       const evCode = nextAmCode(this.allCodes());
-      const evId = this.mem.db.prepare(
+      const evId = db.prepare(
         'INSERT INTO memory_event (code, description, characters, refs, resolved) VALUES (?, ?, ?, ?, 0)'
       ).run(evCode, ev.description.slice(0, 400), ev.characters ?? '[]', '[]').lastInsertRowid as number;
       insertedCodes.push(evCode);
@@ -104,15 +116,16 @@ export class WriteLoop {
     }
 
     // 9. 轮次推进 + 元数据（UPSERT 语义：保留 initMeta 的 stage/bars/config，审查 §3.1 修复）
-    const meta = this.mem.db.prepare('SELECT id FROM memory_meta WHERE id = 1').get() as { id: number } | undefined;
+    const meta = db.prepare('SELECT id FROM memory_meta WHERE id = 1').get() as { id: number } | undefined;
     if (meta) {
-      this.mem.db.prepare('UPDATE memory_meta SET plot_round = ? WHERE id = 1').run(round);
+      db.prepare('UPDATE memory_meta SET plot_round = ? WHERE id = 1').run(round);
     } else {
       // 未初始化时自动创建（默认 'setup' stage，不硬编码 'development'）
-      this.mem.db.prepare('INSERT INTO memory_meta (id, arc_id, stage, plot_round, bars, config) VALUES (1, ?, ?, ?, ?, ?)')
+      db.prepare('INSERT INTO memory_meta (id, arc_id, stage, plot_round, bars, config) VALUES (1, ?, ?, ?, ?, ?)')
         .run('arc-1', 'setup', round, '{}', '{}');
     }
 
+    db.exec('COMMIT');
     return {
       insertedCodes,
       updatedCodes: [],

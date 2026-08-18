@@ -201,6 +201,9 @@ CREATE TRIGGER IF NOT EXISTS lore_au AFTER UPDATE ON lorebook_entry BEGIN
 END;
 `;
 
+/** 当前 schema 版本号（0.5.0：与 PRAGMA user_version 同步，供增量迁移使用） */
+export const SCHEMA_VERSION = 3;
+
 /** 检索融合权重（v2 07 §5.1） */
 export const DEFAULT_WEIGHTS = {
   wBm25: 0.45,
