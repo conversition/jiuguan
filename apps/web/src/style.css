@@ -105,7 +105,7 @@ body { font-family: system-ui, 'PingFang SC', 'Microsoft YaHei', sans-serif; bac
   background: var(--bg-card); color: var(--ink-2); border: 1px solid var(--border);
   border-radius: 6px; padding: 4px 8px; font-size: 13px;
 }
-.chat { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.chat { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
 .messages { flex: 1; overflow-y: auto; padding: 24px 20px; }
 .empty { text-align: center; color: var(--ink-4); margin-top: 80px; font-size: 14px; line-height: 1.8; }
 .msg { display: flex; margin-bottom: 18px; }
@@ -358,3 +358,42 @@ body { font-family: system-ui, 'PingFang SC', 'Microsoft YaHei', sans-serif; bac
 }
 .branch-btn:hover { background: var(--bg-hover); border-left-color: var(--accent-ink); transform: translateX(2px); }
 .branch-btn:disabled { opacity: .5; cursor: default; }
+
+/* ═══════════ 右侧楼层刻度表（v0.6.0）═══════════ */
+.message-ruler {
+  position: absolute; right: 12px; top: 50%; transform: translateY(-50%);
+  z-index: 20; display: flex; flex-direction: column; align-items: center;
+  max-height: 70vh; overflow-y: auto; padding: 6px 4px;
+  background: var(--bg-elev); border: 1px solid var(--border); border-radius: 999px;
+  backdrop-filter: blur(8px); scrollbar-width: none;
+}
+.message-ruler::-webkit-scrollbar { display: none; }
+.message-ruler__track { display: flex; flex-direction: column; align-items: center; }
+
+.message-ruler__tick {
+  position: relative; display: flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; margin: 2px 0; background: transparent; border: none;
+  cursor: pointer; color: var(--ink-3); padding: 0;
+}
+.message-ruler__dot { width: 6px; height: 6px; border-radius: 999px; background: currentColor; opacity: .7; transition: all .2s; }
+.message-ruler__tick:hover .message-ruler__dot { opacity: 1; }
+.message-ruler__tick.is-active .message-ruler__dot { width: 9px; height: 9px; opacity: 1; background: var(--accent); box-shadow: 0 0 10px var(--accent); }
+.message-ruler__label {
+  position: absolute; right: 30px; top: 50%; transform: translateY(-50%);
+  font-size: 11px; padding: 1px 6px; border-radius: 4px; background: var(--bg-deep); border: 1px solid var(--border);
+  opacity: 0; transition: opacity .15s; pointer-events: none; white-space: nowrap;
+}
+.message-ruler__tick:hover .message-ruler__label { opacity: 1; }
+
+/* ═══════════ 查看新回复浮窗（生成完成智能定位 v0.6.0）═══════════ */
+.jump-to-latest {
+  position: absolute; bottom: 92px; left: 50%; transform: translateX(-50%);
+  z-index: 30; padding: 8px 16px; border-radius: 999px; border: 1px solid var(--border);
+  background: var(--accent); color: #1b1b1b; font-size: 13px;
+  box-shadow: 0 8px 24px rgba(0,0,0,.3); cursor: pointer;
+}
+.jump-to-latest:hover { filter: brightness(1.08); }
+
+@media (max-width: 768px) {
+  .message-ruler { right: 4px; transform: translateY(-50%) scale(.8); }
+}
