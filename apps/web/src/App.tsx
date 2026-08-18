@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { MemoryConsole } from './MemoryConsole.tsx';
 import { ProviderPanel } from './ProviderPanel.tsx';
 import { AssetsPanel } from './AssetsPanel.tsx';
@@ -10,6 +10,11 @@ import { MarkdownMessage, StreamText } from './MarkdownMessage.tsx';
 import { HtmlMessage, looksLikeHtml, extractHtmlFromCodeFence } from './HtmlMessage.tsx';
 import { applyRegexRules } from '../../../packages/core/src/regex.ts';
 import type { RegexRule } from '../../../packages/core/src/regex.ts';
+import { useMessageRefs, toMessageKey } from './hooks/useMessageRefs.ts';
+import { useScrollToMessage } from './hooks/useScrollToMessage.ts';
+import { useScrollSpy } from './hooks/useScrollSpy.ts';
+import { useAutoScrollToMessage } from './hooks/useAutoScrollToMessage.ts';
+import { MessageRuler } from './components/MessageRuler.tsx';
 
 interface Card { id: string; name: string }
 interface SessionInfo { id: string; name: string; preview?: string; round?: number }
@@ -101,7 +106,7 @@ interface MsgOps {
 /** 单条消息行（memo：流式期旧消息 content 不变则不重渲染，避免全量 re-parse 卡死）
  *  仅比较渲染相关字段，忽略 ops/streamingMsgRef 等稳定引用 */
 const MessageRow = React.memo(function MessageRow({
-  m, busy, streaming, isLastAssistant, showRaw, regexRules, ops, streamingMsgRef,
+  m, busy, streaming, isLastAssistant, showRaw, regexRules, ops, streamingMsgRef, registerAnchor,
 }: {
   m: Message;
   busy: boolean;
@@ -111,13 +116,19 @@ const MessageRow = React.memo(function MessageRow({
   regexRules: RegexRule[] | null;
   ops: MsgOps;
   streamingMsgRef: React.RefObject<HTMLDivElement>;
+  registerAnchor: (key: string) => (el: HTMLDivElement | null) => void;
 }) {
   const shown = showRaw || !regexRules ? m.content : applyRegexRules(m.content, regexRules, 'display').text;
   const msgHtml = !streaming && m.role === 'assistant'
     ? extractHtmlFromCodeFence(shown) ?? (looksLikeHtml(shown) ? shown : null)
     : null;
+  const anchorKey = toMessageKey(m.round, m.role);
   return (
-    <div className={`msg ${m.role}`} ref={streaming ? streamingMsgRef : undefined}>
+    <div
+      className={`msg ${m.role}`}
+      ref={streaming ? streamingMsgRef : registerAnchor(anchorKey)}
+      data-message-key={anchorKey}
+    >
       <div className="msg-body">
         {msgHtml ? (
           <HtmlMessage text={msgHtml} />
@@ -156,12 +167,17 @@ export function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
+  // v0.6.0：一次 AI 回复生成完成信号（供"生成完成智能定位"触发跳转；每次开新生成前清 false）
+  const [streamCompleted, setStreamCompleted] = useState(false);
   const [initStage, setInitStage] = useState('');
   const [contentMode, setContentMode] = useState<'nsfw' | 'nsf'>('nsfw');
   const [tab, setTab] = useState<'setup' | 'chat' | 'memory' | 'provider' | 'assets' | 'editor' | 'plugins' | 'skills'>('setup');
   const [error, setError] = useState('');
   const [adultOk, setAdultOk] = useState<boolean>(() => localStorage.getItem('jg-adult-ok') === '1');
   const bottomRef = useRef<HTMLDivElement>(null);
+  // v0.6.0 消息锚点 + 楼层刻度 + 生成完成定位：滚动视口 ref / 锚点注册表 / 3 个定位 hook
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const { refMap, register, getElement } = useMessageRefs();
   // 正则管道：对话原始标记（<think>/<UpdateVariable>/<era_data> 等）前端自动屏蔽隐藏
   const [regexRules, setRegexRules] = useState<RegexRule[] | null>(null);
   const [showRaw, setShowRaw] = useState(false);
@@ -311,14 +327,34 @@ export function App() {
   // 每次切到"新建会话"面板时同步侧栏角色卡列表（导入后立即可见）
   useEffect(() => { if (tab === 'setup') refreshCards(); }, [tab]);
 
-  useEffect(() => {
-    // 流式生成时：钉在正在生成正文的起点，方便从头阅读；空闲/结束后回到底部
-    if (busy && streamingMsgRef.current) {
-      streamingMsgRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    } else {
-      bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+  // v0.6.0：楼层刻度数据源（round+role 结构串，流式期结构不变则不触发 scroll-spy 重建监听）
+  const historyForSpy = useMemo(
+    () => messages.map((m) => ({ round: m.round, role: m.role })),
+    [messages],
+  );
+  // 最新一条 AI 回复所在轮的锚点键（供生成完成智能定位跳到该回复开头）
+  const lastAssistantAnchorKey = useMemo(() => {
+    let lastRound = -1;
+    for (const m of messages) {
+      if (m.role === 'assistant' && m.round > lastRound) lastRound = m.round;
     }
-  }, [messages, busy, initStage]);
+    return lastRound >= 0 ? toMessageKey(lastRound, 'assistant') : null;
+  }, [messages]);
+
+  // v0.6.0：当前楼层检测（scroll-spy）——监听视口滚动定位当前所在轮
+  const activeKey = useScrollSpy(scrollRef, refMap, historyForSpy);
+
+  // v0.6.0：手动滚动定位（点击刻度跳转）
+  const scrollToKey = useScrollToMessage(getElement, scrollRef);
+
+  // 生成完成智能定位：未上滚 → 滚到新 AI 回复开头；上滚读旧内容 → 显示"查看新回复"浮窗
+  const { showJumpButton, jumpKey, dismissJump } = useAutoScrollToMessage(
+    scrollRef,
+    getElement,
+    lastAssistantAnchorKey,
+    busy,
+    streamCompleted,
+  );
 
   /** 会话创建完成回调（SessionSetup 面板 → 进入对话） */
   const onSessionCreated = (sid: string, greeting: string, cardName: string, mode: string) => {
@@ -365,6 +401,7 @@ export function App() {
     if (!text || !sessionId || busy) return;
     setInput('');
     setBusy(true);
+    setStreamCompleted(false);
     setError('');
     startGenTimer();
     setMessages((m) => [...m, { id: nextMsgId(), round: 0, role: 'user', content: text }]);
@@ -409,6 +446,7 @@ export function App() {
     abortRef.current = null;
     stopStream();
     stopGenTimer();
+    setStreamCompleted(true);
     setBusy(false);
   };
 
@@ -416,6 +454,7 @@ export function App() {
   const regenerateMessage = async (msg: Message) => {
     if (!sessionId || busy) return;
     setBusy(true);
+    setStreamCompleted(false);
     setError('');
     startGenTimer();
     streamTargetRef.current = { kind: 'round', round: msg.round };
@@ -449,6 +488,7 @@ export function App() {
     abortRef.current = null;
     stopStream();
     stopGenTimer();
+    setStreamCompleted(true);
     setBusy(false);
   };
 
@@ -603,7 +643,7 @@ export function App() {
           <PluginsPanel />
         ) : (
           <>
-            <div className="messages">
+            <div className="messages" ref={scrollRef}>
               {busy && (
                 <div className="gen-timer" title="从点击发送开始计时">
                   <span className="gen-timer-spin" /> 正在生成… <b>{genSeconds.toFixed(1)}s</b>
@@ -631,6 +671,7 @@ export function App() {
                       regexRules={regexRules}
                       ops={msgOpsRef.current}
                       streamingMsgRef={streamingMsgRef}
+                      registerAnchor={register}
                     />
                   );
                 });
@@ -640,6 +681,15 @@ export function App() {
               )}
               <div ref={bottomRef} />
             </div>
+            <MessageRuler messages={historyForSpy} activeKey={activeKey} onJump={scrollToKey} />
+            {messages.length > 0 && showJumpButton && jumpKey && (
+              <button
+                className="jump-to-latest"
+                onClick={() => { scrollToKey(jumpKey); dismissJump(); }}
+              >
+                查看新回复 ↓
+              </button>
+            )}
             <div className="inputbar">
               <label className="edit-check" title="显示原始文本（含 <think>/<UpdateVariable> 等标记）">
                 <input type="checkbox" checked={showRaw} onChange={(e) => setShowRaw(e.target.checked)} />

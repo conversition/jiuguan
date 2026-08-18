@@ -6,6 +6,20 @@
 
 ---
 
+## v0.6.0 变更（2026-08）
+
+**消息锚点 + 右侧楼层刻度表 + 生成后智能定位**（按规划文档 `右侧楼层刻度表 + 生成后自动定位到新回复开头.md`）
+
+- **消息锚点系统**（`apps/web/src/hooks/useMessageRefs.ts`）：给每条消息行登记 DOM 锚点（锚点键 `round-role`，服务端每轮成对唯一），`register`/`getElement` 供刻度跳转与楼层检测统一取 DOM；沿用 `m.id` 作 React key（不动 memo/流式优化），锚点键并存不互扰，流式消息生成结束才挂锚点、时刻精准。
+- **右侧楼层刻度表**（`apps/web/src/components/MessageRuler.tsx`）：垂直胶囊条，每刻度一轮，点击平滑跳到该轮 AI 回复开头；当前所在轮高亮放大；轮次多久自身可滚动（max-height + overflow）。
+- **当前楼层检测**（`apps/web/src/hooks/useScrollSpy.ts`）：监听视口滚动，按 round+role 结构串监听（流式期内容变化不重建监听）定位当前楼层。
+- **手动定位**（`apps/web/src/hooks/useScrollToMessage.ts`）：`scrollTo` 手动计算偏移（不用 scrollIntoView，避免整页滚动）。
+- **生成完成智能定位**（`apps/web/src/hooks/useAutoScrollToMessage.ts`）：生成期未上滚 → 跟随流式尾部持续可见；生成结束未上滚 → 平滑滚到**新 AI 回复开头**（非底部）；已上滚在读旧内容 → 不打断、显示「查看新回复」浮窗，点击跳转。
+- 替换 v0.4 的固定自动滚动（busy 钉起点 / 空闲到底部），体验更贴阅读诉求。
+- **后续**（本期明确不做）：刻度表分组/折叠、楼层书签自定义、生成期悬浮进度条。
+
+---
+
 ## v0.5.0 变更（2026-08）
 
 **安全与数据一致性强化 + 工具 DAG 平台化**（按两份规划文档评估，只做前三项 A/B/C）
