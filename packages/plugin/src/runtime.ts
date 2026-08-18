@@ -12,6 +12,7 @@ import vm from 'node:vm';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { PluginRegistry } from './registry.ts';
+import { scanServerSource } from './scan.ts';
 
 /** 钩子载荷与返回约定（04 §4.1）：
  *  onSessionStart({card, resume})                        → 无返回
@@ -53,6 +54,9 @@ export class PluginHost {
       if (!rec.enabled || !rec.server) continue;
       const src = this.registry.serverSource(rec.id);
       if (!src) { console.warn(`[插件] ${rec.id} 服务端入口缺失: ${rec.server}`); continue; }
+      // 0.5.0 沙箱强化：静态扫描逃逸特征，命中拒载（不执行不可信代码）
+      const scan = scanServerSource(src, rec.permissions);
+      if (!scan.ok) { console.warn(`[插件] ${rec.id} 拒载：${scan.deny}`); continue; }
       try {
         const ctx = this.makeCtx(rec.id);
         const loaded = loadPluginSandbox(rec.id, src, ctx);

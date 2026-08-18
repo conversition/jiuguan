@@ -25,6 +25,12 @@ export const PluginManifestSchema = z.object({
   server: z.string().optional(),
   /** 声明支持的钩子（信息性） */
   hooks: z.array(z.string()).optional(),
+  /** 权限声明（0.5.0 沙箱强化）：未声明 = 最小权限；超范围源码拒载 */
+  permissions: z.object({
+    network: z.boolean().optional(),
+    fs: z.boolean().optional(),
+    runtime: z.boolean().optional(),
+  }).default({}),
 }).passthrough();
 
 export type PluginManifest = z.infer<typeof PluginManifestSchema>;

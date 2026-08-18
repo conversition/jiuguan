@@ -20,6 +20,8 @@ export interface PluginRecord {
   includes: string[];
   server?: string;
   hooks: string[];
+  /** 权限声明（0.5.0 沙箱强化；未声明 = 最小） */
+  permissions: { network?: boolean; fs?: boolean; runtime?: boolean };
   enabled: boolean;
   /** 安装来源（git URL / 本地路径 / zip），update 复用 */
   source: string;
@@ -54,7 +56,7 @@ export class PluginRegistry {
       id: r.id, name: r.manifest.name, displayName: r.manifest.display_name || r.manifest.name,
       version: r.manifest.version, description: r.manifest.description, author: r.manifest.author,
       homepage: r.manifest.homepage, license: r.manifest.license, includes: r.manifest.includes,
-      server: r.manifest.server, hooks: r.manifest.hooks ?? [], enabled: true, source,
+      server: r.manifest.server, hooks: r.manifest.hooks ?? [], permissions: r.manifest.permissions ?? {}, enabled: true, source,
       installedAt: now, updatedAt: now,
     };
     this.records.set(rec.id, rec);
