@@ -21,14 +21,14 @@ const SPEC: CardVariableSpec = {
 };
 
 const GOOD_MANIFEST = {
-  version: 1, cardId: 'tavern-girl', source: 'nl',
+  version: 1, cardId: 'tavern-girl', source: 'nl' as const,
   vars: [
-    { name: 'affection', type: 'number', default: 0 },
-    { name: 'trust', type: 'number', default: 5 },
+    { name: 'affection', type: 'number' as const, default: 0 },
+    { name: 'trust', type: 'number' as const, default: 5 },
   ],
   rules: [
-    { trigger: 'contains({event_user_input}, "礼物")', action: 'affection = {affection} + 1' },
-    { trigger: 'contains({event_user_input}, "说谎")', action: 'trust = max(0, {trust} - 2)' },
+    { trigger: 'contains({event_user_input}, "礼物")', action: 'affection = {affection} + 1', requires_ai: false },
+    { trigger: 'contains({event_user_input}, "说谎")', action: 'trust = max(0, {trust} - 2)', requires_ai: false },
   ],
   cardHash: '',
 };

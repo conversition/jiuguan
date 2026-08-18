@@ -21,9 +21,9 @@ function freshVms(): VariableManager {
 }
 
 const RULES: VariableManifestRule[] = [
-  { trigger: 'contains({event_user_input}, "礼物")', action: 'affection = {affection} + 1' },
-  { trigger: 'contains({event_user_input}, "说谎")', action: 'trust = max(0, {trust} - 2)' },
-  { trigger: 'true', action: 'location = {event_location}' },
+  { trigger: 'contains({event_user_input}, "礼物")', action: 'affection = {affection} + 1', requires_ai: false },
+  { trigger: 'contains({event_user_input}, "说谎")', action: 'trust = max(0, {trust} - 2)', requires_ai: false },
+  { trigger: 'true', action: 'location = {event_location}', requires_ai: false },
 ];
 
 function main() {
@@ -52,7 +52,7 @@ function main() {
 
   // ---- 场景4：步数上限（70 条恒真规则 → 64 步截断 + 记录错误） ----
   const v4 = freshVms();
-  const many: VariableManifestRule[] = Array.from({ length: 70 }, () => ({ trigger: 'true', action: 'affection = {affection} + 1' }));
+  const many: VariableManifestRule[] = Array.from({ length: 70 }, () => ({ trigger: 'true', action: 'affection = {affection} + 1', requires_ai: false }));
   const r4 = executeRules(many, {}, v4);
   check('场景4 步数停在上限', r4.steps === MAX_RULES_STEPS, `steps=${r4.steps}`);
   check('场景4 截断错误记录', r4.errors.some((e) => e.message.includes('步数上限')), JSON.stringify(r4.errors));
@@ -62,8 +62,8 @@ function main() {
   const v5 = freshVms();
   v5.register({ scope: 'session', source: 'card', name: 'derived', type: 'derived', expression: '{affection} * 2' });
   const r5 = executeRules([
-    { trigger: 'true', action: 'ghost = 1' },
-    { trigger: 'true', action: 'derived = 3' },
+    { trigger: 'true', action: 'ghost = 1', requires_ai: false },
+    { trigger: 'true', action: 'derived = 3', requires_ai: false },
   ], {}, v5);
   check('场景5 两个非法 action 被跳过', r5.effects.length === 0 && r5.errors.length === 2, JSON.stringify(r5.errors));
   check('场景5 derived 未被覆盖', v5.get('session:card:derived')?.value === undefined, '');
