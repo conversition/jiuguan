@@ -20,7 +20,8 @@ import { parsePreset } from '../../packages/core/src/preset.ts';
 import { RegexLibrary } from '../../packages/core/src/regex-library.ts';
 import { applyRegexRules } from '../../packages/core/src/regex.ts';
 import { LorebookScanner } from '../../packages/core/src/scanner.ts';
-import { matchSkills, renderSkillBlock } from '../../packages/core/src/skills.ts';
+import { matchSkills, renderSkillBlock, type SkillMatch } from '../../packages/core/src/skills.ts';
+import { ToolDag, type ToolContext, type ToolDefinition } from '../../packages/core/src/tool-dag.ts';
 import { MemoryDb } from '../../packages/memory/src/db.ts';
 import { WriteLoop } from '../../packages/memory/src/writer.ts';
 import type { WriteResult } from '../../packages/memory/src/writer.ts';
@@ -128,6 +129,18 @@ function parseStoryIndex(text: string): { content: string; branches: string[] } 
     branches = trailing.map(clean).filter((l) => l.length > 1);
   }
   return { content, branches: branches.slice(0, 4) };
+}
+
+/** 平台预计算 DAG 的运行上下文（runtime 注入只读句柄：检索器/扫描器/VMS） */
+interface PlatformToolCtx extends ToolContext {
+  runtime: Record<string, unknown> & {
+    bars: Record<string, number>;
+    round: number;
+    input: string;
+    ret?: { recallAsync: (opts: { query: string; round: number; budgetTokens: number }) => Promise<RecallResult> };
+    scanner?: { scan: (opts: { text: string; seed: number; budgetTokens: number }) => ScanResult };
+    vms?: { evaluate: () => { values: Record<string, string | number | boolean> } };
+  };
 }
 
 export class ChatSession {
@@ -673,6 +686,52 @@ export class ChatSession {
     return this.runTurnCore(this.round, userInput, contentMode ?? this.args.contentMode ?? 'nsfw', onProse, { logUser: true }, signal);
   }
 
+  /** 平台预计算 → 工具 DAG（0.5.0 C：声明式工具，无依赖并行；执行全在平台，模型不参与选工具）
+   *  工具：recall_memory(记忆检索) / worldbook_activate(世界书扫描) / update_variable(变量求值) / skill_match(Skill 匹配) */
+  private buildPlatformDag(): ToolDag<PlatformToolCtx> {
+    // self：闭包捕获 ChatSession（箭头内 this 被工具对象字面量上下文遮蔽）
+    const self = this;
+    const tools: ToolDefinition<PlatformToolCtx>[] = [
+      {
+        name: 'recall_memory', description: '记忆检索（RAG：弧/总结/事件/状态，RRF 融合）', dependencies: [], deterministic: true, sideEffects: false,
+        async execute(c, args) {
+          const round = c.runtime.round as number;
+          const input = c.runtime.input as string;
+          const bars = c.runtime.bars as Record<string, number>;
+          const hits = await c.runtime.ret!.recallAsync({ query: self.buildRecallQuery(input, bars), round, budgetTokens: 400 });
+          return { ok: true, data: { hits: hits.hits, raw: hits }, cost: hits.hits.length };
+        },
+      },
+      {
+        name: 'worldbook_activate', description: '世界书扫描（正则/关键词命中 + 概率门）', dependencies: [], deterministic: true, sideEffects: false,
+        execute(c, args) {
+          const round = c.runtime.round as number;
+          const input = c.runtime.input as string;
+          const scan = c.runtime.scanner!.scan({ text: input, seed: round, budgetTokens: 1200 });
+          return { ok: true, data: { activated: scan.activated, raw: scan }, cost: scan.activated.length };
+        },
+      },
+      {
+        name: 'update_variable', description: '变量求值（VMS：确定性 DSL 表达式求值）', dependencies: [], deterministic: true, sideEffects: false,
+        execute(c, args) {
+          const evalResult = c.runtime.vms!.evaluate();
+          return { ok: true, data: { values: evalResult.values, raw: evalResult }, cost: Object.keys(evalResult.values).length };
+        },
+      },
+      {
+        name: 'skill_match', description: 'Skill 语义匹配（关键词/描述余弦，阈值+topK）', dependencies: [], deterministic: true, sideEffects: false,
+        execute(c, args) {
+          const input = c.runtime.input as string;
+          const matches = matchSkills(input);
+          return { ok: true, data: { matches }, cost: matches.length };
+        },
+      },
+    ];
+    const dag = new ToolDag<PlatformToolCtx>();
+    for (const tool of tools) dag.define(tool);
+    return dag;
+  }
+
   /** 每轮核心（turn / regenerate 共用）：预计算→装配→模型→写环→引擎 tick→持久化→账本
    *  @param signal 外部中止信号：用户停止生成时，保留已流式生成的正文落库，不写记忆（07 铁律1）
    */
@@ -689,24 +748,26 @@ export class ChatSession {
     const windowInfo = this.buildChatWindow(round - 1);
     await this.maybeRollingSummarize(round, windowInfo);
 
-    // ① 平台预计算（并行：检索 + 扫描 + 变量 + Skill 自觉匹配）
+    // ① 平台预计算 → 工具 DAG（0.5.0 C：平台步骤声明化为工具，自动拓扑并行 + 结果进 tool_results）
     // 推进槽（bars）：先于检索读取（焦点合成/检索 query 增强复用）
     const meta = this.getMeta();
     const bars = meta ? JSON.parse(meta.bars ?? '{}') as Record<string, number> : {};
-    const [recall, scan, skillMatches] = await Promise.all([
-      this.ret.recallAsync({ query: this.buildRecallQuery(userInput, bars), round, budgetTokens: 400 }),
-      Promise.resolve(this.scanner.scan({ text: userInput, seed: round, budgetTokens: 1200 })),
-      // Skill 系统：语义匹配用户输入 vs 各 skill 描述（阈值/topK），命中读取指令正文
-      Promise.resolve(matchSkills(userInput)),
-    ]);
+    const dag = this.buildPlatformDag();
+    const toolResults = await dag.runAll({
+      round, input: userInput, deps: {},
+      runtime: { bars, round, input: userInput, ret: this.ret, scanner: this.scanner, vms: this.vms },
+    });
+    const recall = (toolResults.recall_memory?.data as unknown as RecallResult) ?? null;
+    const scan = (toolResults.worldbook_activate?.data as unknown as ScanResult) ?? null;
+    const skillMatches = (toolResults.skill_match?.data as unknown as { matches?: SkillMatch[] } | undefined)?.matches ?? [];
+    const vmsResult = toolResults.update_variable?.data as { values: Record<string, string | number | boolean> } | undefined;
     const skillBlock = renderSkillBlock(skillMatches);
     if (skillMatches.length > 0) console.log(`[Skill] 命中 ${skillMatches.map((m) => `${m.skill.name}(${m.score.toFixed(2)})`).join(', ')}`);
-    const vmsResult = this.vms.evaluate();
-    console.log(`[预计算] 检索 ${recall.hits.length} 条 / 世界书 ${scan.activated.length} 条 / 变量 ${Object.keys(vmsResult.values).length} 个 / 窗口 ${windowInfo.messages.length} 条 ${windowInfo.tokens}t${windowInfo.truncated ? '（截断）' : ''}`);
+    console.log(`[预计算] 检索 ${recall?.hits.length ?? 0} 条 / 世界书 ${scan?.activated.length ?? 0} 条 / 变量 ${Object.keys(vmsResult?.values ?? {}).length} 个 / 窗口 ${windowInfo.messages.length} 条 ${windowInfo.tokens}t${windowInfo.truncated ? '（截断）' : ''}`);
 
     // ② 装配（L1/L2：焦点 → 依赖激活 → 全局预算调度 → 各槽位片段）
-    const variableValues = { ...vmsResult.values, ...(this.bridge?.getFlat() ?? {}) };
-    this.turnInput = { recall, scan, bars, vmsValues: variableValues };
+    const variableValues = { ...(vmsResult?.values ?? {}), ...(this.bridge?.getFlat() ?? {}) };
+    this.turnInput = { recall: recall ?? null, scan: scan ?? null, bars, vmsValues: variableValues };
     const focus: TurnFocus = { round, scene: this.currentScene(), present: this.presentEntities(userInput), bars, input: userInput };
     const ctx = this.scheduleTurnContext(focus);
     // 动态状态：优先世界状态结构化块（L2 规范化呈现）；被预算裁掉则退回紧凑推进槽

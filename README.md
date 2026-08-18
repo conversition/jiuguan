@@ -6,7 +6,16 @@
 
 ---
 
-## v0.4.0 变更（2026-08）
+## v0.5.0 变更（2026-08）
+
+**安全与数据一致性强化 + 工具 DAG 平台化**（按两份规划文档评估，只做前三项 A/B/C）
+
+- **A · 沙箱隔离强化**（`packages/plugin/scan.ts` + `registry.ts` + `runtime.ts`）：插件加载前**静态逃逸扫描**（`child_process` / `process.exit` / `fs` 写 / `eval` 逃逸 / 任意网络 / `require`），命中拒载**不执行不可信代码**；manifest 增加 `permissions` 权限声明（未声明 = 最小权限，超范围源码拒载）；死循环在 vm 同步超时内 kill（不拖垮主进程）。`verify-sandbox-isolation`：5 类逃逸拒载 + 正常插件通过 + 权限归一化 + 超时隔离。
+- **B · SQLite 统一事务 + 版本化迁移**（`packages/memory/db.ts` + `writer.ts`）：写环整体落 `BEGIN IMMEDIATE` 事务，中途失败 `ROLLBACK` **无部分写入**（多表强一致）；`PRAGMA user_version` + 最小 migration runner（幂等：已存在的列/表自动跳过），旧库逐级升到当前 schema **数据不丢**。`verify-migration`：建 v1 旧库 → 升级对齐 + 数据保留。
+- **C · 工具 DAG 平台化**（`packages/core/tool-dag.ts` + `session.ts`）：把平台预计算组织为声明式工具（`ToolDefinition{name, deps, deterministic, sideEffects, execute}`），Kahn 拓扑分层（无依赖并行 / 有依赖串行），结果统一进 `tool_results` 命名空间；迁移四步骤为工具 `recall_memory` / `worldbook_activate` / `update_variable` / `skill_match`——**执行全在平台，不把工具选择权交给模型（延续每回合 1 次往返铁律）**。`verify-tool-dag`：菱形拓扑 / 无依赖并行 / 依赖读取上游 / 环检测 / 异常隔离。
+- **后续**（本期明确不做）：路由 zod 校验收敛、前缀缓存开关、App.tsx 拆分面板。
+
+---
 
 **变量后台自治服务 —— 编译期一次性翻译 + 运行期确定性执行 + 紧凑按需注入**
 - **编译调度器**（`packages/variable/compiler.ts`）：卡片加载时检测类型（MVU 引擎直连桥 / 结构化声明直注 / 纯 NL 规则走编译器 / 混合 / 无），编译状态机 `Idle→Compiling→Active|Fallback`，编译器 LLM ≤2 次 + 2000 token 预算 + 产物静态校验，**磁盘缓存**（内容指纹失效，下次加载免 token）。编译产物**绝不进对话 prompt**。
