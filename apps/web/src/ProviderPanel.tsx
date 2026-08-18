@@ -8,6 +8,8 @@ interface ProviderInfo {
   kind: string;
   prefixCacheThreshold: number;
   hasKey: boolean;
+  keySource?: 'provider.json' | 'env' | 'none';
+  keyFingerprint?: string;
 }
 
 export function ProviderPanel() {
@@ -66,7 +68,15 @@ export function ProviderPanel() {
               <tr><td>模型</td><td>{info.model}</td></tr>
               <tr><td>类型</td><td>{info.kind}</td></tr>
               <tr><td>前缀缓存阈值</td><td>{info.prefixCacheThreshold} tok</td></tr>
-              <tr><td>API Key</td><td>{info.hasKey ? '✅ 已配置' : '❌ 未配置'}</td></tr>
+              <tr><td>API Key</td><td>{info.hasKey ? `✅ 已配置（${info.keyFingerprint ?? ''}）` : '❌ 未配置'}</td></tr>
+              <tr>
+                <td>Key 来源</td>
+                <td>
+                  {info.keySource === 'provider.json' ? 'provider.json（UI 面板唯一权威）'
+                    : info.keySource === 'env' ? 'env（.env.local，面板兜底）'
+                    : '无'}
+                </td>
+              </tr>
             </tbody>
           </table>
         ) : <p className="console-none">加载中…</p>}

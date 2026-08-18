@@ -426,7 +426,10 @@ const server = createServer(async (req, res) => {
     // Provider 配置（非敏感：不含 key）
     if (method === 'GET' && p === '/api/provider') {
       const cfg = (await import('../../packages/proxy/src/config.ts')).loadProviderConfig();
-      return json(res, { baseUrl: cfg.baseUrl, model: cfg.model, kind: cfg.kind, prefixCacheThreshold: cfg.prefixCacheThreshold, hasKey: Boolean(cfg.apiKey) });
+      return json(res, {
+        baseUrl: cfg.baseUrl, model: cfg.model, kind: cfg.kind, prefixCacheThreshold: cfg.prefixCacheThreshold,
+        hasKey: Boolean(cfg.apiKey), keySource: cfg.keySource, keyFingerprint: cfg.keyFingerprint,
+      });
     }
 
     // Provider 测试连接（模型列表）

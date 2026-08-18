@@ -17,6 +17,19 @@ export interface ProviderConfig {
   prefixCacheThreshold: number;
   /** 请求超时（ms） */
   timeoutMs: number;
+  /** API key 单一来源锚定：provider.json(UI 唯一权威) | env(.env.local) | none
+   *  仅 loadProviderConfig 填充，供面板/日志展示；非持久化字段 */
+  keySource?: 'provider.json' | 'env' | 'none';
+  /** API key 指纹（前 4 + 尾 4，如 sk-N4b…Wxy），不回显完整 key */
+  keyFingerprint?: string;
+}
+
+/** API key 指纹：仅暴露首 4 与末 4 字符，用于面板/日志识别来源、不泄露完整密钥 */
+export function fingerprintKey(key: string): string {
+  if (!key) return '';
+  const s = key.trim();
+  if (s.length <= 8) return s.slice(0, 2) + '…';
+  return `${s.slice(0, 4)}…${s.slice(-4)}`;
 }
 
 /** 运行时配置文件（UI 写入；不入库、不回显 key；可用 JG_PROVIDER_JSON 覆盖路径，测试隔离用） */
@@ -70,16 +83,48 @@ export function writeProviderJson(partial: Partial<ProviderConfig>): void {
 
 const env = { ...loadDotEnvLocal(), ...process.env };
 
+/** 已打印过的 key 指纹（避免每次 loadProviderConfig 刷日志；来源变化时重新打印） */
+let printedKeyAnchor = '';
+
 export function loadProviderConfig(overrides: Partial<ProviderConfig> = {}): ProviderConfig {
   const file = readProviderJson();
-  return {
+  let keySource: ProviderConfig['keySource'];
+  let apiKey: string;
+  if (overrides.apiKey) {
+    keySource = 'provider.json'; // 显式 overrides 视同 UI 锚定
+    apiKey = overrides.apiKey;
+  } else if (file.apiKey) {
+    keySource = 'provider.json'; // UI 面板唯一权威
+    apiKey = file.apiKey;
+  } else if (env.JG_API_KEY) {
+    keySource = 'env'; // 仅未在面板配置时兜底
+    apiKey = env.JG_API_KEY;
+  } else {
+    keySource = 'none';
+    apiKey = '';
+  }
+  const cfg: ProviderConfig = {
     baseUrl: overrides.baseUrl ?? file.baseUrl ?? env.JG_API_BASE ?? 'https://opencode.ai/zen/go',
-    apiKey: overrides.apiKey ?? file.apiKey ?? env.JG_API_KEY ?? '',
+    apiKey,
     model: overrides.model ?? file.model ?? env.JG_MODEL ?? 'deepseek-v4-flash',
     kind: overrides.kind ?? file.kind ?? (env.JG_PROVIDER_KIND === 'anthropic' ? 'anthropic' : 'openai'),
     prefixCacheThreshold: Number(overrides.prefixCacheThreshold ?? file.prefixCacheThreshold ?? env.JG_PREFIX_THRESHOLD ?? 1024),
     timeoutMs: Number(overrides.timeoutMs ?? file.timeoutMs ?? env.JG_TIMEOUT_MS ?? 120000),
+    keySource,
+    keyFingerprint: fingerprintKey(apiKey),
   };
+  // 单一锚定日志：仅来源或指纹变化时打印一次
+  const anchor = fingerprintKey(apiKey) || (keySource === 'none' ? 'none' : '');
+  if (anchor && anchor !== printedKeyAnchor) {
+    printedKeyAnchor = anchor;
+    const srcDesc = keySource === 'provider.json'
+      ? 'provider.json（UI 面板唯一权威）'
+      : keySource === 'env'
+        ? 'env（.env.local，未在面板配置时的兜底）'
+        : '无';
+    console.log(`[Provider] key 来源=${srcDesc}${cfg.apiKey ? ` 指纹=${cfg.keyFingerprint}` : ''}`);
+  }
+  return cfg;
 }
 
 /** 校验配置，缺 key 时给出明确指引 */

@@ -167,11 +167,12 @@ export class ChatSession {
   private plugins: PluginHost;
   /** 正则库（04 §4.3：卡片 regex_scripts 自动导入 + 前端屏蔽隐藏规则） */
   private regexLib: RegexLibrary;
-  /** 滑动窗口配置（长对话防爆 token；env 可覆盖） */
-  private windowN = Number(process.env.JG_WINDOW_N ?? 12);
-  private windowTokens = Number(process.env.JG_WINDOW_TOKENS ?? 1500);
-  private longtermTokens = Number(process.env.JG_LONGTERM_TOKENS ?? 800);
-  private summaryRounds = Number(process.env.JG_SUMMARY_ROUNDS ?? 20);
+  /** 滑动窗口配置（长对话防爆 token；env 可覆盖）
+   *  windowN=10（5 回合×2）；windowTokens 窗口原文预算（窗口优先）；超预算旧文靠滚动摘要 + 检索 query 头召回 */
+  private windowN = Number(process.env.JG_WINDOW_N ?? 10);
+  private windowTokens = Number(process.env.JG_WINDOW_TOKENS ?? 3500);
+  private longtermTokens = Number(process.env.JG_LONGTERM_TOKENS ?? 1500);
+  private summaryRounds = Number(process.env.JG_SUMMARY_ROUNDS ?? 5);
   /** 上下文提供者运行时（L1：依赖满足激活 + 干净撤销）与 cost/priority 台账（L2 调度） */
   private ctxRuntime = new ContextProviderRuntime();
   private ctxCost = new Map<string, { cost: number; priority: number }>();
@@ -424,15 +425,25 @@ export class ChatSession {
     return input.split(/[，。！？、,.!?\s]+/).filter((s) => s.length >= 2 && s.length <= 8).slice(0, 6);
   }
 
-  /** 检索 query 增强：完整输入 + 在场实体裸词 + 推进槽（替代仅 24 字截断），预算内截断
-   *  实体裸词（不加前缀）：与内容同词形，FTS/LIKE 才能命中；<120 字预算 */
+  /** 检索 query 增强：压缩摘要 + 完整输入 + 在场实体裸词 + 推进槽（替代仅 24 字截断），预算内截断
+   *  压缩摘要（memory_meta.longterm）并入 query 头：被滑动窗口压缩掉的旧文/远史靠摘要词项仍能被记忆检索召回；
+   *  实体裸词（不加前缀）：与内容同词形，FTS/LIKE 才能命中；<300 字预算 */
   private buildRecallQuery(input: string, bars: Record<string, number>): string {
+    const lt = this.getLongTermCompact();
     const parts = [
+      lt,
       input,
       ...this.presentEntities(input),
       Object.entries(bars).map(([k, v]) => `${k}:${v}`).join(' '),
     ].filter(Boolean);
-    return parts.join(' ').slice(0, 120);
+    return parts.join(' ').slice(0, 300);
+  }
+
+  /** 压缩摘要紧凑片段（只读）：取 memory_meta.longterm 前 ~150 字作为检索 query 词元来源 */
+  private getLongTermCompact(): string {
+    const row = this.mem.db.prepare('SELECT longterm FROM memory_meta WHERE id = 1').get() as { longterm: string } | undefined;
+    const lt = (row?.longterm ?? '').trim();
+    return lt ? lt.slice(0, 150) : '';
   }
 
   /** 世界状态块：结构化场景/在场/推进槽/变量（L2 规范化呈现，模型可直接遵循） */
@@ -1131,7 +1142,9 @@ export class ChatSession {
       if (orphanRounds.has(r.round)) continue;
       const clean = applyRegexRules(r.content, this.regexLib.list(), 'prompt').text;
       const t = estimateTokens(clean);
-      if (tokens + t > this.windowTokens && kept.length > 0) { truncated = true; break; }
+      // 预算裁剪：最新一条（kept 为空时）强制保留，避免「单条超预算 → 窗口塌陷只剩 1 条」；
+      // 从第二条起严格按 windowTokens 预算从新往旧累积；被裁旧文靠滚动摘要 + 检索 query 头召回
+      if (kept.length > 0 && tokens + t > this.windowTokens) { truncated = true; break; }
       kept.push({ round: r.round, role: r.role, content: clean });
       tokens += t;
     }

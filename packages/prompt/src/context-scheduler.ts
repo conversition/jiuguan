@@ -30,7 +30,7 @@ export interface ScheduleResult {
 }
 
 /** 全局上下文总闸（环境可覆盖）；>窗口(1500)+长摘(800)+记忆(400)+世界书(1200) 单项之和的可覆盖默认 */
-export const CONTEXT_BUDGET_TOKENS = Number(process.env.JG_CONTEXT_BUDGET_TOKENS ?? 3000);
+export const CONTEXT_BUDGET_TOKENS = Number(process.env.JG_CONTEXT_BUDGET_TOKENS ?? 1500);
 
 /** 块 token 估算：中文 1 字≈1.5，其余 1 字≈0.4（与 assembly.estimateTokens 同口径） */
 export function blockTokens(fragment: string): number {
