@@ -46,7 +46,7 @@ import type { RecallResult } from '../../packages/memory/src/retrieval.ts';
 import type { ScanResult } from '../../packages/core/src/scanner.ts';
 import { ContextProviderRuntime } from '../../packages/prompt/src/context-provider-runtime.ts';
 import type { TurnFocus, ContextProviderFiber } from '../../packages/prompt/src/context-provider-runtime.ts';
-import { scheduleContext } from '../../packages/prompt/src/context-scheduler.ts';
+import { scheduleContext, shrinkToBudget } from '../../packages/prompt/src/context-scheduler.ts';
 import type { ContextBlock } from '../../packages/prompt/src/context-scheduler.ts';
 import { resolveAsset, listAssets } from '../../packages/core/src/asset-paths.ts';
 import type { AssetKind } from '../../packages/core/src/asset-paths.ts';
@@ -175,7 +175,7 @@ export class ChatSession {
   private summaryRounds = Number(process.env.JG_SUMMARY_ROUNDS ?? 5);
   /** 上下文提供者运行时（L1：依赖满足激活 + 干净撤销）与 cost/priority 台账（L2 调度） */
   private ctxRuntime = new ContextProviderRuntime();
-  private ctxCost = new Map<string, { cost: number; priority: number }>();
+  private ctxCost = new Map<string, { cost: number; priority: number; reducible?: boolean }>();
   /** 每回合预计算结果暂存（provider build 闭包读取：L3 内容源） */
   private turnInput: { recall: RecallResult | null; scan: ScanResult | null; bars: Record<string, number>; vmsValues: Record<string, string | number | boolean> } =
     { recall: null, scan: null, bars: {}, vmsValues: {} };
@@ -389,23 +389,25 @@ export class ChatSession {
   /** 注册上下文 provider（L1 fiber）：每块声明 deps/build + 登记 cost/priority（L2）。
    *  build 读取 this.turnInput 预计算源（回合前由 runTurnCore 汇入），产注入片段。 */
   private initContextProviders(): void {
-    this.regProvider('memory', 400, 75, {
+    // cost 默认适配 128k–200k 窗口；均可经 JG_COST_* 环境变量按量上调/下调
+    this.regProvider('memory', Number(process.env.JG_COST_MEMORY ?? 3000), 75, {
       build: () => this.turnInput.recall?.injectedBlock ?? '',
     });
-    this.regProvider('longterm', 800, 70, {
+    this.regProvider('longterm', Number(process.env.JG_COST_LONGTERM ?? 1500), 70, {
       build: () => this.getLongTermBlock(),
     });
-    this.regProvider('worldbook', 1200, 60, {
+    this.regProvider('worldbook', Number(process.env.JG_COST_WORLDBOOK ?? 8000), 60, {
       build: (focus) => this.gatedWorldbookBlock(focus),
     });
-    this.regProvider('worldstate', 500, 90, {
+    // worldstate：变量段可降级（reducible），cost 默认 3000（核心段必留，变量段由 worldStateBlock 内部收缩到 JG_WORLDSTATE_VAR_TOKENS）
+    this.regProvider('worldstate', Number(process.env.JG_COST_WORLDSTATE ?? 3000), 90, {
       build: (focus) => this.worldStateBlock(focus),
-    });
+    }, true);
   }
 
   /** 登记单个 provider（成本/优先级进台账，fiber 进运行时） */
-  private regProvider(id: string, cost: number, priority: number, fiber: Omit<ContextProviderFiber, 'id'>): void {
-    this.ctxCost.set(id, { cost, priority });
+  private regProvider(id: string, cost: number, priority: number, fiber: Omit<ContextProviderFiber, 'id'>, reducible = false): void {
+    this.ctxCost.set(id, { cost, priority, reducible });
     this.ctxRuntime.register({ id, ...fiber });
   }
 
@@ -446,18 +448,20 @@ export class ChatSession {
     return lt ? lt.slice(0, 150) : '';
   }
 
-  /** 世界状态块：结构化场景/在场/推进槽/变量（L2 规范化呈现，模型可直接遵循） */
-  /** 世界状态块：场景/在场/推进槽 + 紧凑变量段（只注入上轮变化集；首轮全量紧凑，长期不变省略） */
+  /** 世界状态块：核心段（场景/在场/推进槽）恒定必留；变量段（上轮变化集 / 前 12 个 vmsValues）
+   *  收缩到 JG_WORLDSTATE_VAR_TOKENS（默认 1200），避免变量段过大把整块拖入 over-cost。 */
   private worldStateBlock(focus: TurnFocus): string {
-    const vars = this.lastVarEffects.length > 0
+    const rawVars = this.lastVarEffects.length > 0
       ? formatVarDelta(this.lastVarEffects)
       : Object.entries(this.turnInput.vmsValues).slice(0, 12).map(([k, v]) => `${bareVarName(k)}=${v}`).join('; ');
+    const maxVarTokens = Number(process.env.JG_WORLDSTATE_VAR_TOKENS ?? 1200);
+    const vars = rawVars ? shrinkToBudget(`变量: ${rawVars}`, maxVarTokens) : '';
     return [
       '<世界状态>',
       `场景: ${focus.scene || '（未知）'}`,
       `在场: ${focus.present.join('、') || '（无）'}`,
       `推进槽: ${JSON.stringify(focus.bars)}`,
-      vars ? `变量: ${vars}` : '',
+      vars,
       '</世界状态>',
     ].filter(Boolean).join('\n');
   }
@@ -483,7 +487,7 @@ export class ChatSession {
     this.ctxRuntime.beginTurn(focus);
     const blocks: ContextBlock[] = this.ctxRuntime.activeFragments().map(({ id, fragment }) => {
       const c = this.ctxCost.get(id) ?? { cost: 400, priority: 50 };
-      return { id, fragment, cost: c.cost, priority: c.priority };
+      return { id, fragment, cost: c.cost, priority: c.priority, reducible: c.reducible };
     });
     const sched = scheduleContext(blocks);
     if (sched.dropped.length > 0) console.log(`[调度] 预算裁剪: ${sched.dropped.map((d) => `${d.id}(${d.reason})`).join(', ')}`);
