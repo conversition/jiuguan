@@ -17,5 +17,10 @@
     "test": "node --experimental-strip-types --experimental-transform-types tests/verify.ts",
     "start": "node --experimental-strip-types --experimental-transform-types src/api.ts"
   },
-  "dependencies": {}
+  "dependencies": {
+    "pg": "^8.23.0"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.23.1"
+  }
 }
