@@ -66,11 +66,11 @@ export class WriteLoop {
       summary = summary.slice(0, 300);
     }
 
-    // 3. 写入总结表（memory_summary，新 AM 码）
+    // 3. 写入总结表（memory_summary，新 AM 码；last_access_ms=落地时间 → 遗忘曲线刷新基准）
     const now = new Date().toISOString();
     const summaryId = db.prepare(
-      'INSERT INTO memory_summary (code, round, delta, scene, created_at) VALUES (?, ?, ?, ?, ?)'
-    ).run(code, round, summary, scene, now).lastInsertRowid as number;
+      'INSERT INTO memory_summary (code, round, delta, scene, created_at, last_access_ms) VALUES (?, ?, ?, ?, ?, ?)'
+    ).run(code, round, summary, scene, now, Date.now()).lastInsertRowid as number;
 
     // 4. 写入/更新大纲表（memory_arc，同 AM 码 → 双表一致）
     let arcId: number | undefined;
@@ -82,8 +82,8 @@ export class WriteLoop {
     } else {
       const seq = this.maxSeq() + 1;
       arcId = db.prepare(
-        'INSERT INTO memory_arc (code, chapter, title, summary, status, seq) VALUES (?, ?, ?, ?, ?, ?)'
-      ).run(code, scene, `R${round}`, summary, 'active', seq).lastInsertRowid as number;
+        'INSERT INTO memory_arc (code, chapter, title, summary, status, seq, last_access_ms) VALUES (?, ?, ?, ?, ?, ?, ?)'
+      ).run(code, scene, `R${round}`, summary, 'active', seq, Date.now()).lastInsertRowid as number;
     }
 
     // 5. 新事件（可分配独立 AM 码或并入本轮码）
@@ -92,8 +92,8 @@ export class WriteLoop {
     for (const ev of delta.new_events ?? []) {
       const evCode = nextAmCode(this.allCodes());
       const evId = db.prepare(
-        'INSERT INTO memory_event (code, description, characters, refs, resolved) VALUES (?, ?, ?, ?, 0)'
-      ).run(evCode, ev.description.slice(0, 400), ev.characters ?? '[]', '[]').lastInsertRowid as number;
+        'INSERT INTO memory_event (code, description, characters, refs, resolved, last_access_ms) VALUES (?, ?, ?, ?, 0, ?)'
+      ).run(evCode, ev.description.slice(0, 400), ev.characters ?? '[]', '[]', Date.now()).lastInsertRowid as number;
       insertedCodes.push(evCode);
       eventIds.push(evId);
     }
@@ -157,12 +157,12 @@ export class WriteLoop {
       const row = this.mem.db.prepare('SELECT state_json FROM memory_state WHERE id = ?').get(existing.id) as { state_json: string };
       const st = JSON.parse(row.state_json ?? '{}');
       if (sc.field) st[sc.field] = sc.value ?? '';
-      this.mem.db.prepare('UPDATE memory_state SET state_json = ?, updated_round = ? WHERE id = ?')
-        .run(JSON.stringify(st), round, existing.id);
+      this.mem.db.prepare('UPDATE memory_state SET state_json = ?, updated_round = ?, last_access_ms = ? WHERE id = ?')
+        .run(JSON.stringify(st), round, Date.now(), existing.id);
     } else {
       this.mem.db.prepare(
-        'INSERT INTO memory_state (entity_type, entity_id, name, state_json, updated_round) VALUES (?, ?, ?, ?, ?)'
-      ).run(sc.entity_type, sc.entity_id, sc.entity_id, JSON.stringify(sc.field ? { [sc.field]: sc.value ?? '' } : {}), round);
+        'INSERT INTO memory_state (entity_type, entity_id, name, state_json, updated_round, last_access_ms) VALUES (?, ?, ?, ?, ?, ?)'
+      ).run(sc.entity_type, sc.entity_id, sc.entity_id, JSON.stringify(sc.field ? { [sc.field]: sc.value ?? '' } : {}), round, Date.now());
     }
   }
 
@@ -187,8 +187,8 @@ export class WriteLoop {
       for (const o of orphans) {
         if (AM_CODE_RE.test(o.code)) {
           // 自动回填（继承 <tableCheck> 修正语义）
-          this.mem.db.prepare('INSERT OR IGNORE INTO memory_arc (code, chapter, title, summary, status, seq) VALUES (?, ?, ?, ?, ?, ?)')
-            .run(o.code, '', `自动回填 ${o.code}`, '', 'active', this.maxSeq() + 1);
+          this.mem.db.prepare('INSERT OR IGNORE INTO memory_arc (code, chapter, title, summary, status, seq, last_access_ms) VALUES (?, ?, ?, ?, ?, ?, ?)')
+            .run(o.code, '', `自动回填 ${o.code}`, '', 'active', this.maxSeq() + 1, Date.now());
         }
       }
       return false;

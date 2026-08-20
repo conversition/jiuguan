@@ -11,7 +11,19 @@
  *  ③ 注入块标注来源与置信度，低置信标 [存疑]
  */
 import { MemoryDb } from './db.ts';
-import { DEFAULT_WEIGHTS, DEFAULT_DROP_THRESHOLD, AM_CODE_RE } from './schema.ts';
+import {
+  DEFAULT_WEIGHTS,
+  DEFAULT_DROP_THRESHOLD,
+  AM_CODE_RE,
+  DECAY_LAMBDA_DEFAULT,
+  ACCESS_BOOST_DEFAULT,
+  DAY_MS,
+} from './schema.ts';
+
+/** 记忆衰减/访问提升 运行时默认值（env 可覆盖；RecallQuery 三字段可再覆盖） */
+const DECAY_ENABLED = !['0', 'false', 'off'].includes((process.env.JG_MEMORY_DECAY ?? '').toLowerCase());
+const ENV_DECAY_LAMBDA = Number(process.env.JG_MEMORY_DECAY_LAMBDA ?? DECAY_LAMBDA_DEFAULT);
+const ENV_ACCESS_BOOST = Number(process.env.JG_MEMORY_ACCESS_BOOST ?? ACCESS_BOOST_DEFAULT);
 
 export interface RecallQuery {
   /** 场景关键词（含人物/地点/事件/物品/任务要素） */
@@ -30,6 +42,14 @@ export interface RecallQuery {
   channels?: { bm25?: boolean; vec?: boolean; entity?: boolean; am?: boolean };
   /** PG 检索命名空间（会话 DB 基名）；缺省空串=不过滤（向后兼容无命名空间调用） */
   namespace?: string;
+  /** 记忆衰减开关（默认读 JG_MEMORY_DECAY） */
+  decay?: boolean;
+  /** 遗忘曲线衰减系数（每天，默认 0.1） */
+  decayLambda?: number;
+  /** 访问提升系数（默认 0.5） */
+  accessBoost?: number;
+  /** 命中后是否回写访问计数（默认 true；内部多段检索避免重复回写时置 false） */
+  trackAccess?: boolean;
 }
 
 export interface RecallHit {
@@ -40,6 +60,12 @@ export interface RecallHit {
   score: number;
   source: string; // bm25 | vec | entity | am | like
   confidence: 'high' | 'low';
+  /** 记忆衰减：被检索注入次数（lore 恒为 0，不参与衰减） */
+  accessCount?: number;
+  /** 记忆衰减：最近一次被注入时间戳(ms)，<=0 视为新生不衰减 */
+  lastAccessMs?: number;
+  /** 记忆衰减：本轮衰减因子（调试/日志） */
+  decayFactor?: number;
 }
 
 export interface RecallResult {
@@ -78,6 +104,16 @@ export function cosine(a: number[], b: number[]): number {
   return dot / (Math.sqrt(na) * Math.sqrt(nb));
 }
 
+/**
+ * 记忆衰减因子（Ebbinghaus 遗忘曲线近似）：
+ * decay = exp(-λ * days) ∈ (0, 1]，越久越小；elapsedMs<=0 = 全新 → 1。
+ * @param elapsedMs 距最近一次被注入的时间（毫秒）
+ * @param lambda 每天衰减系数（默认 0.1：7 天≈50% 残留）
+ */
+export function calculateDecay(elapsedMs: number, lambda: number): number {
+  return Math.exp(-lambda * (Math.max(0, elapsedMs) / DAY_MS));
+}
+
 // FTS 元数据（审查 §3.3 修复：移除死字段 codeCol；显式 src 表名 + whereExpr，避免从 fts 表名反推的脆弱约定）
 interface FtsMeta {
   ftsTable: string;
@@ -92,6 +128,14 @@ const FTS_TABLES: Record<RecallHit['category'], FtsMeta> = {
   event: { ftsTable: 'fts_event', srcTable: 'memory_event', whereExpr: 'description' },
   state: { ftsTable: 'fts_state', srcTable: 'memory_state', whereExpr: "name || ' ' || state_json" },
   lore: { ftsTable: 'fts_lore', srcTable: 'lorebook_entry', whereExpr: "comment || ' ' || content" },
+};
+
+/** 动态记忆表（记忆衰减/访问计数仅作用于用户态记忆；世界书 lore 静态条目不参与） */
+const ACCESS_TABLES: Partial<Record<RecallHit['category'], string>> = {
+  arc: 'memory_arc',
+  summary: 'memory_summary',
+  event: 'memory_event',
+  state: 'memory_state',
 };
 
 /** 提取 FTS trigram 查询词元：3-6 字短词（trigram 完整匹配语义可靠） */
@@ -149,8 +193,8 @@ export class RetrievalEngine {
   /** 异步混合检索：通道 B 使用真实 embedding（bge），其余通道与 recall 一致 */
   async recallAsync(q: RecallQuery): Promise<RecallResult> {
     const t0 = Date.now();
-    // 基础检索（关闭 hash vec 通道）
-    const base = this.recall({ ...q, channels: { ...(q.channels ?? {}), vec: false } });
+    // 基础检索（关闭 hash vec 通道 + 衰减/访问回写，避免与下方合并集重复；合并后统一应用一次）
+    const base = this.recall({ ...q, channels: { ...(q.channels ?? {}), vec: false }, decay: false, trackAccess: false });
     const seen = new Set(base.hits.map((h) => h.rowId));
     const ns = q.namespace ?? '';
 
@@ -215,13 +259,24 @@ export class RetrievalEngine {
           }
         }
       }
-      // 语义强信号置顶，别名确定性最高
-      const pri = { alias: 0, vec: 1, am: 2, entity: 2, bm25: 3, like: 3 };
-      base.hits.sort((a, b) => (pri[a.source] ?? 9) - (pri[b.source] ?? 9) || b.score - a.score);
-      base.codes = base.hits.map((h) => h.code).filter(Boolean);
-      base.injectedBlock = (this as unknown as { renderBlock(h: unknown[]): string }).renderBlock(base.hits as never);
-      base.layerStats = { ...base.layerStats, alias: aliasAdded, vec: base.hits.filter((h) => h.source === 'vec').length };
+      } // end vector channel merge
+
+    // 记忆衰减 + 访问提升（对完整合并集统一应用一次；内层 recall 已关闭以避免重复）
+    if (q.decay ?? DECAY_ENABLED) {
+      this.applyDecayAndAccess(base.hits, { decayLambda: q.decayLambda ?? ENV_DECAY_LAMBDA, accessBoost: q.accessBoost ?? ENV_ACCESS_BOOST });
     }
+    // 语义强信号置顶（alias/vec 确定性优先），次按衰减后得分
+    const pri = { alias: 0, vec: 1, am: 2, entity: 2, bm25: 3, like: 3 };
+    base.hits.sort((a, b) => (pri[a.source] ?? 9) - (pri[b.source] ?? 9) || b.score - a.score);
+    base.codes = base.hits.map((h) => h.code).filter(Boolean);
+    base.injectedBlock = this.renderBlock(base.hits);
+    base.layerStats = {
+      ...base.layerStats,
+      alias: aliasAdded,
+      vec: base.hits.filter((h) => h.source === 'vec').length,
+      decayBoosted: base.hits.filter((h) => (h.decayFactor ?? 1) < 1 || (h.accessCount ?? 0) > 0).length,
+    };
+    if (q.trackAccess !== false) this.bumpAccess(base.hits);
     base.elapsedMs = Date.now() - t0;
     return base;
   }
@@ -334,12 +389,18 @@ export class RetrievalEngine {
     }
     fused.sort((a, b) => b.score - a.score);
 
-    // 置信门控：RRF 得分范围 ~[0, 0.05]，min-max 归一化到 [0,1] 后按阈值丢弃
+    // 置信门控：RRF 得分范围 ~[0, 0.05]，min-max 归一化到 [0,1]
     const maxScore = fused.length > 0 ? fused[0].score : 0;
     const norm = (s: number) => (maxScore > 0 ? s / maxScore : 0);
-    const kept = fused.filter((h) => norm(h.score) >= drop);
+    for (const h of fused) h.score = norm(h.score);
+    // 记忆衰减 + 访问提升（拍在归一化得分上：score = norm * exp(-λΔt) + log(1+access)*boost）
+    if (q.decay ?? DECAY_ENABLED) {
+      this.applyDecayAndAccess(fused, { decayLambda: q.decayLambda ?? ENV_DECAY_LAMBDA, accessBoost: q.accessBoost ?? ENV_ACCESS_BOOST });
+      fused.sort((a, b) => b.score - a.score);
+    }
+    const kept = fused.filter((h) => h.score >= drop);
     for (const h of kept) {
-      h.confidence = norm(h.score) >= drop + 0.15 ? 'high' : 'low';
+      h.confidence = h.score >= drop + 0.15 ? 'high' : 'low';
       h.source = h.source || 'rrf';
     }
 
@@ -354,12 +415,22 @@ export class RetrievalEngine {
       final.push(h);
     }
 
+    // 访问计数回写（仅「实际注入」的命中，供遗忘曲线 access boost 累积）
+    if (q.trackAccess !== false) this.bumpAccess(final);
+
     return {
       hits: final,
       injectedBlock: this.renderBlock(final),
       codes: final.map((h) => h.code).filter(Boolean),
       elapsedMs: Date.now() - t0,
-      layerStats: { bm25: rankMaps.bm25.size, vec: rankMaps.vec.size, entity: rankMaps.entity?.size ?? 0, am: rankMaps.am.size, total: final.length },
+      layerStats: {
+        bm25: rankMaps.bm25.size,
+        vec: rankMaps.vec.size,
+        entity: rankMaps.entity?.size ?? 0,
+        am: rankMaps.am.size,
+        total: final.length,
+        decayBoosted: final.filter((h) => (h.decayFactor ?? 1) < 1 || (h.accessCount ?? 0) > 0).length,
+      },
     };
   }
 
@@ -447,6 +518,8 @@ export class RetrievalEngine {
         score: 0,
         source: 'db',
         confidence: 'high',
+        accessCount: Number(row.access_count ?? 0),
+        lastAccessMs: Number(row.last_access_ms ?? 0),
       };
     } catch {
       return null;
@@ -458,6 +531,50 @@ export class RetrievalEngine {
       if (this.hitFromRowId(rowId, cat)) return cat;
     }
     return 'lore';
+  }
+
+  /**
+   * 记忆衰减 + 访问提升：score = score * exp(-λ·Δt) + log(1+accessCount) * boost
+   * （Ebbinghaus 遗忘曲线：越久没被引用磨损越大；被引用越多越重要。）
+   * 世界书静态条目（lore）不参与；lastAccessMs<=0 视为新生（decay=1）。
+   */
+  private applyDecayAndAccess(hits: RecallHit[], opts: { decayLambda: number; accessBoost: number }): void {
+    if (hits.length === 0) return;
+    const now = Date.now();
+    for (const h of hits) {
+      if (h.category === 'lore') {
+        h.decayFactor = 1;
+        continue;
+      }
+      const elapsed = h.lastAccessMs && h.lastAccessMs > 0 ? now - h.lastAccessMs : 0;
+      const decay = calculateDecay(elapsed, opts.decayLambda);
+      const boost = Math.log(1 + (h.accessCount ?? 0)) * opts.accessBoost;
+      h.score = h.score * decay + boost;
+      h.decayFactor = decay;
+    }
+  }
+
+  /** 访问计数回写：命中被实际注入提示词 → access_count+1 且刷新 last_access_ms
+   *  （供后续轮次的遗忘曲线 access boost 累积；旧库缺列时忽略，不阻断检索）
+   *  双表一致性：arc ↔ summary 同 AM 码孪生行同步累计（避免同一记忆两行访问计数分叉） */
+  private bumpAccess(hits: RecallHit[]): void {
+    if (hits.length === 0) return;
+    const now = Date.now();
+    for (const h of hits) {
+      const table = ACCESS_TABLES[h.category];
+      if (!table || h.rowId <= 0) continue;
+      try {
+        this.mem.db.prepare(`UPDATE ${table} SET access_count = access_count + 1, last_access_ms = ? WHERE id = ?`).run(now, h.rowId);
+        // 孪生行同步（同 AM 码）：arc 命中同步 summary，summary 命中同步 arc
+        if (h.category === 'arc' && h.code) {
+          this.mem.db.prepare('UPDATE memory_summary SET access_count = access_count + 1, last_access_ms = ? WHERE code = ?').run(now, h.code);
+        } else if (h.category === 'summary' && h.code) {
+          this.mem.db.prepare('UPDATE memory_arc SET access_count = access_count + 1, last_access_ms = ? WHERE code = ?').run(now, h.code);
+        }
+      } catch {
+        // 旧库缺列忽略
+      }
+    }
   }
 
   /** 占位 embedding：可替换为本地 bge 模型 / OpenAI 兼容 /embeddings（Phase 3） */

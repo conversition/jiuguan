@@ -6,6 +6,18 @@
 
 ---
 
+## v0.7.1 变更（2026-08）
+
+**记忆衰减 + 访问计数**（`更新计划.md` 二.1：Ebbinghaus 遗忘曲线 + 被引用次数提升）
+
+- **遗忘曲线衰减**：`packages/memory/retrieval.ts` 新增 `calculateDecay(elapsedMs, λ)`（`exp(-λ·Δt)`，默认 λ=0.1/天，7 天≈半衰），在 RRF 融合归一化得分上叠加时间磨损——久不被引用的旧记忆自然下沉，30 天零访问记忆衰减击穿置信门控后剔除。
+- **访问计数提升**：每个命中注入提示词后 `access_count+1` 并刷新 `last_access_ms`（`bumpAccess`，arc↔summary 同 AM 码孪生行同步累计），检索得分加 `log(1+access_count)×boost`——被反复引用的长期伏笔即使久远仍保持高权重。
+- **可调可关**：`JG_MEMORY_DECAY`（默认开）/ `JG_MEMORY_DECAY_LAMBDA`（默认 0.1） / `JG_MEMORY_ACCESS_BOOST`（默认 0.5）；`RecallQuery.decay=false` 保守模式不走磨损。
+- **schema v4 迁移**（`packages/memory/db.ts`）：`memory_arc/summary/event/state` 四表补齐 `access_count`/`last_access_ms`（旧库幂等补列，存量数据不误伤），写环新记忆落地即打时间戳。
+- **测试**：`verify.ts` 新增 8 项衰减/门控/回升/回写断言；`verify-migration` 覆盖 v4 迁移补列。
+
+---
+
 ## v0.6.0 变更（2026-08）
 
 **消息锚点 + 右侧楼层刻度表 + 生成后智能定位**（按规划文档 `右侧楼层刻度表 + 生成后自动定位到新回复开头.md`）
@@ -132,7 +144,7 @@
 
 ### 记忆系统 `packages/memory`
 - **SQLite（node:sqlite，零原生依赖）**：WAL + integrity + 热备；7 表 + 4 组 FTS5 external-content（**trigram 中文分词**）+ vec BLOB + 触发器
-- **混合检索防幻觉**：通道A FTS5 BM25 + LIKE 兜底 + 实体精确映射 + AM码直查（确定性）∥ 通道B bge 语义向量 ∥ 通道C 时效 → **RRF 融合 + min-max 置信门控**，注入块标注来源/置信度，低置信标 `[存疑]`
+- **混合检索防幻觉**：通道A FTS5 BM25 + LIKE 兜底 + 实体精确映射 + AM码直查（确定性）∥ 通道B bge 语义向量 ∥ 通道C 时效 → **RRF 融合 + min-max 置信门控**（叠加记忆衰减/访问提升：Ebbinghaus 遗忘曲线 + 被引用次数），注入块标注来源/置信度，低置信标 `[存疑]`
 - **写环平台驱动**：AM 码全局唯一（三表 UNION 自增）+ 双表一致性自动回填 + 状态表 diff + 实体索引
 - **真实 embedding**：本地 `bge-small-zh-v1.5`（512 维，HF 镜像下载），`hash-ngram` 兜底；批量向量化管线
 

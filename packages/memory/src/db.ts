@@ -50,6 +50,19 @@ const MIGRATIONS: { version: number; apply: (db: DatabaseSync) => void }[] = [
       if (!names.has('useProbability')) db.exec('ALTER TABLE lorebook_entry ADD COLUMN useProbability INTEGER DEFAULT 0');
     },
   },
+  {
+    version: 4,
+    apply: (db) => {
+      // 记忆衰减列补齐：四张动态记忆表（旧库老数据 last_access_ms=0 → 检索层视为不衰减，不误伤存量）
+      const decayTables = ['memory_arc', 'memory_summary', 'memory_event', 'memory_state'];
+      for (const t of decayTables) {
+        const cols = db.prepare(`PRAGMA table_info(${t})`).all() as { name: string }[];
+        const names = new Set(cols.map((c) => c.name));
+        if (!names.has('access_count')) db.exec(`ALTER TABLE ${t} ADD COLUMN access_count INTEGER DEFAULT 0`);
+        if (!names.has('last_access_ms')) db.exec(`ALTER TABLE ${t} ADD COLUMN last_access_ms INTEGER DEFAULT 0`);
+      }
+    },
+  },
 ];
 
 export class MemoryDb {

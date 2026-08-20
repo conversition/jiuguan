@@ -3,8 +3,9 @@
  * 覆盖：schema 初始化 / 写环 AM 码分配+双表一致 / 混合检索 trigram+LIKE 兜底 / 注入块标注 / AM 码直查 / 空库安全
  */
 import { MemoryDb } from '../src/db.ts';
-import { RetrievalEngine } from '../src/retrieval.ts';
+import { RetrievalEngine, calculateDecay } from '../src/retrieval.ts';
 import { WriteLoop } from '../src/writer.ts';
+import { DAY_MS } from '../src/schema.ts';
 
 let passed = 0;
 let failed = 0;
@@ -96,6 +97,65 @@ console.log('== 性能基准（10 万级近似：3000 行 × 33 次扫描）==')
   // 独有内容精确命中对应轮次（如第 300 轮的"经验3000"）
   const rExact = ret.recall({ query: '经验3000 任务300', round: 300, budgetTokens: 100 });
   check('独有内容命中对应轮次', rExact.hits.some((h) => h.code === 'AM300'), `codes=${rExact.codes.join(',')}`);
+}
+
+console.log('== 记忆衰减 + 访问计数（Ebbinghaus 遗忘曲线 + 被引用提升）==');
+{
+  // 1. calculateDecay 纯函数
+  check('decay(0 天)=1', calculateDecay(0, 0.1) === 1);
+  const sevenDays = calculateDecay(7 * DAY_MS, 0.1);
+  check('decay(7 天, 0.1)≈0.4966', Math.abs(sevenDays - Math.exp(-0.7)) < 1e-9, String(sevenDays));
+  check('decay 随时间单调递减', calculateDecay(10 * DAY_MS, 0.1) < sevenDays);
+
+  // 场景：两条同关键词记忆（round1 较早 / round2 较新）；arc↔summary 双表孪生行需同步设置
+  const mem = new MemoryDb();
+  const writer = new WriteLoop(mem);
+  writer.initMeta({}, {});
+  writer.execute({ delta_summary: '主角在远古遗迹发现封印，揭开了冒险的序幕', round: 1 });
+  writer.execute({ delta_summary: '主角回到遗迹检查封印状态', round: 2 });
+  const ret = new RetrievalEngine(mem);
+  const now = Date.now();
+  const setDecay = (round: number, daysAgo: number, acc: number): void => {
+    const ts = daysAgo === 0 ? now : now - daysAgo * DAY_MS;
+    mem.db.prepare('UPDATE memory_summary SET last_access_ms = ?, access_count = ? WHERE round = ?').run(ts, acc, round);
+    mem.db.prepare('UPDATE memory_arc SET last_access_ms = ?, access_count = ? WHERE title = ?').run(ts, acc, `R${round}`);
+  };
+
+  // 2. 等了 5 天的旧记忆，同零访问：新记忆排序应高于旧记忆（但都保留，衰减未击穿门控）
+  setDecay(1, 5, 0);
+  const r2 = ret.recall({ query: '遗迹', round: 2, budgetTokens: 200, trackAccess: false });
+  const f2 = r2.hits.find((h) => h.code === 'AM02');
+  const o2 = r2.hits.find((h) => h.code === 'AM01');
+  check('新旧都命中(5 天磨损未击穿)', !!f2 && !!o2, `codes=${r2.codes.join(',')}`);
+  check('新记忆(今) 排序高于 旧记忆(5 天前)', f2 && o2 ? f2.score > o2.score : false, `fresh=${f2?.score?.toFixed(3)} old=${o2?.score?.toFixed(3)}`);
+
+  // 3. 30 天零访问的旧记忆：衰减击穿置信门控 → 直接剔除（久不被引用则淡出）
+  setDecay(1, 30, 0);
+  const r3 = ret.recall({ query: '遗迹', round: 2, budgetTokens: 200, trackAccess: false });
+  check('30 天零访问旧记忆被门控剔除', !r3.hits.some((h) => h.code === 'AM01'), r3.codes.join(','));
+
+  // 4. 访问提升：30 天前的旧记忆但因被引用 50 次 → 反超今天的零访问新记忆（被引用越多越重要）
+  setDecay(1, 30, 50);
+  setDecay(2, 0, 0);
+  const r4 = ret.recall({ query: '遗迹', round: 2, budgetTokens: 200, trackAccess: false });
+  const o4 = r4.hits.find((h) => h.code === 'AM01');
+  const f4 = r4.hits.find((h) => h.code === 'AM02');
+  check('高频引用旧记忆复活并反超新记忆', o4 && f4 ? o4.score > f4.score : false, `old=${o4?.score?.toFixed(3)} fresh=${f4?.score?.toFixed(3)}`);
+
+  // 5. 访问计数回写：recall（默认 trackAccess）后 access_count 自增（arc+summary 孪生行同步）
+  setDecay(2, 0, 0);
+  const r5 = ret.recall({ query: '遗迹', round: 2, budgetTokens: 200 });
+  const sumCnt = mem.db.prepare('SELECT access_count FROM memory_summary WHERE round = 2').get() as { access_count: number };
+  const arcCnt = mem.db.prepare("SELECT access_count FROM memory_arc WHERE title = 'R2'").get() as { access_count: number };
+  check('命中注入后双表 access_count 各自增为 1', sumCnt.access_count === 1 && arcCnt.access_count === 1, `sum=${sumCnt.access_count} arc=${arcCnt.access_count}（命中 ${r5.hits.length}）`);
+
+  // 6. decay:false 保守模式：不走时间磨损，新旧都贴近归一化基准（仅差 RRF 基分 <2%）
+  setDecay(1, 30, 0);
+  setDecay(2, 0, 0);
+  const r6 = ret.recall({ query: '遗迹', round: 2, budgetTokens: 200, decay: false, trackAccess: false });
+  const f6 = r6.hits.find((h) => h.code === 'AM02');
+  const o6 = r6.hits.find((h) => h.code === 'AM01');
+  check('decay:false 新旧得分贴近归一化基准', f6 && o6 ? Math.abs(f6.score - o6.score) < 0.02 : false, `fresh=${f6?.score?.toFixed(4)} old=${o6?.score?.toFixed(4)}`);
 }
 
 console.log(`\n结果: ${passed} passed, ${failed} failed`);

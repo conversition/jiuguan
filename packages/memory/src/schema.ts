@@ -23,14 +23,18 @@ CREATE TABLE IF NOT EXISTS memory_arc (
   chapter TEXT, title TEXT,
   summary TEXT,
   status TEXT DEFAULT 'active',
-  seq INTEGER
+  seq INTEGER,
+  access_count INTEGER DEFAULT 0,    -- 记忆衰减：被检索注入次数
+  last_access_ms INTEGER DEFAULT 0   -- 记忆衰减：最近一次被注入的时间戳(ms)
 );
 
 -- 总结表（每轮增量）
 CREATE TABLE IF NOT EXISTS memory_summary (
   id INTEGER PRIMARY KEY,
   code TEXT NOT NULL,
-  round INTEGER, delta TEXT, scene TEXT, created_at TEXT
+  round INTEGER, delta TEXT, scene TEXT, created_at TEXT,
+  access_count INTEGER DEFAULT 0,
+  last_access_ms INTEGER DEFAULT 0
 );
 
 -- 关键事件
@@ -38,7 +42,9 @@ CREATE TABLE IF NOT EXISTS memory_event (
   id INTEGER PRIMARY KEY,
   code TEXT, description TEXT,
   characters TEXT,
-  refs TEXT, resolved INTEGER DEFAULT 0
+  refs TEXT, resolved INTEGER DEFAULT 0,
+  access_count INTEGER DEFAULT 0,
+  last_access_ms INTEGER DEFAULT 0
 );
 
 -- 平行事件（倒计时）
@@ -52,7 +58,9 @@ CREATE TABLE IF NOT EXISTS memory_parallel (
 CREATE TABLE IF NOT EXISTS memory_state (
   id INTEGER PRIMARY KEY,
   entity_type TEXT, entity_id TEXT, name TEXT,
-  state_json TEXT, updated_round INTEGER
+  state_json TEXT, updated_round INTEGER,
+  access_count INTEGER DEFAULT 0,
+  last_access_ms INTEGER DEFAULT 0
 );
 
 -- 世界书条目缓存（向量化来源）
@@ -201,8 +209,13 @@ CREATE TRIGGER IF NOT EXISTS lore_au AFTER UPDATE ON lorebook_entry BEGIN
 END;
 `;
 
-/** 当前 schema 版本号（0.5.0：与 PRAGMA user_version 同步，供增量迁移使用） */
-export const SCHEMA_VERSION = 3;
+/** 当前 schema 版本号（0.5.0：与 PRAGMA user_version 同步，供增量迁移使用；v4：记忆衰减列） */
+export const SCHEMA_VERSION = 4;
+
+/** 记忆衰减（Ebbinghaus 遗忘曲线）+ 访问提升 默认参数（均可用 env / RecallQuery 覆盖） */
+export const DECAY_LAMBDA_DEFAULT = 0.1;  // 每天衰减系数：7 天≈50% 残留（exp(-0.7)≈0.497）
+export const ACCESS_BOOST_DEFAULT = 0.5;  // 每次被检索注入的提升系数（叠加到归一化得分）
+export const DAY_MS = 24 * 60 * 60 * 1000;
 
 /** 检索融合权重（v2 07 §5.1） */
 export const DEFAULT_WEIGHTS = {
