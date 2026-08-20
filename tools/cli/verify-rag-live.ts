@@ -27,7 +27,7 @@ async function main(): Promise<void> {
 
   for (const q of ['会长', '樱佳', '塞蕾丝', '物部千代凛是谁']) {
     console.log(`\n===== recallAsync("${q}") =====`);
-    const r = await ret.recallAsync({ query: q, round: 1, budgetTokens: 800 });
+    const r = await ret.recallAsync({ query: q, round: 1, budgetTokens: 800, namespace: 'session-1787145050757' });
     console.log(`layers=${JSON.stringify(r.layerStats)} elapsed=${r.elapsedMs}ms`);
     for (const h of r.hits) {
       const tag = h.confidence === 'low' ? ' [存疑]' : '';

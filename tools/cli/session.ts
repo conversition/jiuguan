@@ -12,7 +12,7 @@
  *   node session.ts --card <path> --db <path> [--resume] [--once "用户输入"]
  */
 import { readFileSync, existsSync, mkdirSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { dirname, resolve, basename } from 'node:path';
 import { createInterface } from 'node:readline';
 import { parseCharaCard, extractCharaFromPng, pngPayloadToJson } from '../../packages/core/src/chara.ts';
 import { cardBookToLorebookRows, parseWorldBook, entryToLorebookRow } from '../../packages/core/src/worldbook.ts';
@@ -727,7 +727,8 @@ export class ChatSession {
           const round = c.runtime.round as number;
           const input = c.runtime.input as string;
           const bars = c.runtime.bars as Record<string, number>;
-          const hits = await c.runtime.ret!.recallAsync({ query: self.buildRecallQuery(input, bars), round, budgetTokens: 400 });
+          const ns = basename(self.dbPath).replace(/\.db$/i, ''); // PG 命名空间 = 会话 DB 基名（隔离跨卡，同会话多世界书共享）
+          const hits = await c.runtime.ret!.recallAsync({ query: self.buildRecallQuery(input, bars), round, budgetTokens: 400, namespace: ns });
           return { ok: true, data: { hits: hits.hits, raw: hits }, cost: hits.hits.length };
         },
       },

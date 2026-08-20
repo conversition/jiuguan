@@ -18,22 +18,23 @@ async function main(): Promise<void> {
     process.exit(1);
   }
   console.log(`PG 就绪：chunks=${await pg.chunkCount()} aliases=${await pg.aliasCount()}`);
+  const NS = 'session-1787145050757'; // 与 index-lore --db 基名一致
 
-  // 1) 确定性别名命中："会长" 应找到桐月樱佳
-  const hus = await pg.queryByAlias('会长');
+  // 1) 确定性别名命中："会长" 应找到桐月樱佳（限定 namespace）
+  const hus = await pg.queryByAlias(NS, '会长');
   console.log('\n== queryByAlias("会长") ==');
   for (const h of hus) console.log(`  ${h.alias} → ${h.entityName} (${h.explicit ? '显式' : '推导'})`);
   check('命中至少 1 条', hus.length > 0, JSON.stringify(hus));
   check('映射到含"樱佳"的实体', hus.some((h) => h.entityName.includes('樱佳')), JSON.stringify(hus.map((h) => h.entityName)));
 
   // 2) 精确别名："樱佳" 直中
-  const ying = await pg.queryByAlias('樱佳');
+  const ying = await pg.queryByAlias(NS, '樱佳');
   console.log('\n== queryByAlias("樱佳") ==');
   for (const h of ying) console.log(`  ${h.alias} → ${h.entityName}`);
   check('樱佳 命中', ying.length > 0);
 
   // 3) 精确原词优先于包含退化
-  const exact = await pg.queryByAlias('塞蕾丝');
+  const exact = await pg.queryByAlias(NS, '塞蕾丝');
   console.log('\n== queryByAlias("塞蕾丝") ==');
   for (const h of exact) console.log(`  ${h.alias} → ${h.entityName}`);
   check('塞蕾丝 命中', exact.length > 0);

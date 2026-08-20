@@ -28,6 +28,8 @@ export interface RecallQuery {
   dropThreshold?: number;
   /** 通道开关（调试用） */
   channels?: { bm25?: boolean; vec?: boolean; entity?: boolean; am?: boolean };
+  /** PG 检索命名空间（会话 DB 基名）；缺省空串=不过滤（向后兼容无命名空间调用） */
+  namespace?: string;
 }
 
 export interface RecallHit {
@@ -130,7 +132,7 @@ export class RetrievalEngine {
   private embedProvider: { embed: (t: string) => Promise<number[]> } | null = null;
   private embedCache = new Map<string, number[]>();
   /** 注入的 PG 真向量库（可选；缺省回落 SQLite vec_memory）。lore_chunk.lore_id ↔ SQLite lorebook_entry.id */
-  private pgStore: { query(v: number[], k: number, threshold: number): Promise<{ loreId: number; seq: number; text: string; sim: number }[]>; queryByAlias(q: string, k: number): Promise<{ alias: string; entityName: string; explicit: boolean }[]> } | null = null;
+  private pgStore: { query(ns: string, v: number[], k: number, threshold: number): Promise<{ loreId: number; seq: number; text: string; sim: number }[]>; queryByAlias(ns: string, q: string, k: number): Promise<{ alias: string; entityName: string; explicit: boolean }[]> } | null = null;
 
   constructor(private mem: MemoryDb) {}
 
@@ -140,7 +142,7 @@ export class RetrievalEngine {
   }
 
   /** 注入 PG pgvector 存储（提供真向量 ANN + 别名确定性检索；缺省则回落 SQLite） */
-  setPgStore(store: { query(v: number[], k: number, threshold: number): Promise<{ loreId: number; seq: number; text: string; sim: number }[]>; queryByAlias(q: string, k: number): Promise<{ alias: string; entityName: string; explicit: boolean }[]> } | null): void {
+  setPgStore(store: { query(ns: string, v: number[], k: number, threshold: number): Promise<{ loreId: number; seq: number; text: string; sim: number }[]>; queryByAlias(ns: string, q: string, k: number): Promise<{ alias: string; entityName: string; explicit: boolean }[]> } | null): void {
     this.pgStore = store;
   }
 
@@ -150,13 +152,14 @@ export class RetrievalEngine {
     // 基础检索（关闭 hash vec 通道）
     const base = this.recall({ ...q, channels: { ...(q.channels ?? {}), vec: false } });
     const seen = new Set(base.hits.map((h) => h.rowId));
+    const ns = q.namespace ?? '';
 
     // 通道0：PG 别名/职位简写确定性命中（最高优先）—— 解决 2 字词（"会长"）FTS 失效
     let aliasAdded = 0;
     if (q.channels?.entity !== false && this.pgStore) {
       for (const tok of q.query.split(/[\s,，、;；]+/)) {
         if (!tok || aliasAdded >= 6) continue;
-        const aliasHits = await this.pgStore.queryByAlias(tok, 3);
+        const aliasHits = await this.pgStore.queryByAlias(ns, tok, 3);
         for (const a of aliasHits) {
           // 反查该实体的 lorebook_entry.rowId：优先 comment 精确含实体名（角色本体设），退而 content 含
           const entity = a.entityName.replace(/[%_\]]/g, ' ').trim();
@@ -202,7 +205,7 @@ export class RetrievalEngine {
         }
         // PG 真向量 ANN：lore_id → SQLite lorebook_entry.id
         if (this.pgStore) {
-          const pgHits = await this.pgStore.query(qv, 10, Number(process.env.JG_VEC_THRESHOLD ?? 0.4));
+          const pgHits = await this.pgStore.query(ns, qv, 10, Number(process.env.JG_VEC_THRESHOLD ?? 0.4));
           for (const pg of pgHits) {
             if (seen.has(pg.loreId)) continue;
             const h = this.hitFromRowId(pg.loreId, 'lore');

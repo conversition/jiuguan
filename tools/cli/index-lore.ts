@@ -15,6 +15,7 @@
  * 幂等：PG 侧 ON CONFLICT 覆盖；进程可反复跑。缺 PG 连接时告警退出（不解索引）。
  */
 import { readFileSync } from 'node:fs';
+import { basename } from 'node:path';
 import { MemoryDb } from '../../packages/memory/src/db.ts';
 import { parseLoreEntries, parseLoreEntry, buildAliasIndex } from '../../packages/core/src/lore-parse.ts';
 import { chunkLoreEntry } from '../../packages/core/src/lore-chunk.ts';
@@ -24,6 +25,7 @@ import { getPgVectorStore, PG_VECTOR_DIMS } from '../../packages/memory/src/pg-v
 interface Options {
   db?: string;
   worldbooks: string[];
+  namespace?: string;
   noEmbed: boolean;
   batchSize: number;
   maxLen: number;
@@ -36,6 +38,7 @@ function parseArgs(argv: string[]): Options {
     const a = argv[i];
     if (a === '--db') o.db = argv[++i];
     else if (a === '--worldbook') o.worldbooks.push(argv[++i]);
+    else if (a === '--namespace') o.namespace = argv[++i];
     else if (a === '--no-embed') o.noEmbed = true;
     else if (a === '--batch-size') o.batchSize = Number(argv[++i]);
     else if (a === '--max-len') o.maxLen = Number(argv[++i]);
@@ -78,6 +81,10 @@ async function main(): Promise<void> {
     console.error('[索引] PG 不可用，未索引。检查 JG_PG_DSN / pgvector 扩展。');
     process.exit(1);
   }
+  // 命名空间 = PG 隔离键（同一会话多世界书共享、不同会话互不串扰）：显式 --namespace 优先，否则取 db 基名
+  const namespace = o.namespace
+    ?? (o.db ? basename(o.db).replace(/\.db$/i, '') : '')
+    ?? '__worldbook';
 
   // 3) embedding provider（默认 bge；--no-embed 时用零向量占位标记，实际检索前会重新嵌入）
   const embedProvider = o.noEmbed ? null : await createEmbeddingProvider(true);
@@ -105,7 +112,7 @@ async function main(): Promise<void> {
       }
     }
     writeBatch.push({
-      id: p.id, book: p.meta.book, settingText: p.settingText, aliases: p.aliases,
+      namespace, id: p.id, book: p.meta.book, settingText: p.settingText, aliases: p.aliases,
       chunks: chunks.map((c, i) => ({ seq: c.seq, text: c.text, vec: vecs[i] ?? new Array(0) })),
     });
     if (writeBatch.length >= o.batchSize) {
@@ -124,11 +131,11 @@ async function main(): Promise<void> {
   for (const [alias, entry] of aliasIndex) {
     aliasRows.push({ alias, entityName: entry.entityName || alias, explicit: entry.explicit });
   }
-  await pg.upsertAlias(aliasRows);
+  await pg.upsertAlias(namespace, aliasRows);
 
   const n = await pg.chunkCount();
   const na = await pg.aliasCount();
-  console.log(`\n[索引] 完成：写入 ${written} 条 / ${chunked} 窗口，PG 总窗口 ${n}，别名 ${na}（含 "会长→桐月樱佳" 类职位简写）。`);
+  console.log(`\n[索引] 完成：namespace=${namespace} 写入 ${written} 条 / ${chunked} 窗口，PG 总窗口 ${n}，别名 ${na}（含 "会长→桐月樱佳" 类职位简写）。`);
   console.log('  注：向量维度需与查询端 bge 一致（默认 512）。');
   await pg.close();
   process.exit(0);
