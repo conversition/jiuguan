@@ -10,7 +10,7 @@
  * 会话实例进程内 Map + DB 文件持久化。
  */
 import { createServer, IncomingMessage, ServerResponse } from 'node:http';
-import { readdirSync, existsSync, readFileSync, rmSync } from 'node:fs';
+import { readdirSync, existsSync, readFileSync, rmSync, appendFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { ChatSession } from '../../tools/cli/session.ts';
 import { MemoryDb } from '../../packages/memory/src/db.ts';
@@ -30,6 +30,25 @@ import { VariableManager } from '../../packages/variable/src/vms.ts';
 const PORT = Number(process.env.JG_WEB_PORT ?? 17800);
 const HOST = '127.0.0.1';
 const DATA_DIR = resolve('data');
+/** 前端日志落盘路径（日志模块 v0.6.1：浏览器批量上报 → 逐行追加） */
+const WEB_LOG_PATH = resolve(DATA_DIR, 'web.log');
+
+/** 后端兜底脱敏：剥掉 data 里的敏感字段（apiKey/key/token/authorization…），避免 key 落盘 */
+function stripSensitive(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stripSensitive);
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (/^(api_?key|key|token|authorization|auth|secret|password)$/i.test(k)) {
+        out[k] = '[redacted]';
+      } else {
+        out[k] = stripSensitive(v);
+      }
+    }
+    return out;
+  }
+  return value;
+}
 
 const sessions = new Map<string, ChatSession>();
 /** 插件注册表（插件市场：git URL 安装 / 启停 / 卸载 / 更新，数据在 data/plugins） */
@@ -131,6 +150,25 @@ const server = createServer(async (req, res) => {
         return { id, file: f, name: meta.card || id, preview: meta.preview, round: meta.round };
       });
       return json(res, { sessions: list });
+    }
+
+    // ── 前端日志落盘（浏览器上报 → data/web.log 逐行追加；前端已脱敏，后端再兜底 strip）──
+    if (method === 'POST' && p === '/api/log') {
+      const body = await readBody(req);
+      const entries = Array.isArray((body as { entries?: unknown }).entries)
+        ? (body as { entries: unknown[] }).entries
+        : [body];
+      const lines = entries
+        .filter((e) => e && typeof e === 'object')
+        .map((e) => JSON.stringify({
+          ts: (e as { ts?: unknown }).ts ?? '',
+          level: (e as { level?: unknown }).level ?? 'info',
+          scope: (e as { scope?: unknown }).scope ?? '',
+          msg: String((e as { msg?: unknown }).msg ?? ''),
+          data: stripSensitive((e as { data?: unknown }).data),
+        }));
+      if (lines.length > 0) appendFileSync(WEB_LOG_PATH, `${lines.join('\n')}\n`, 'utf8');
+      return json(res, { ok: true, count: lines.length });
     }
 
     // ── 插件市场（04 §4.1 / §7：git 安装 + 启停 + 卸载 + 更新）──

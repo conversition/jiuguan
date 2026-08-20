@@ -397,3 +397,24 @@ body { font-family: system-ui, 'PingFang SC', 'Microsoft YaHei', sans-serif; bac
 @media (max-width: 768px) {
   .message-ruler { right: 4px; transform: translateY(-50%) scale(.8); }
 }
+
+/* ═══════════ 错误边界兜底面板（v0.6.1）═══════════ */
+.boundary-fallback {
+  margin: 24px auto; max-width: 720px; padding: 20px 24px;
+  border: 1px solid var(--border); border-radius: 12px;
+  background: var(--bg-panel); color: var(--ink-1);
+}
+.boundary-fallback h3 { margin: 0 0 10px; font-size: 15px; color: #e5484d; }
+.boundary-msg {
+  margin: 0 0 10px; padding: 10px 12px; border-radius: 8px;
+  background: var(--bg-deep); border-left: 3px solid #e5484d;
+  font-size: 13px; white-space: pre-wrap; word-break: break-all; color: var(--ink-2);
+}
+.boundary-stack {
+  margin: 0 0 12px; padding: 10px 12px; border-radius: 8px;
+  background: var(--bg-deep); font-size: 11px; line-height: 1.5;
+  white-space: pre-wrap; word-break: break-all; color: var(--ink-3);
+  max-height: 200px; overflow-y: auto;
+}
+.boundary-actions { display: flex; gap: 8px; }
+.boundary-actions .op-btn { font-size: 13px; padding: 6px 12px; }

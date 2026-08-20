@@ -15,6 +15,11 @@ import { useScrollToMessage } from './hooks/useScrollToMessage.ts';
 import { useScrollSpy } from './hooks/useScrollSpy.ts';
 import { useAutoScrollToMessage } from './hooks/useAutoScrollToMessage.ts';
 import { MessageRuler } from './components/MessageRuler.tsx';
+import { ErrorBoundary } from './components/ErrorBoundary.tsx';
+import { logger } from './lib/logger.ts';
+
+/** 单回合生成超时（秒）：上游迟迟不返回/不结束 → 前端主动 abort，避免 busy 卡死、页面永久空转 */
+const GENERATION_TIMEOUT_MS = 300_000;
 
 interface Card { id: string; name: string }
 interface SessionInfo { id: string; name: string; preview?: string; round?: number }
@@ -123,10 +128,17 @@ const MessageRow = React.memo(function MessageRow({
     ? extractHtmlFromCodeFence(shown) ?? (looksLikeHtml(shown) ? shown : null)
     : null;
   const anchorKey = toMessageKey(m.round, m.role);
+  // 锚点 ref 记忆化（v0.6.1）：registerAnchor(key) 每次调用都返回新函数，
+  // 直接内联会导致非流式行每渲染触发 ref 解绑/重绑、锚点 Map 反复增删（抖动）。
+  // 按 anchorKey 记住同一引用，key 不变则 ref 引用稳定。
+  const anchorRefCache = useRef<{ key: string; fn: ((el: HTMLDivElement | null) => void) | null }>({ key: '', fn: null });
+  if (anchorRefCache.current.key !== anchorKey) {
+    anchorRefCache.current = { key: anchorKey, fn: registerAnchor(anchorKey) };
+  }
   return (
     <div
       className={`msg ${m.role}`}
-      ref={streaming ? streamingMsgRef : registerAnchor(anchorKey)}
+      ref={streaming ? streamingMsgRef : anchorRefCache.current.fn}
       data-message-key={anchorKey}
     >
       <div className="msg-body">
@@ -199,6 +211,21 @@ export function App() {
   // 中止生成：busy 期间持有当前回合的 AbortController（发送键变停止键 + Esc）
   const abortRef = useRef<AbortController | null>(null);
   const stopGenerating = () => { abortRef.current?.abort(); };
+  // 生成超时兜底：回合迟迟不结束 → 主动中止，防止 busy 卡死 / 页面永久空转
+  const genTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const genTimedOutRef = useRef(false);
+  const clearGenTimeout = () => {
+    if (genTimeoutRef.current) { clearTimeout(genTimeoutRef.current); genTimeoutRef.current = null; }
+  };
+  const startGenTimeout = () => {
+    clearGenTimeout();
+    genTimedOutRef.current = false;
+    genTimeoutRef.current = setTimeout(() => {
+      genTimedOutRef.current = true;
+      logger.warn('turn', '生成超时，自动中止', { timeoutMs: GENERATION_TIMEOUT_MS });
+      abortRef.current?.abort();
+    }, GENERATION_TIMEOUT_MS);
+  };
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && busy) stopGenerating(); };
     window.addEventListener('keydown', onKey);
@@ -216,6 +243,11 @@ export function App() {
         ? { ...x, content: x.content + chunk }
         : x
     )));
+    // 生成期底部跟随（v0.6.1：事件驱动，仅确有 delta 时执行，取代原 60fps 追随循环）
+    // 未上滚读旧文 → 钉住底部让新内容持续可见；已上滚 → 不动，等用户回到底部后恢复
+    if (userScrolledUpRef.current) return;
+    const container = scrollRef.current;
+    if (container) container.scrollTop = container.scrollHeight;
   };
   const pushStream = (text: string) => {
     streamBufRef.current += text;
@@ -228,8 +260,7 @@ export function App() {
     flushStream();
     streamTargetRef.current = null;
   };
-  useEffect(() => () => { if (streamRafRef.current != null) cancelAnimationFrame(streamRafRef.current); }, []);
-  // 会话删除：两步内联确认
+  useEffect(() => () => { if (streamRafRef.current != null) cancelAnimationFrame(streamRafRef.current); }, []);  // 会话删除：两步内联确认
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   // 生成计时器
@@ -243,7 +274,10 @@ export function App() {
   const stopGenTimer = () => {
     if (genTimerRef.current) { clearInterval(genTimerRef.current); genTimerRef.current = null; }
   };
-  useEffect(() => () => { if (genTimerRef.current) clearInterval(genTimerRef.current); }, []);
+  useEffect(() => () => {
+    if (genTimerRef.current) clearInterval(genTimerRef.current);
+    if (genTimeoutRef.current) clearTimeout(genTimeoutRef.current);
+  }, []);
 
   // 主题应用到 <html data-theme>，字号写到 --read-fs 变量
   useEffect(() => {
@@ -303,6 +337,7 @@ export function App() {
   const deleteSession = async (s: SessionInfo) => {
     if (confirmDel !== s.id) { setConfirmDel(s.id); return; } // 第一次点击 → 进入确认态
     setConfirmDel(null);
+    logger.info('session', '删除会话', { session: s.id });
     try {
       await api(`/api/session/${s.id}/delete`, { method: 'POST' });
       setSessions((prev) => prev.filter((x) => x.id !== s.id));
@@ -348,7 +383,8 @@ export function App() {
   const scrollToKey = useScrollToMessage(getElement, scrollRef);
 
   // 生成完成智能定位：未上滚 → 滚到新 AI 回复开头；上滚读旧内容 → 显示"查看新回复"浮窗
-  const { showJumpButton, jumpKey, dismissJump } = useAutoScrollToMessage(
+  // 生成期底部跟随由 flushStream（有 delta 的 rAF 帧）执行，userScrolledUpRef 表示用户是否上滚
+  const { showJumpButton, jumpKey, dismissJump, userScrolledUpRef } = useAutoScrollToMessage(
     scrollRef,
     getElement,
     lastAssistantAnchorKey,
@@ -358,6 +394,7 @@ export function App() {
 
   /** 会话创建完成回调（SessionSetup 面板 → 进入对话） */
   const onSessionCreated = (sid: string, greeting: string, cardName: string, mode: string) => {
+    logger.info('session', '会话创建', { session: sid, card: cardName, mode });
     setSessionId(sid);
     setContentMode(mode === 'nsf' ? 'nsf' : 'nsfw');
     setMessages([{ id: nextMsgId(), round: 0, role: 'assistant', content: `${greeting}\n\n（角色卡：${cardName} · ${mode}）` }]);
@@ -368,7 +405,9 @@ export function App() {
 
   /** 拉取会话历史并合并到本地（稳定 key：round+role 匹配保留前端 id） */
   const fetchHistory = async (sid: string): Promise<void> => {
+    const t0 = performance.now();
     const h = await api<{ messages: { id: number; round: number; role: string; content: string }[] }>(`/api/session/${sid}/history`);
+    logger.debug('session', '拉取会话历史', { session: sid, count: h.messages?.length ?? 0, ms: Math.round(performance.now() - t0) });
     setMessages((prev) => mergeHistory(prev, h.messages));
   };
 
@@ -384,6 +423,7 @@ export function App() {
   };
 
   const resumeSession = async (sid: string) => {
+    logger.info('session', '恢复会话', { session: sid });
     setBusy(true);
     setError('');
     try {
@@ -392,28 +432,37 @@ export function App() {
       await fetchHistory(sid);
       setTab('chat');
       fetchTurnState(sid);
-    } catch (e) { setError((e as Error).message); }
+    } catch (e) {
+      logger.error('session', '恢复会话失败', { message: (e as Error).message });
+      setError((e as Error).message);
+    }
     setBusy(false);
   };
 
   const send = async () => {
     const text = input.trim();
     if (!text || !sessionId || busy) return;
+    logger.info('turn', '发送消息', { session: sessionId, content_mode: contentMode });
     setInput('');
     setBusy(true);
     setStreamCompleted(false);
     setError('');
     startGenTimer();
+    startGenTimeout();
     setMessages((m) => [...m, { id: nextMsgId(), round: 0, role: 'user', content: text }]);
     const replyId = nextMsgId();
     setMessages((m) => [...m, { id: replyId, round: 0, role: 'assistant', content: '' }]);
     streamTargetRef.current = { kind: 'id', id: replyId };
     const ac = new AbortController();
     abortRef.current = ac;
+    let deltaCount = 0;
+    let deltaLen = 0;
     try {
       await apiStream('/api/turn', { session: sessionId, input: text, content_mode: contentMode }, (ev) => {
         if (ev.type === 'delta' && typeof ev.text === 'string') {
           // 真流式：rAF 批合并逐帧追加（StreamText 渐进渲染，不做全量 re-parse）
+          deltaCount++;
+          deltaLen += ev.text.length;
           pushStream(ev.text);
         }
         if (ev.type === 'done' && typeof ev.prose === 'string') {
@@ -422,20 +471,27 @@ export function App() {
           const prose = ev.prose;
           setMessages((m) => m.map((x) => (x.id === replyId ? { ...x, content: prose } : x)));
         }
-        if (ev.type === 'error') setError(String(ev.message ?? '回合失败'));
+        if (ev.type === 'error') {
+          logger.error('turn', '回合 SSE error', { message: ev.message });
+          setError(String(ev.message ?? '回合失败'));
+        }
       }, ac.signal);
+      logger.info('turn', '回合 SSE 完成', { deltaCount, deltaLen, aborted: ac.signal.aborted });
       // 回合结束 → 刷新推进槽（侧栏常驻）+ 拉真实 round（消息操作按 round 定位）+ 会话预览
       fetchTurnState(sessionId);
       await fetchHistory(sessionId);
       refreshSessions();
     } catch (e) {
       if ((e as { name?: string }).name === 'AbortError') {
-        // 用户停止：后端已通过 req close 触发部分正文落库；此处幂等兜底 + 刷新
+        logger.warn('turn', '回合被中止', { timeout: genTimedOutRef.current });
+        if (genTimedOutRef.current) setError('生成超时（5 分钟），已自动中止。可重新发送。');
+        // 用户停止/超时：后端已通过 req close 触发部分正文落库；此处幂等兜底 + 刷新
         try {
           const ts = await api<{ state: TurnState | null }>(`/api/session/${sessionId}/turn-state`);
           await finalizeAbort(sessionId, ts.state?.round ?? 0);
         } catch { /* 中止兜底失败不阻塞 */ }
       } else {
+        logger.error('turn', '回合失败', { message: (e as Error).message });
         setError((e as Error).message);
         // 网络级异常：后端已清理失败轮孤儿 → 刷新历史移除乐观气泡（round 0 user+assistant），避免残留空回复
         try { await fetchHistory(sessionId); } catch { /* 刷新失败不阻塞报错 */ }
@@ -444,6 +500,8 @@ export function App() {
       }
     }
     abortRef.current = null;
+    clearGenTimeout();
+    genTimedOutRef.current = false;
     stopStream();
     stopGenTimer();
     setStreamCompleted(true);
@@ -453,31 +511,45 @@ export function App() {
   /** 重新生成某条 AI 回复（SSE 流式原地替换目标消息内容；可中止） */
   const regenerateMessage = async (msg: Message) => {
     if (!sessionId || busy) return;
+    logger.info('turn', '重新生成回复', { session: sessionId, round: msg.round });
     setBusy(true);
     setStreamCompleted(false);
     setError('');
     startGenTimer();
+    startGenTimeout();
     streamTargetRef.current = { kind: 'round', round: msg.round };
     const ac = new AbortController();
     abortRef.current = ac;
+    let deltaCount = 0;
+    let deltaLen = 0;
     try {
       await apiStream(`/api/session/${sessionId}/regenerate`, { round: msg.round }, (ev) => {
-        if (ev.type === 'delta' && typeof ev.text === 'string') pushStream(ev.text);
+        if (ev.type === 'delta' && typeof ev.text === 'string') {
+          deltaCount++;
+          deltaLen += ev.text.length;
+          pushStream(ev.text);
+        }
         if (ev.type === 'done' && typeof ev.prose === 'string') {
           stopStream();
           const prose = ev.prose;
           setMessages((m) => m.map((x) => (x.round === msg.round && x.role === 'assistant' ? { ...x, content: prose } : x)));
         }
-        if (ev.type === 'error') setError(String(ev.message ?? '重新生成失败'));
+        if (ev.type === 'error') {
+          logger.error('turn', '重新生成 SSE error', { message: ev.message });
+          setError(String(ev.message ?? '重新生成失败'));
+        }
       }, ac.signal);
+      logger.info('turn', '重新生成 SSE 完成', { round: msg.round, deltaCount, deltaLen, aborted: ac.signal.aborted });
       await fetchHistory(sessionId);
       fetchTurnState(sessionId);
       refreshSessions();
     } catch (e) {
       if ((e as { name?: string }).name === 'AbortError') {
-        // 用户停止重新生成：round 已知，幂等兜底落库 + 刷新
+        if (genTimedOutRef.current) setError('生成超时（5 分钟），已自动中止。可重试。');
+        // 用户停止/超时重新生成：round 已知，幂等兜底落库 + 刷新
         await finalizeAbort(sessionId, msg.round);
       } else {
+        logger.error('turn', '重新生成失败', { message: (e as Error).message });
         setError((e as Error).message);
         // 网络级异常：后端已写占位 assistant → 刷新历史对齐，避免前后端状态漂移
         try { await fetchHistory(sessionId); } catch { /* 刷新失败不阻塞报错 */ }
@@ -486,6 +558,8 @@ export function App() {
       }
     }
     abortRef.current = null;
+    clearGenTimeout();
+    genTimedOutRef.current = false;
     stopStream();
     stopGenTimer();
     setStreamCompleted(true);
@@ -543,6 +617,7 @@ export function App() {
             </select>
             <button onClick={() => setReadFs((f) => Math.max(14, f - 1))} title="减小字号">A-</button>
             <button onClick={() => setReadFs((f) => Math.min(22, f + 1))} title="增大字号">A+</button>
+            <button onClick={() => logger.download()} title="下载前端日志（.log）">📄</button>
           </div>
         </div>
         <div className="modebar">
@@ -649,6 +724,7 @@ export function App() {
                   <span className="gen-timer-spin" /> 正在生成… <b>{genSeconds.toFixed(1)}s</b>
                 </div>
               )}
+              <ErrorBoundary scope="render" onReset={() => setMessages([])}>
               {messages.length === 0 && !busy && (
                 <div className="empty">从左侧选择一张角色卡开始对话（首次需加载世界书 + 向量化，约 10 秒）</div>
               )}
@@ -676,6 +752,7 @@ export function App() {
                   );
                 });
               })()}
+              </ErrorBoundary>
               {busy && !messages.some((m) => m.role === 'assistant' && m.content === '') && (
                 <div className="msg assistant"><div className="bubble typing">思考中…</div></div>
               )}

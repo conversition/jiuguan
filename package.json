@@ -1,7 +1,7 @@
 {
   "name": "jiuguan",
   "private": true,
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "酒馆提示词Agent - 下一代剧本游玩平台（headless-first MVP）",
   "type": "module",
   "workspaces": [
