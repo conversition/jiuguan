@@ -28,6 +28,7 @@ import type { WriteResult } from '../../packages/memory/src/writer.ts';
 import { RetrievalEngine } from '../../packages/memory/src/retrieval.ts';
 import { Vectorizer } from '../../packages/memory/src/vectorize.ts';
 import { createEmbeddingProvider, HashEmbeddingProvider } from '../../packages/memory/src/embedding.ts';
+import { getPgVectorStore } from '../../packages/memory/src/pg-vector.ts';
 import { VariableManager } from '../../packages/variable/src/vms.ts';
 import { persistVariables, restoreVariables } from '../../packages/variable/src/persist.ts';
 import { VariableCompiler, detectCardSource } from '../../packages/variable/src/compiler.ts';
@@ -595,7 +596,7 @@ export class ChatSession {
         console.warn(`[世界书] ${f} 解析失败，跳过: ${(e as Error).message.slice(0, 80)}`);
       }
     }
-    // 语义向量化（bge；失败回落 hash）
+    // 语义向量化（bge；失败回落 hash）+ PG 真向量检索（可选，缺连优雅回落）
     if (vectorizable && this.args.useBge) {
       onStage?.('vectorize');
       try {
@@ -606,6 +607,19 @@ export class ChatSession {
       } catch (e) {
         this.ret.setEmbeddingProvider(new HashEmbeddingProvider());
         console.warn(`[向量] 失败，回落 hash: ${(e as Error).message.slice(0, 60)}`);
+      }
+      // PG pgvector 真向量/别名检索通道（同一 bge model）；缺连优雅回落 SQLite 检索
+      try {
+        const pg = await getPgVectorStore();
+        if (pg.isReady) {
+          this.ret.setPgStore(pg);
+          console.log(`[向量] PG pgvector 就绪（chunks=${await pg.chunkCount()} aliases=${await pg.aliasCount()}）`);
+        } else {
+          this.ret.setPgStore(null);
+        }
+      } catch (e) {
+        this.ret.setPgStore(null);
+        console.warn(`[向量] PG 不可用，回落 SQLite 检索: ${(e as Error).message.slice(0, 60)}`);
       }
     } else if (!vectorizable) {
       this.ret.setEmbeddingProvider(new HashEmbeddingProvider());

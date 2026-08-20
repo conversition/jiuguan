@@ -203,7 +203,7 @@ const server = createServer(async (req, res) => {
       const dbPath = resolve(DATA_DIR, dbName);
       if (!existsSync(dbPath)) return json(res, { error: '会话不存在' }, 404);
       const id = dbName.replace(/\.db$/, '');
-      const session = sessions.get(id) ?? new ChatSession({ db: dbPath, resume: true, useBge: false });
+      const session = sessions.get(id) ?? new ChatSession({ db: dbPath, resume: true, useBge: true });
       if (!sessions.has(id)) await session.init();
       sessions.set(id, session);
       return json(res, { id });

@@ -16,7 +16,7 @@
  */
 import { readFileSync } from 'node:fs';
 import { MemoryDb } from '../../packages/memory/src/db.ts';
-import { parseLoreEntries, parseLoreEntry } from '../../packages/core/src/lore-parse.ts';
+import { parseLoreEntries, parseLoreEntry, buildAliasIndex } from '../../packages/core/src/lore-parse.ts';
 import { chunkLoreEntry } from '../../packages/core/src/lore-chunk.ts';
 import { createEmbeddingProvider } from '../../packages/memory/src/embedding.ts';
 import { getPgVectorStore, PG_VECTOR_DIMS } from '../../packages/memory/src/pg-vector.ts';
@@ -118,8 +118,17 @@ async function main(): Promise<void> {
   for (const w of writeBatch) await pg.upsertLore(w);
   written += writeBatch.length;
 
+  // 5) 别名/职位简写写入 lore_alias（`会长→桐月樱佳` 确定性检索，解决 2 字词 FTS 失效）
+  const aliasIndex = buildAliasIndex(unique);
+  const aliasRows: { alias: string; entityName: string; explicit: boolean }[] = [];
+  for (const [alias, entry] of aliasIndex) {
+    aliasRows.push({ alias, entityName: entry.entityName || alias, explicit: entry.explicit });
+  }
+  await pg.upsertAlias(aliasRows);
+
   const n = await pg.chunkCount();
-  console.log(`\n[索引] 完成：写入 ${written} 条 / ${chunked} 窗口，PG 总窗口 ${n}。`);
+  const na = await pg.aliasCount();
+  console.log(`\n[索引] 完成：写入 ${written} 条 / ${chunked} 窗口，PG 总窗口 ${n}，别名 ${na}（含 "会长→桐月樱佳" 类职位简写）。`);
   console.log('  注：向量维度需与查询端 bge 一致（默认 512）。');
   await pg.close();
   process.exit(0);

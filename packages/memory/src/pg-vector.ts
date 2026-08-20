@@ -76,6 +76,13 @@ export class PgVectorStore {
         PRIMARY KEY (lore_id, seq)
       )`);
       await pool.query('CREATE INDEX IF NOT EXISTS lore_chunk_embed_hnsw ON lore_chunk USING hnsw (embedding vector_cosine_ops)');
+      // 别名/职位简写索引：`会长→桐月樱佳` 确定性命中（解决 2 字词 FTS 失效）
+      await pool.query(`CREATE TABLE IF NOT EXISTS lore_alias (
+        alias TEXT PRIMARY KEY,
+        entity_name TEXT DEFAULT '',
+        explicit BOOLEAN DEFAULT false
+      )`);
+      await pool.query('CREATE INDEX IF NOT EXISTS lore_alias_alias ON lore_alias (alias)');
       this.ready = true;
     } catch (e) {
       this.ready = false;
@@ -111,7 +118,7 @@ export class PgVectorStore {
         `INSERT INTO lore_chunk (lore_id, seq, text, embedding)
          SELECT * FROM unnest($1::int[], $2::int[], $3::text[], $4::vector[])
          ON CONFLICT (lore_id, seq) DO UPDATE SET text=EXCLUDED.text, embedding=EXCLUDED.embedding`,
-        [p.chunks.map((c) => p.id), p.chunks.map((c) => c.seq), p.chunks.map((c) => c.text), p.chunks.map((c) => `[${c.vec.join(',')}]`)],
+        [p.chunks.map((_) => p.id), p.chunks.map((c) => c.seq), p.chunks.map((c) => c.text), p.chunks.map((c) => `[${c.vec.join(',')}]`)],
       );
       await client.query('COMMIT');
     } catch (e) {
@@ -126,7 +133,7 @@ export class PgVectorStore {
   async query(queryVec: number[], k = 10, threshold = 0.35): Promise<PgHit[]> {
     if (!this.ready || !this.pool || queryVec.length !== PG_VECTOR_DIMS) return [];
     const q = `[${queryVec.join(',')}]`;
-    const res = await this.pool.query<PgHit>(
+    const res = await this.pool.query<{ lore_id: number; seq: number; text: string; sim: string }>(
       `SELECT lore_id, seq, text, (1 - (embedding <=> $1::vector)) AS sim
        FROM lore_chunk
        WHERE embedding IS NOT NULL AND (1 - (embedding <=> $1::vector)) >= $2
@@ -135,6 +142,52 @@ export class PgVectorStore {
       [q, threshold, k],
     );
     return res.rows.map((r) => ({ loreId: r.lore_id, seq: r.seq, text: r.text, sim: Number(r.sim) }));
+  }
+
+  /**
+   * 写别名/职位简写映射（`会长→桐月樱佳` 确定性命中）。
+   * explicit=true 表示来自条目 comment/正文的显式别名；false 表示推导简写（职位/后缀）。批量 ON CONFLICT 覆盖。
+   */
+  async upsertAlias(rows: { alias: string; entityName: string; explicit: boolean }[]): Promise<void> {
+    if (!this.ready || !this.pool || rows.length === 0) return;
+    try {
+      await this.pool.query(
+        `INSERT INTO lore_alias (alias, entity_name, explicit)
+         SELECT * FROM unnest($1::text[], $2::text[], $3::boolean[])
+         ON CONFLICT (alias) DO UPDATE SET entity_name=EXCLUDED.entity_name, explicit=EXCLUDED.explicit`,
+        [rows.map((r) => r.alias), rows.map((r) => r.entityName), rows.map((r) => r.explicit)],
+      );
+    } catch (e) {
+      console.warn(`[pgvector] upsertAlias 失败(${rows.length}): ${(e as Error).message.slice(0, 100)}`);
+    }
+  }
+
+  /**
+   * 别名/职位简写确定性检索。优先精确匹配，再退化到包含匹配——"会长"
+   * 应对应"桐月樱佳"，不依赖 FTS trigram（2 字词 FTS 天然失效）。
+   */
+  async queryByAlias(query: string, k = 8): Promise<{ alias: string; entityName: string; explicit: boolean }[]> {
+    if (!this.ready || !this.pool || !query.trim()) return [];
+    try {
+      const res = await this.pool.query<{ alias: string; entity_name: string; explicit: boolean }>(
+        `SELECT alias, entity_name, explicit FROM lore_alias
+         WHERE alias = $1 OR alias LIKE $2
+         ORDER BY (alias = $1)::int DESC, explicit DESC, char_length(alias) DESC
+         LIMIT $3`,
+        [query.trim(), `%${query.trim()}%`, k],
+      );
+      return res.rows.map((r) => ({ alias: r.alias, entityName: r.entity_name, explicit: r.explicit }));
+    } catch (e) {
+      console.warn(`[pgvector] queryByAlias 失败: ${(e as Error).message.slice(0, 100)}`);
+      return [];
+    }
+  }
+
+  /** 别名表总数（健康检查/日志） */
+  async aliasCount(): Promise<number> {
+    if (!this.ready || !this.pool) return 0;
+    const r = await this.pool.query<{ n: string }>('SELECT COUNT(*) AS n FROM lore_alias');
+    return Number(r.rows[0]?.n ?? 0);
   }
 
   /** 统计窗口数（健康检查/日志） */

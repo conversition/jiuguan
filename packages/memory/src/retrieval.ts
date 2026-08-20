@@ -111,10 +111,26 @@ function collectLikeQueries(query: string): string[] {
   return out.slice(0, 16);
 }
 
+/**
+ * 从世界书条目原文提炼「可读设定」：剥离 EJS/MVU 代码（<%_ … %>）与 {{// }} 注释，
+ * 保留自然语言设定。只影响注入展示，不改检索匹配。
+ */
+export function readableLoreContent(raw: string): string {
+  if (!raw) return '';
+  return raw
+    .replace(/<%[-=_]?[\s\S]*?[-=_]?%>/g, ' ')   // EJS/MVU 代码段
+    .replace(/\{\{\/\/[\s\S]*?\}\}/g, ' ')        // 注释段
+    .replace(/[\r\n]+/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 export class RetrievalEngine {
   /** 注入的 embedding provider（真实语义向量；缺省用内置 hash） */
   private embedProvider: { embed: (t: string) => Promise<number[]> } | null = null;
   private embedCache = new Map<string, number[]>();
+  /** 注入的 PG 真向量库（可选；缺省回落 SQLite vec_memory）。lore_chunk.lore_id ↔ SQLite lorebook_entry.id */
+  private pgStore: { query(v: number[], k: number, threshold: number): Promise<{ loreId: number; seq: number; text: string; sim: number }[]>; queryByAlias(q: string, k: number): Promise<{ alias: string; entityName: string; explicit: boolean }[]> } | null = null;
 
   constructor(private mem: MemoryDb) {}
 
@@ -123,12 +139,45 @@ export class RetrievalEngine {
     this.embedProvider = provider;
   }
 
+  /** 注入 PG pgvector 存储（提供真向量 ANN + 别名确定性检索；缺省则回落 SQLite） */
+  setPgStore(store: { query(v: number[], k: number, threshold: number): Promise<{ loreId: number; seq: number; text: string; sim: number }[]>; queryByAlias(q: string, k: number): Promise<{ alias: string; entityName: string; explicit: boolean }[]> } | null): void {
+    this.pgStore = store;
+  }
+
   /** 异步混合检索：通道 B 使用真实 embedding（bge），其余通道与 recall 一致 */
   async recallAsync(q: RecallQuery): Promise<RecallResult> {
     const t0 = Date.now();
     // 基础检索（关闭 hash vec 通道）
     const base = this.recall({ ...q, channels: { ...(q.channels ?? {}), vec: false } });
+    const seen = new Set(base.hits.map((h) => h.rowId));
 
+    // 通道0：PG 别名/职位简写确定性命中（最高优先）—— 解决 2 字词（"会长"）FTS 失效
+    let aliasAdded = 0;
+    if (q.channels?.entity !== false && this.pgStore) {
+      for (const tok of q.query.split(/[\s,，、;；]+/)) {
+        if (!tok || aliasAdded >= 6) continue;
+        const aliasHits = await this.pgStore.queryByAlias(tok, 3);
+        for (const a of aliasHits) {
+          // 反查该实体的 lorebook_entry.rowId：优先 comment 精确含实体名（角色本体设），退而 content 含
+          const entity = a.entityName.replace(/[%_\]]/g, ' ').trim();
+          const rows = this.mem.db.prepare(
+            `SELECT id AS rowId, CASE WHEN comment LIKE ?1 COLLATE NOCASE THEN 0 ELSE 1 END AS rank
+             FROM lorebook_entry WHERE comment LIKE ?1 OR content LIKE ?2
+             ORDER BY rank ASC, id ASC LIMIT 6`
+          ).all(`%${entity}%`, `%${entity}%`) as { rowId: number; rank: number }[];
+          for (const { rowId } of rows.slice(0, 2)) {
+            if (seen.has(rowId)) continue;
+            const h = this.hitFromRowId(rowId, 'lore');
+            if (!h) continue;
+            seen.add(rowId);
+            base.hits.push({ ...h, score: 0.99 - aliasAdded * 0.005, source: 'alias', confidence: 'high' });
+            aliasAdded++;
+          }
+        }
+      }
+    }
+
+    // 通道B：PG 真向量 ANN（lore_chunk），退回落 SQLite vec_memory
     if (q.channels?.vec !== false && this.embedProvider) {
       const qv = await this.embedQuery(q.query);
       if (qv.length > 0) {
@@ -142,21 +191,33 @@ export class RetrievalEngine {
           if (sim > 0.5) scored.push({ rowId: r.row_id, sim });
         }
         scored.sort((a, b) => b.sim - a.sim);
-        const seen = new Set(base.hits.map((h) => h.rowId));
         for (const s of scored.slice(0, 10)) {
           if (seen.has(s.rowId)) continue;
           const cat = this.categoryOfRow(s.rowId);
           const h = this.hitFromRowId(s.rowId, cat);
           if (h) {
-            base.hits.push({ ...h, score: s.sim, source: 'vec' });
             seen.add(s.rowId);
+            base.hits.push({ ...h, score: s.sim, source: 'vec', confidence: 'high' });
           }
         }
-        // 向量命中优先置顶（语义强信号）
-        base.hits.sort((a, b) => (b.source === 'vec' ? 1 : 0) - (a.source === 'vec' ? 1 : 0) || b.score - a.score);
-        base.codes = base.hits.map((h) => h.code).filter(Boolean);
-        base.injectedBlock = (this as unknown as { renderBlock(h: unknown[]): string }).renderBlock(base.hits as never);
+        // PG 真向量 ANN：lore_id → SQLite lorebook_entry.id
+        if (this.pgStore) {
+          const pgHits = await this.pgStore.query(qv, 10, Number(process.env.JG_VEC_THRESHOLD ?? 0.4));
+          for (const pg of pgHits) {
+            if (seen.has(pg.loreId)) continue;
+            const h = this.hitFromRowId(pg.loreId, 'lore');
+            if (!h) continue;
+            seen.add(pg.loreId);
+            base.hits.push({ ...h, score: pg.sim, source: 'vec', confidence: 'high' });
+          }
+        }
       }
+      // 语义强信号置顶，别名确定性最高
+      const pri = { alias: 0, vec: 1, am: 2, entity: 2, bm25: 3, like: 3 };
+      base.hits.sort((a, b) => (pri[a.source] ?? 9) - (pri[b.source] ?? 9) || b.score - a.score);
+      base.codes = base.hits.map((h) => h.code).filter(Boolean);
+      base.injectedBlock = (this as unknown as { renderBlock(h: unknown[]): string }).renderBlock(base.hits as never);
+      base.layerStats = { ...base.layerStats, alias: aliasAdded, vec: base.hits.filter((h) => h.source === 'vec').length };
     }
     base.elapsedMs = Date.now() - t0;
     return base;
@@ -373,7 +434,7 @@ export class RetrievalEngine {
       const content = category === 'state'
         ? `${row.name ?? ''} ${row.state_json ?? ''}`
         : category === 'lore'
-          ? `${row.comment ?? ''} ${row.content ?? ''}`
+          ? `${row.comment ?? ''} ${readableLoreContent((row.content as string) ?? '')}`
           : (row.summary ?? row.delta ?? row.description ?? '') as string;
       return {
         rowId,
