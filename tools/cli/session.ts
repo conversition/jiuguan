@@ -37,7 +37,7 @@ import { executeRules, formatVarDelta, bareVarName } from '../../packages/variab
 import type { RuleEffect } from '../../packages/variable/src/rules.ts';
 import type { VariableManifestRule, VariableManifest } from '../../packages/variable/src/manifest.ts';
 import { assembleTurn, DEFAULT_SYSTEM_CORE, estimateTokens } from '../../packages/prompt/src/assembly.ts';
-import { validateGameTurn, safeParseTurn, normalizeTurn, createProseStreamExtractor } from '../../packages/prompt/src/turn.ts';
+import { validateGameTurn, safeParseTurn, normalizeTurn, createProseStreamExtractor, diagIssueDetail } from '../../packages/prompt/src/turn.ts';
 import type { GameTurn } from '../../packages/prompt/src/turn.ts';
 import { OpenAICompatibleClient, toolLoopMessages, AbortTurnError } from '../../packages/proxy/src/client.ts';
 import { loadProviderConfig, assertProviderReady } from '../../packages/proxy/src/config.ts';
@@ -830,7 +830,7 @@ export class ChatSession {
     // sentProse：已流式发出的正文累积（用户停止生成时保留该部分落库）
     let sentProse = '';
     const attemptTurn = async (messages: import('../../packages/proxy/src/client.ts').ChatMessage[]):
-      Promise<{ turn: GameTurn | null; tc: import('../../packages/proxy/src/client.ts').ToolCall | null; aborted?: boolean }> => {
+      Promise<{ turn: GameTurn | null; tc: import('../../packages/proxy/src/client.ts').ToolCall | null; aborted?: boolean; issues?: string[]; details?: string[] }> => {
       const extractor = createProseStreamExtractor();
       let res: import('../../packages/proxy/src/client.ts').ChatResponse;
       try {
@@ -861,8 +861,10 @@ export class ChatSession {
       turn = norm.turn;
       const v = validateGameTurn(turn);
       if (!v.ok) {
-        console.log(`  ⚠ 契约失败: ${v.issues[0]}`);
-        return { turn: null, tc };
+        // 诊断：附实际字段值（供错误召回让模型自纠 + 日志可观测）
+        const details = v.issues.map((issue) => diagIssueDetail(issue, turn)).filter((d): d is string => d.length > 0);
+        console.log(`  ⚠ 契约失败: ${v.issues[0]}${details[0] ?? ''}`);
+        return { turn: null, tc, issues: v.issues, details };
       }
       return { turn, tc };
     };
@@ -871,8 +873,12 @@ export class ChatSession {
     if (first.aborted) return this.finalizeAborted(round, sentProse, pre);
     let turn = first.turn;
     if (!turn && first.tc) {
+      // 错误召回：把具体 zod issues + 实际值注入 tool result，模型才能自纠（否则复现同一错误）
+      const diag = first.issues && first.issues.length > 0
+        ? `game_turn 输出校验失败：${first.issues.join('; ')}${(first.details ?? []).join(' ')}。请严格按照上述每条要求修正后重新生成完整的 game_turn 参数。`
+        : '输出校验失败，请重新生成完整的 game_turn 参数';
       console.log('  ⚠ 首轮失败，错误召回重试一次...');
-      const retry = await attemptTurn(toolLoopMessages(assembled.messages, first.tc, '输出校验失败，请重新生成完整的 game_turn 参数'));
+      const retry = await attemptTurn(toolLoopMessages(assembled.messages, first.tc, diag));
       if (retry.aborted) return this.finalizeAborted(round, sentProse, pre);
       turn = retry.turn;
     }

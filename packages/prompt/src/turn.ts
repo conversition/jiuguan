@@ -215,10 +215,24 @@ function repairNestedJson(obj: unknown): unknown {
   return out;
 }
 
-/** 平台归一化（v2"平台做确定性的事"）：越界值自动收敛，返回警告而非硬失败 */
+/** 平台归一化（v2"平台做确定性的事"）：越界值自动收敛 + 合同字段同义词归一化，返回警告而非硬失败 */
 export function normalizeTurn(turn: GameTurn): { turn: GameTurn; warnings: string[] } {
   const warnings: string[] = [];
   const t = structuredClone(turn);
+  // state_changes.action 同义词归一化（契约只收 upsert|delete，创作型模型常写 update/set 等口语/数据库词）
+  for (const sc of t.memory_delta.state_changes ?? []) {
+    const raw = (sc as { action?: unknown }).action;
+    if (raw == null) continue;
+    const norm = ACTION_SYNONYMS[String(raw).toLowerCase()];
+    if (norm && norm !== raw) {
+      warnings.push(`memory_delta.state_changes.action "${raw}" 归一化 → ${norm}`);
+      (sc as { action: 'upsert' | 'delete' }).action = norm;
+    } else if (!norm) {
+      // 无法识别的 action 几乎都是"想写状态"（删除极少数），默认归入 upsert 保底，避免单字段 KO 整轮
+      warnings.push(`memory_delta.state_changes.action "${raw}" 无法识别，归一化 → upsert`);
+      (sc as { action: 'upsert' | 'delete' }).action = 'upsert';
+    }
+  }
   // countdown_min 超 30 → clamp（平行事件 ≤30min 规则；长行为由平台拆分子动作）
   for (const p of t.plan.parallel ?? []) {
     if (p.countdown_min > 30) {
@@ -234,6 +248,31 @@ export function normalizeTurn(turn: GameTurn): { turn: GameTurn; warnings: strin
     }
   }
   return { turn: t, warnings };
+}
+
+/** state_changes.action 同义词映射（大小写不敏感；数据库术语 ↔ 模型口语） */
+const ACTION_SYNONYMS: Record<string, 'upsert' | 'delete'> = {
+  upsert: 'upsert',
+  update: 'upsert', set: 'upsert', add: 'upsert', modify: 'upsert',
+  insert: 'upsert', put: 'upsert', write: 'upsert', create: 'upsert',
+  delete: 'delete', remove: 'delete', del: 'delete', drop: 'delete', clear: 'delete', erase: 'delete',
+};
+
+/**
+ * 契约失败诊断：沿 zod issue 的 JSON path 取出实际值（供错误召回带入 + 日志可观测性）。
+ * 例：issue `memory_delta.state_changes.0.action: Invalid option...` → `（实际值 "update"）`。
+ */
+export function diagIssueDetail(issue: string, turn: GameTurn): string {
+  const path = issue.split(':')[0].trim();
+  const segs = path.split('.').map((s) => (/^\d+$/.test(s) ? Number(s) : s) as string | number);
+  let cur: unknown = turn;
+  for (const s of segs) {
+    if (cur == null) return '';
+    cur = (cur as Record<string, unknown>)[s as string];
+  }
+  if (cur === undefined || cur === null) return '';
+  const str = JSON.stringify(cur);
+  return str.length > 120 ? `（实际值: ${str.slice(0, 120)}…）` : `（实际值: ${str}）`;
 }
 
 /** OpenAI 兼容 tools 定义（用于 API 请求 tools 字段）
