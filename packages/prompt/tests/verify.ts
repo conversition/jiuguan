@@ -81,5 +81,25 @@ check('裸 update 契约失败（未归一化）', !v7.ok, v7.issues.join(';'));
 const detail = diagIssueDetail(v7.issues[0], bad as unknown as import('../src/turn.ts').GameTurn);
 check('diag 取到实际值', detail.includes('"update"'), detail);
 
+// 8. 回归修复：缺 memory_delta 的输出不得被 safeParseTurn 放行（否则 normalizeTurn 对
+//    t.memory_delta.state_changes 解引用裸奔 TypeError 整轮 crash → 被兜底清孤儿）
+const noDelta = JSON.stringify({
+  plan: { key_events: [{ description: 'e' }], bars_delta: {}, next_plan: 'n', event_type: 'normal' },
+  prose: 'p',
+});
+check('缺 memory_delta 拒绝(不 crash)', safeParseTurn(noDelta) === null);
+
+// 9. 回归修复：normalizeTurn 对异常形态（memory_delta:null / 缺失）不再抛错，交给 zod 判契约失败
+const nullDelta = {
+  plan: { key_events: [{ description: 'e' }], bars_delta: {}, next_plan: 'n', event_type: 'normal' },
+  memory_delta: null,
+  prose: 'p',
+};
+let crashed = false;
+let nNull;
+try { nNull = normalizeTurn(nullDelta as unknown as import('../src/turn.ts').GameTurn); }
+catch { crashed = true; }
+check('normalizeTurn 容忍 memory_delta:null', !crashed && nNull.turn.memory_delta === null, crashed ? 'crash' : '');
+
 console.log(`\n结果: ${pass} passed, ${fail} failed`);
 process.exit(fail > 0 ? 1 : 0);

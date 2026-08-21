@@ -133,6 +133,19 @@ function parseStoryIndex(text: string): { content: string; branches: string[] } 
   return { content, branches: branches.slice(0, 4) };
 }
 
+/** 错误召回重试前校验工具参数是否为合法 JSON 对象：
+ *  首轮失败常因参数被流式截断/坏字符（非法 JSON），若原样塞回 assistant.tool_calls 会 400 顶掉重试；
+ *  非法则用 {} 占位（诊断文本已说明错误，模型仍可自纠）。 */
+function isValidToolArgs(args: string): boolean {
+  if (!args || !args.trim()) return false;
+  try {
+    const v = JSON.parse(args) as unknown;
+    return v !== null && typeof v === 'object' && !Array.isArray(v);
+  } catch {
+    return false;
+  }
+}
+
 /** 平台预计算 DAG 的运行上下文（runtime 注入只读句柄：检索器/扫描器/VMS） */
 interface PlatformToolCtx extends ToolContext {
   runtime: Record<string, unknown> & {
@@ -472,7 +485,7 @@ export class ChatSession {
    *  语义融合条目已由融合公式确认相关性：high 整条保留；medium 注入标题+摘要提示可展开（LLM 决定是否展开）。 */
   private gatedWorldbookBlock(focus: TurnFocus): string {
     const scan = this.turnInput.scan;
-    if (!scan || scan.activated.length === 0) return '';
+    if (!scan || !Array.isArray(scan.activated) || scan.activated.length === 0) return '';
     const relevant = scan.activated.filter((e) => {
       if (e.constant) return true;
       // 语义融合已确认相关性：high 语义条目标记（fusion 阈值高）直接保留；medium 仍需在场/场景佐证
@@ -756,7 +769,9 @@ export class ChatSession {
           const bars = c.runtime.bars as Record<string, number>;
           const ns = basename(self.dbPath).replace(/\.db$/i, ''); // PG 命名空间 = 会话 DB 基名（隔离跨卡，同会话多世界书共享）
           const hits = await c.runtime.ret!.recallAsync({ query: self.buildRecallQuery(input, bars), round, budgetTokens: 400, namespace: ns });
-          return { ok: true, data: { hits: hits.hits, raw: hits }, cost: hits.hits.length };
+          // data 必须直接是完整 RecallResult（调用方据此读 injectedBlock/codes 进装配）；包一层 {hits,raw}
+          // 会让 provider 的 turnInput.recall.injectedBlock 读到 undefined → 记忆块静默失活（0.5.0 回归）
+          return { ok: true, data: hits, cost: hits.hits.length };
         },
       },
       {
@@ -765,14 +780,14 @@ export class ChatSession {
           const round = c.runtime.round as number;
           const input = c.runtime.input as string;
           const scan = await c.runtime.scanner!.scanAsync({ text: input, seed: round, budgetTokens: 1200 });
-          return { ok: true, data: { activated: scan.activated, raw: scan }, cost: scan.activated.length };
+          return { ok: true, data: scan, cost: scan.activated.length };
         },
       },
       {
         name: 'update_variable', description: '变量求值（VMS：确定性 DSL 表达式求值）', dependencies: [], deterministic: true, sideEffects: false,
         execute(c, args) {
           const evalResult = c.runtime.vms!.evaluate();
-          return { ok: true, data: { values: evalResult.values, raw: evalResult }, cost: Object.keys(evalResult.values).length };
+          return { ok: true, data: evalResult, cost: Object.keys(evalResult.values).length };
         },
       },
       {
@@ -820,7 +835,7 @@ export class ChatSession {
     const vmsResult = toolResults.update_variable?.data as { values: Record<string, string | number | boolean> } | undefined;
     const skillBlock = renderSkillBlock(skillMatches);
     if (skillMatches.length > 0) console.log(`[Skill] 命中 ${skillMatches.map((m) => `${m.skill.name}(${m.score.toFixed(2)})`).join(', ')}`);
-    console.log(`[预计算] 检索 ${recall?.hits.length ?? 0} 条 / 世界书 ${scan?.activated.length ?? 0} 条 / 变量 ${Object.keys(vmsResult?.values ?? {}).length} 个 / 窗口 ${windowInfo.messages.length} 条 ${windowInfo.tokens}t${windowInfo.truncated ? '（截断）' : ''}`);
+    console.log(`[预计算] 检索 ${recall?.hits?.length ?? 0} 条 / 世界书 ${scan?.activated?.length ?? 0} 条 / 变量 ${Object.keys(vmsResult?.values ?? {}).length} 个 / 窗口 ${windowInfo.messages.length} 条 ${windowInfo.tokens}t${windowInfo.truncated ? '（截断）' : ''}`);
 
     // ② 装配（L1/L2：焦点 → 依赖激活 → 全局预算调度 → 各槽位片段）
     const variableValues = { ...(vmsResult?.values ?? {}), ...(this.bridge?.getFlat() ?? {}) };
@@ -905,7 +920,9 @@ export class ChatSession {
         ? `game_turn 输出校验失败：${first.issues.join('; ')}${(first.details ?? []).join(' ')}。请严格按照上述每条要求修正后重新生成完整的 game_turn 参数。`
         : '输出校验失败，请重新生成完整的 game_turn 参数';
       console.log('  ⚠ 首轮失败，错误召回重试一次...');
-      const retry = await attemptTurn(toolLoopMessages(assembled.messages, first.tc, diag));
+      // 非法工具参数才回填 {}（safeParse 已失败=参数坏）；可解析参数保留原文供模型自查
+      const retryTc = isValidToolArgs(first.tc.arguments) ? first.tc : { ...first.tc, arguments: '{}' };
+      const retry = await attemptTurn(toolLoopMessages(assembled.messages, retryTc, diag));
       if (retry.aborted) return this.finalizeAborted(round, sentProse, pre);
       turn = retry.turn;
     }

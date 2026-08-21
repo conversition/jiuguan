@@ -171,7 +171,12 @@ export function safeParseTurn(args: string): GameTurn | null {
     try {
       const parsed = JSON.parse(a) as unknown;
       const repaired = repairNestedJson(parsed);
-      if (repaired && typeof repaired === 'object' && 'plan' in (repaired as object)) return repaired as GameTurn;
+      // 三顶层键必须齐全才放行：只认 plan 会放过缺失 memory_delta/prose 的输出，
+      // 让 normalizeTurn 对 t.memory_delta.state_changes 解引用裸奔（TypeError 整轮 crash）
+      if (repaired && typeof repaired === 'object'
+        && 'plan' in (repaired as object) && 'memory_delta' in (repaired as object) && 'prose' in (repaired as object)) {
+        return repaired as GameTurn;
+      }
     } catch { /* 继续下一个尝试 */ }
   }
   return null;
@@ -219,8 +224,9 @@ function repairNestedJson(obj: unknown): unknown {
 export function normalizeTurn(turn: GameTurn): { turn: GameTurn; warnings: string[] } {
   const warnings: string[] = [];
   const t = structuredClone(turn);
-  // state_changes.action 同义词归一化（契约只收 upsert|delete，创作型模型常写 update/set 等口语/数据库词）
-  for (const sc of t.memory_delta.state_changes ?? []) {
+  // 防御：safeParse 已保证三键存在，但值可能为 null/非对象（如 memory_delta: null、plan: 数组），
+  // 可选链兜底，缺失字段按空处理交给后续 zod 校验判契约失败，绝不在此裸奔 TypeError
+  for (const sc of (t.memory_delta?.state_changes ?? [])) {
     const raw = (sc as { action?: unknown }).action;
     if (raw == null) continue;
     const norm = ACTION_SYNONYMS[String(raw).toLowerCase()];
@@ -234,14 +240,14 @@ export function normalizeTurn(turn: GameTurn): { turn: GameTurn; warnings: strin
     }
   }
   // countdown_min 超 30 → clamp（平行事件 ≤30min 规则；长行为由平台拆分子动作）
-  for (const p of t.plan.parallel ?? []) {
+  for (const p of (t.plan?.parallel ?? [])) {
     if (p.countdown_min > 30) {
       warnings.push(`parallel.${p.actor}.countdown_min ${p.countdown_min} 超限，平台收敛至 30（长行为应拆分子动作）`);
       p.countdown_min = 30;
     }
   }
   // bars_delta 收敛到 [-100, 100]
-  for (const [k, v] of Object.entries(t.plan.bars_delta ?? {})) {
+  for (const [k, v] of Object.entries(t.plan?.bars_delta ?? {})) {
     if (typeof v === 'number' && (v > 100 || v < -100)) {
       warnings.push(`bars_delta.${k} ${v} 超限，收敛至 ${Math.max(-100, Math.min(100, v))}`);
       (t.plan.bars_delta as Record<string, number>)[k] = Math.max(-100, Math.min(100, v));
