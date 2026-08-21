@@ -37,6 +37,7 @@ import { executeRules, formatVarDelta, bareVarName } from '../../packages/variab
 import type { RuleEffect } from '../../packages/variable/src/rules.ts';
 import type { VariableManifestRule, VariableManifest } from '../../packages/variable/src/manifest.ts';
 import { assembleTurn, DEFAULT_SYSTEM_CORE, estimateTokens } from '../../packages/prompt/src/assembly.ts';
+import { KeyAnchorDetector, type KeyAnchor } from '../../packages/prompt/src/key-anchor-detector.ts';
 import { validateGameTurn, safeParseTurn, normalizeTurn, createProseStreamExtractor, diagIssueDetail } from '../../packages/prompt/src/turn.ts';
 import type { GameTurn } from '../../packages/prompt/src/turn.ts';
 import { OpenAICompatibleClient, toolLoopMessages, AbortTurnError } from '../../packages/proxy/src/client.ts';
@@ -1239,8 +1240,11 @@ export class ChatSession {
       chars += line.length;
     }
     if (lines.length === 0) return;
+    // 锚点检测：在滚动压缩前识别「不可丢弃」信息（实体首次出现/情感突变/目标声明/世界书触发点），
+    // 即使窗口滑过也借新 longterm 保留（B1）。按累积滑出块新建实例，块内同名实体只记首次。
+    const anchorBlock = this.anchorBlockFor(rows);
     const oldLong = this.getLongTermBlock();
-    const prompt = `以下是从对话窗口中滑出的近期剧情（按时间正序）：\n\n${lines.join('\n')}\n\n${oldLong ? `旧的长期摘要：\n${oldLong}\n\n` : ''}请输出合并去重后的新长期摘要，聚焦：角色关系、当前处境与目标、关键事件、未解决伏笔、已获物品/技能。要求：正文 ≤500 字，不含任何 XML/标签。`;
+    const prompt = `以下是从对话窗口中滑出的近期剧情（按时间正序）：\n\n${lines.join('\n')}\n\n${anchorBlock ? `${anchorBlock}\n\n` : ''}${oldLong ? `旧的长期摘要：\n${oldLong}\n\n` : ''}请输出合并去重后的新长期摘要，聚焦：角色关系、当前处境与目标、关键事件、未解决伏笔、已获物品/技能。要求：正文 ≤500 字，不含任何 XML/标签；若上面给出「不可丢弃锚点」，必须确保其中的实体关系、目标与关键事件被纳入摘要。`;
     let summary = '';
     try {
       const res = await this.client.complete({
@@ -1261,6 +1265,23 @@ export class ChatSession {
     while (estimateTokens(kept) > this.longtermTokens && kept.length > 80) kept = kept.slice(0, Math.floor(kept.length * 0.8));
     this.mem.db.prepare('UPDATE memory_meta SET longterm = ?, summary_round = ? WHERE id = 1').run(kept, round);
     console.log(`[摘要] 滚动压缩 ${lines.length} 条旧文 → ${kept.length} 字（第 ${round} 轮触发）`);
+  }
+
+  /** 对滑出窗口的旧文跑关键锚点检测，格式化为「不可丢弃锚点」提示块（无锚点返回空串）。
+   *  锚点并入 longterm：实体首次出现/情感突变/目标声明/世界书触发点即使窗口滑过也不丢。 */
+  private anchorBlockFor(rows: { role: string; content: string }[]): string {
+    const detector = new KeyAnchorDetector();
+    const anchors = detector.detect(rows.map((r) => ({ role: r.role as 'user' | 'assistant', content: r.content, round: 0 })));
+    if (anchors.length === 0) return '';
+    const byType: Record<string, string[]> = {};
+    for (const a of anchors) {
+      const label: Record<KeyAnchor['type'], string> = {
+        entity: '实体', emotion: '情感变化', goal: '目标声明', worldbook: '世界书触发',
+      };
+      (byType[label[a.type]] ??= []).push(a.text.slice(0, 30));
+    }
+    const lines = Object.entries(byType).map(([k, v]) => `- ${k}: ${[...new Set(v)].join('、')}`);
+    return `<不可丢弃锚点>\n${lines.join('\n')}\n</不可丢弃锚点>`;
   }
 
   // ── 剧情分支索引（AI 生成，按轮缓存；帮助玩家决定下一步，减轻思考负担）──
