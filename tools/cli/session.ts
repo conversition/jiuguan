@@ -467,18 +467,30 @@ export class ChatSession {
     ].filter(Boolean).join('\n');
   }
 
-  /** 世界书条件化门控：按在场实体/场景过滤已扫描条目（只注入相关条目；恒常条目保留） */
+  /** 世界书条件化门控：按在场实体/场景过滤已扫描条目（只注入相关条目；恒常条目保留）。
+   *  语义融合条目已由融合公式确认相关性：high 整条保留；medium 注入标题+摘要提示可展开（LLM 决定是否展开）。 */
   private gatedWorldbookBlock(focus: TurnFocus): string {
     const scan = this.turnInput.scan;
     if (!scan || scan.activated.length === 0) return '';
     const relevant = scan.activated.filter((e) => {
       if (e.constant) return true;
+      // 语义融合已确认相关性：high 语义条目标记（fusion 阈值高）直接保留；medium 仍需在场/场景佐证
+      if (e.matchType === 'semantic') {
+        return e.priority === 'high' || focus.present.some((p) => `${e.comment} ${e.content}`.includes(p));
+      }
       const text = `${e.comment} ${e.content}`;
       return focus.present.some((p) => text.includes(p))
         || (focus.scene.length > 0 && text.includes(focus.scene));
     });
     if (relevant.length === 0) return '';
-    return relevant.map((e) => `[${e.constant ? '恒定' : e.matchType}] ${e.comment}: ${e.content.slice(0, 200)}`).join('\n');
+    return relevant.map((e) => {
+      // medium 语义：注入标题 + 摘要而非完整内容（LLM 决定是否展开）；其余注入完整
+      const content = e.matchType === 'semantic' && e.priority === 'medium'
+        ? `${e.content.slice(0, 100)}…(可展开)`
+        : e.content;
+      const tag = e.constant ? '恒定' : e.matchType;
+      return `[${tag}] ${e.comment}: ${content.slice(0, 200)}`;
+    }).join('\n');
   }
 
   /** 回合上下文调度：L1 激活（beginTurn）→ 收集激活块 → L2 全局预算裁剪 → 各槽位片段 */
@@ -599,14 +611,28 @@ export class ChatSession {
     // 语义向量化（bge；失败回落 hash）+ PG 真向量检索（可选，缺连优雅回落）
     if (vectorizable && this.args.useBge) {
       onStage?.('vectorize');
+      // 注入 embedding provider 到检索器 + 世界书语义激活器（同一 bge 模型，不重复编码）
+      let wbProvider: import('../../packages/memory/src/embedding.ts').EmbeddingProvider | null = null;
       try {
         const provider = await createEmbeddingProvider(true);
         this.ret.setEmbeddingProvider(provider);
+        wbProvider = provider;
         const vr = await new Vectorizer(this.mem, provider).run({ sources: ['lore'], batchSize: 32, incremental: true });
         console.log(`[向量] ${provider.name} 向量化 ${vr.vectorized} 条（语义激活）`);
       } catch (e) {
         this.ret.setEmbeddingProvider(new HashEmbeddingProvider());
         console.warn(`[向量] 失败，回落 hash: ${(e as Error).message.slice(0, 60)}`);
+      }
+      // 世界书整条目语义激活：复用 Vectorizer 已落库的 vec_memory 整条目向量，不重复编码。
+      // 向量/编码缺失时扫描器自动降级为纯关键词/正则（基础功能不中断）。
+      if (wbProvider) {
+        try {
+          this.scanner.setEmbeddingProvider(wbProvider);
+          this.scanner.initSemantic(this.mem);
+          console.log(`[世界书·语义] 整条目语义索引就绪（${this.scanner.isSemanticReady() ? '开' : '降级'}）`);
+        } catch (e) {
+          console.warn(`[世界书·语义] 语义索引初始化失败，降级关键词: ${(e as Error).message.slice(0, 60)}`);
+        }
       }
       // PG pgvector 真向量/别名检索通道（同一 bge model）；缺连优雅回落 SQLite 检索
       try {
@@ -733,11 +759,11 @@ export class ChatSession {
         },
       },
       {
-        name: 'worldbook_activate', description: '世界书扫描（正则/关键词命中 + 概率门）', dependencies: [], deterministic: true, sideEffects: false,
-        execute(c, args) {
+        name: 'worldbook_activate', description: '世界书扫描（正则/关键词命中 + 概率门 + 整条目语义融合召回）', dependencies: [], deterministic: false, sideEffects: false,
+        async execute(c, args) {
           const round = c.runtime.round as number;
           const input = c.runtime.input as string;
-          const scan = c.runtime.scanner!.scan({ text: input, seed: round, budgetTokens: 1200 });
+          const scan = await c.runtime.scanner!.scanAsync({ text: input, seed: round, budgetTokens: 1200 });
           return { ok: true, data: { activated: scan.activated, raw: scan }, cost: scan.activated.length };
         },
       },
