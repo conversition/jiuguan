@@ -5,5 +5,7 @@ export { parseWorldBook, entryToLorebookRow, cardBookToLorebookRows } from './wo
 export type { WorldBook, ParsedWorldBook } from './worldbook.ts';
 export { LorebookScanner, parseRegexFromString, matchKey } from './scanner.ts';
 export type { LoreRow, ScanOptions, ScanResult, ActivatedEntry } from './scanner.ts';
+export { SemanticWorldbookActivator, defaultActivatorOptions } from './worldbook/index.ts';
+export type { ActivationContext, SemanticEntry, SemanticActivation, SemanticActivatorOptions, SemanticIndexStatus } from './worldbook/index.ts';
 export { listSkills, addSkill, setSkillEnabled, deleteSkill, findSkill, readSkillBody, matchSkills, renderSkillBlock, parseSkillMd, renderSkillMd } from './skills.ts';
 export type { SkillInfo, SkillMatch } from './skills.ts';

@@ -5,7 +5,10 @@
  * 输出：激活条目 → L1 静态设定注入块（含预算截断）
  */
 import { MemoryDb } from '../../memory/src/db.ts';
+import type { EmbeddingProvider } from '../../memory/src/embedding.ts';
 import { estimateTokens } from '../../prompt/src/assembly.ts';
+import { SemanticWorldbookActivator } from './worldbook/semantic-activator.ts';
+import type { ActivationContext } from './worldbook/types.ts';
 
 export interface LoreRow {
   id: number;
@@ -45,9 +48,12 @@ export interface ActivatedEntry {
   comment: string;
   content: string;
   constant: boolean;
-  matchType: 'constant' | 'keyword' | 'regex';
+  matchType: 'constant' | 'keyword' | 'regex' | 'semantic';
   score: number;
   order: number;
+  /** 融合激活附加信息（语义激活条目；向后兼容可选） */
+  priority?: 'high' | 'medium';
+  triggeredBy?: { keyword: number; semantic: number; entity: number; probability: number };
 }
 
 export interface ScanResult {
@@ -59,6 +65,8 @@ export interface ScanResult {
     keywordMatched: number;
     probabilityDropped: number;
     tokens: number;
+    /** 语义补充激活条数（融合召回；0 表示未启用/降级） */
+    semanticAdded?: number;
   };
 }
 
@@ -112,10 +120,72 @@ function mulberry32(seed: number): () => number {
 }
 
 export class LorebookScanner {
+  /** 语义激活器（整条目向量 + 多信号融合；缺省 null = 纯关键词/正则模式） */
+  private semantic: SemanticWorldbookActivator | null = null;
+
   constructor(private mem: MemoryDb) {}
 
-  /** 主入口：扫描并激活条目 */
+  /** 注入编码 provider 并启用语义激活（缺省则不启用，扫描走纯关键词/正则） */
+  setEmbeddingProvider(provider: EmbeddingProvider): void {
+    this.semantic = new SemanticWorldbookActivator();
+    this.semantic.setEmbeddingProvider(provider);
+  }
+
+  /** 预载世界书整条目语义索引（从 vec_memory 读取已编码整条目向量，不重复编码）。
+   *  编码/向量缺失时自动降级为纯关键词/正则。 */
+  initSemantic(mem: MemoryDb): void {
+    if (this.semantic) this.semantic.loadFromVecMemory(mem);
+  }
+
+  /** 是否已启用语义激活 */
+  isSemanticReady(): boolean {
+    return this.semantic?.isReady() ?? false;
+  }
+
+  /** 主入口：扫描并激活条目（纯关键词/正则/概率/常驻，同步确定性路径） */
   scan(opts: ScanOptions): ScanResult {
+    const result = this.runScan(opts);
+    return { ...result, stats: { ...result.stats, semanticAdded: 0 } };
+  }
+
+  /**
+   * 语义增强扫描（异步）：在【确定性触发】基础上并入【语义补充召回】。
+   * 设计（决策 A）：关键词/正则/常驻命中保证激活、不过模糊阈值；语义融合只在「未被确定性命中」的
+   * 条目中做补充（防漏触发：同义词/表述差异/语义相近但字面不同）。融合公式 = 加权线性 + sigmoid。
+   */
+  async scanAsync(opts: ScanOptions): Promise<ScanResult> {
+    const base = this.runScan(opts);
+    if (!this.semantic || !this.semantic.isReady()) {
+      return { ...base, stats: { ...base.stats, semanticAdded: 0 } };
+    }
+    const deterministicIds = new Set(base.activated.map((e) => e.id));
+    const text = opts.text;
+    const context: ActivationContext = { currentInput: text, activeEntities: this.activeEntitiesOf(text) };
+    const fusion = await this.semantic.activate(context);
+    const supplements: ActivatedEntry[] = [];
+    for (const s of fusion) {
+      if (deterministicIds.has(s.entryId)) continue;
+      const row = this.mem.db.prepare('SELECT * FROM lorebook_entry WHERE id = ?').get(s.entryId) as unknown as LoreRow | undefined;
+      if (!row) continue;
+      // 语义补充不重复应用确定性概率门（概率已作为融合信号计入得分，避免双重过滤）
+      supplements.push({
+        id: row.id, uid: row.uid, comment: row.comment, content: row.content,
+        constant: false, matchType: 'semantic', score: s.score, order: 2,
+        priority: s.priority, triggeredBy: s.triggeredBy,
+      });
+    }
+
+    const merged = [...base.activated, ...supplements];
+    const final = this.finalize(merged, opts.budgetTokens ?? 800);
+    return {
+      activated: final,
+      injectedBlock: this.renderBlock(final),
+      stats: { ...base.stats, semanticAdded: supplements.length, tokens: base.stats.tokens },
+    };
+  }
+
+  /** 确定性命中判定 + 排序/预算截断共享管线 */
+  private runScan(opts: ScanOptions): ScanResult {
     const rows = this.mem.db.prepare('SELECT * FROM lorebook_entry WHERE active = 1').all() as LoreRow[];
     const text = opts.text;
     const scanText = [text, ...(opts.history ?? [])].join('\n');
@@ -166,9 +236,14 @@ export class LorebookScanner {
       });
     }
 
-    // 5. 排序（常量优先 + 原始顺序）后预算截断（首条超预算时截断内容而非整条塞入；后续超限条目跳过，小条目仍可保留）
+    const final = this.finalize(activated, opts.budgetTokens ?? 800);
+    stats.tokens = final.reduce((acc, e) => acc + estimateTokens(e.content), 0);
+    return { activated: final, injectedBlock: this.renderBlock(final), stats };
+  }
+
+  /** 排序（常量/副词条优先 + 原始顺序）后预算截断 */
+  private finalize(activated: ActivatedEntry[], budget: number): ActivatedEntry[] {
     activated.sort((a, b) => a.order - b.order || a.id - b.id);
-    const budget = opts.budgetTokens ?? 800;
     const final: ActivatedEntry[] = [];
     let used = 0;
     for (const e of activated) {
@@ -186,9 +261,12 @@ export class LorebookScanner {
       used += cost;
       final.push(e);
     }
-    stats.tokens = used;
+    return final;
+  }
 
-    return { activated: final, injectedBlock: this.renderBlock(final), stats };
+  /** 在场实体（2-8 字连续段，去标点，限 6 个），用于语义融合实体重叠信号 */
+  private activeEntitiesOf(text: string): Set<string> {
+    return new Set(text.split(/[，。！？、,.!?\s]+/).filter((s) => s.length >= 2 && s.length <= 8).slice(0, 6));
   }
 
   /** L1 注入块渲染 */
