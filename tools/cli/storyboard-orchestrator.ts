@@ -126,6 +126,8 @@ export interface StoryboardRunOptions {
   recallQuery?: string;
   /** 额外上下文（导演模式：选中文本所在消息+前后邻近消息；注入各阶段 sys，对齐"L6 选中文本上下文"） */
   extraContext?: string;
+  /** PG 命名空间（导演模式：= 会话 DB 基名，与回合检索同命名空间隔离，缺省空=默认库） */
+  namespace?: string;
 }
 
 export interface StoryboardResult {
@@ -153,7 +155,7 @@ export class StoryboardOrchestrator {
     onStage?.('召回', '批量轮次召回（剧情 RAG ∥ 世界书 ∥ 分镜 Skill）');
     const recallQuery = opts.recallQuery ?? sceneInput.slice(0, 24);
     const [recall, scan, skillMatches] = await Promise.all([
-      this.deps.ret.recallAsync({ query: recallQuery, round: this.deps.round, budgetTokens: 400 }),
+      this.deps.ret.recallAsync({ query: recallQuery, round: this.deps.round, budgetTokens: 400, namespace: opts.namespace }),
       Promise.resolve(this.deps.scanner.scan({ text: sceneInput, seed: this.deps.round, budgetTokens: 1200 })),
       Promise.resolve(matchSkills(sceneInput)),
     ]);

@@ -52,6 +52,8 @@ import { scheduleContext, shrinkToBudget } from '../../packages/prompt/src/conte
 import type { ContextBlock } from '../../packages/prompt/src/context-scheduler.ts';
 import { resolveAsset, listAssets } from '../../packages/core/src/asset-paths.ts';
 import type { AssetKind } from '../../packages/core/src/asset-paths.ts';
+import { StoryboardOrchestrator } from './storyboard-orchestrator.ts';
+import type { StoryboardResult } from './storyboard-orchestrator.ts';
 
 /** 资产解析（用户层 data/{presets,worldbooks} 优先于 剧本方案 源目录，编辑器 P2） */
 function resolveAssetFile(kind: AssetKind, file: string): string | null {
@@ -79,6 +81,24 @@ export interface SessionArgs {
   preset?: string;
   /** 预设块勾选覆盖 {块索引: 启用?}（启动流程审查 P0：UI 勾选 → 会话入参） */
   presetOverrides?: Record<string, boolean>;
+}
+
+/** 导演模式入参（POST /api/session/:id/director 请求体对齐：选区定位 + 分镜偏好） */
+export interface DirectorParams {
+  /** 用户选中的台词/剧本片段（必填） */
+  selectedText: string;
+  /** 选中文本所在消息的轮次（用于上下文定位，≥0） */
+  round?: number;
+  /** 消息角色（assistant/user，信息性） */
+  role?: string;
+  /** 前端消息 id（信息性，备用定位） */
+  messageId?: number;
+  /** 生成镜数（1-30，缺省 9） */
+  shots?: number;
+  /** 导演之声（6 选一，缺省由 Stage0 自选） */
+  voice?: string;
+  /** 分镜工作流（cinematic-default 等，缺省默认） */
+  workflow?: string;
 }
 
 function parseArgs(argv: string[]): SessionArgs {
@@ -1366,6 +1386,48 @@ ${context}`;
     const parsed = parseStoryIndex(content);
     console.log(`[剧情索引] round ${round} AI 生成 ${parsed.branches.length} 个分支`);
     return { ...parsed, round, fromCache: false };
+  }
+
+  // ── 导演模式（对话内选区 → 复用本会话真实上下文跑分镜管线；结果落 memory_state 可检索）──
+
+  async directorRun(
+    params: DirectorParams,
+    onStage?: (label: string, detail?: string) => void,
+  ): Promise<StoryboardResult> {
+    const text = params.selectedText.trim();
+    if (!text) throw new Error('选中文本为空');
+    // 检索 query：与会话回合同款增强（压缩摘要 + 完整选中文本 + 在场实体 + 推进槽），带 PG 命名空间隔离
+    const meta = this.getMeta();
+    const bars = meta ? JSON.parse(meta.bars ?? '{}') as Record<string, number> : {};
+    const recallQuery = this.buildRecallQuery(text, bars);
+    // extraContext：选中消息所在轮次之前的近期原文（buildChatWindow，对齐"L6 选中文本上下文"）
+    const maxRound = Number.isInteger(params.round) && (params.round ?? 0) > 0 ? (params.round as number) : this.round;
+    const window = this.buildChatWindow(maxRound);
+    const ctx = [
+      window.messages.length > 0
+        ? `【近期剧情（至第 ${maxRound} 轮）】\n${window.messages.map((m) => `${m.role === 'user' ? '玩家' : '角色'}: ${m.content}`).join('\n')}`
+        : '',
+      `【用户选中片段】\n${text}`,
+    ].filter(Boolean).join('\n\n');
+    const orch = new StoryboardOrchestrator({
+      client: this.client,
+      ret: this.ret,
+      scanner: this.scanner,
+      vms: this.vms,
+      mem: this.mem,
+      cardName: this.cardName || '导演分镜',
+      round: this.round,
+    });
+    const ns = basename(this.dbPath).replace(/\.db$/i, '');
+    return orch.run(text, {
+      mode: 'batch',
+      shotCount: Math.min(30, Math.max(1, Number(params.shots ?? 9))),
+      workflow: params.workflow,
+      voice: params.voice,
+      recallQuery,
+      extraContext: ctx.slice(0, 6000),
+      namespace: ns,
+    }, onStage);
   }
 }
 

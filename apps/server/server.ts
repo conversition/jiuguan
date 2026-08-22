@@ -21,6 +21,8 @@ import { parsePreset } from '../../packages/core/src/preset.ts';
 import { parseCharaCard, extractCharaFromPng, pngPayloadToJson, buildCharaPng } from '../../packages/core/src/chara.ts';
 import { RegexLibrary } from '../../packages/core/src/regex-library.ts';
 import { StoryboardOrchestrator, StoryboardRegistry, DEFAULT_WORKFLOW } from '../../tools/cli/storyboard-orchestrator.ts';
+import type { StoryboardResult } from '../../tools/cli/storyboard-orchestrator.ts';
+import { renderDirectorMarkdown } from '../../packages/prompt/src/storyboard.ts';
 import { OpenAICompatibleClient } from '../../packages/proxy/src/client.ts';
 import { RetrievalEngine } from '../../packages/memory/src/retrieval.ts';
 import { HashEmbeddingProvider, createEmbeddingProvider } from '../../packages/memory/src/embedding.ts';
@@ -125,6 +127,41 @@ function readSessionMeta(dbPath: string): { card: string; preview: string; round
       .replace(/\s+/g, ' ').trim();
     return { card: cfg.card ?? '', preview: last?.content ? strip(last.content).slice(0, 42) : '', round: r?.m ?? 0 };
   } catch { return { card: '', preview: '', round: 0 }; }
+}
+
+/** 分镜完成载荷（/api/storyboard/run 与 /api/session/:id/director 共用；含下载用全量 Markdown，探窗展示/下载复用） */
+function storyboardDonePayload(
+  result: StoryboardResult,
+  opts: { sceneName?: string; directorSource?: string } = {},
+): Record<string, unknown> {
+  return {
+    type: 'done',
+    passed: result.passed,
+    voice: result.directorsRead?.voice ?? '',
+    intention: result.directorsRead?.intention ?? '',
+    panels: result.panels.map((p) => ({
+      panel: p.panel, time: p.time, shot_size: p.shot_size, angle: p.angle,
+      transition_hint: p.transition_hint, positive_prompt_short: p.positive_prompt_short,
+    })),
+    sequence: result.sequence ? {
+      master_prompt: result.sequence.master_prompt.slice(0, 400), narrative: result.sequence.narrative.slice(0, 400),
+      consistency: result.sequence.consistency.slice(0, 200), sfx: result.sequence.sfx.slice(0, 200),
+    } : null,
+    humanized: result.humanized?.summary ?? '',
+    validation: result.validation,
+    errors: result.errors.slice(0, 12),
+    warnings: result.warnings.slice(0, 12),
+    markdown: renderDirectorMarkdown({
+      sceneName: opts.sceneName,
+      directorSource: opts.directorSource,
+      voice: result.directorsRead?.voice ?? '',
+      intention: result.directorsRead?.intention ?? '',
+      panels: result.panels,
+      sequence: result.sequence,
+      humanized: result.humanized,
+      validation: result.validation,
+    }),
+  };
 }
 
 const server = createServer(async (req, res) => {
@@ -892,24 +929,38 @@ const server = createServer(async (req, res) => {
           },
           (label, detail) => sseSend(res, { type: 'stage', label, detail: detail ?? '' }),
         );
-        sseSend(res, {
-          type: 'done',
-          passed: result.passed,
-          voice: result.directorsRead?.voice ?? '',
-          intention: result.directorsRead?.intention ?? '',
-          panels: result.panels.map((p) => ({
-            panel: p.panel, time: p.time, shot_size: p.shot_size, angle: p.angle,
-            transition_hint: p.transition_hint, positive_prompt_short: p.positive_prompt_short,
-          })),
-          sequence: result.sequence ? {
-            master_prompt: result.sequence.master_prompt.slice(0, 400), narrative: result.sequence.narrative.slice(0, 400),
-            consistency: result.sequence.consistency.slice(0, 200), sfx: result.sequence.sfx.slice(0, 200),
-          } : null,
-          humanized: result.humanized?.summary ?? '',
-          validation: result.validation,
-          errors: result.errors.slice(0, 12),
-          warnings: result.warnings.slice(0, 12),
-        });
+        sseSend(res, storyboardDonePayload(result, { sceneName: `分镜「${scene.slice(0, 20)}」` }));
+      } catch (e) {
+        sseSend(res, { type: 'error', message: (e as Error).message.slice(0, 200) });
+      }
+      res.end();
+      return;
+    }
+
+    // ── 导演模式（对话内选区触发：选中文本 → 复用会话真实记忆/世界书/变量跑分镜管线，SSE 阶段进度 + done）
+    // 与 /api/storyboard/run 同引擎，但上下文来自本会话（非空库）；结果落 memory_state(storyboard) 可检索 + 探窗展示/下载
+    if (method === 'POST' && p.startsWith('/api/session/') && p.endsWith('/director')) {
+      const id = p.split('/')[3];
+      const session = sessions.get(id);
+      if (!session) return json(res, { error: '会话不存在' }, 404);
+      const body = await readBody(req);
+      const selectedText = (body.selectedText ?? '').toString().trim();
+      if (!selectedText) return json(res, { error: '选中文本为空' }, 400);
+      sse(res);
+      try {
+        const result = await session.directorRun({
+          selectedText,
+          round: Number(body.round) || undefined,
+          role: typeof body.role === 'string' ? body.role : undefined,
+          messageId: Number(body.messageId) || undefined,
+          shots: Number(body.shots) || undefined,
+          voice: typeof body.voice === 'string' && body.voice ? body.voice : undefined,
+          workflow: typeof body.workflow === 'string' && body.workflow ? body.workflow : undefined,
+        }, (label, detail) => sseSend(res, { type: 'stage', label, detail: detail ?? '' }));
+        sseSend(res, storyboardDonePayload(result, {
+          sceneName: `导演分镜「${selectedText.slice(0, 10)}…」`,
+          directorSource: selectedText.slice(0, 120),
+        }));
       } catch (e) {
         sseSend(res, { type: 'error', message: (e as Error).message.slice(0, 200) });
       }
