@@ -122,6 +122,10 @@ export interface StoryboardRunOptions {
   shotCount: number;
   workflow?: string;
   voice?: string;
+  /** 检索 query 覆盖（导演模式：选用会话 buildRecallQuery 增强后的 query，而非 sceneInput 前24字） */
+  recallQuery?: string;
+  /** 额外上下文（导演模式：选中文本所在消息+前后邻近消息；注入各阶段 sys，对齐"L6 选中文本上下文"） */
+  extraContext?: string;
 }
 
 export interface StoryboardResult {
@@ -145,15 +149,17 @@ export class StoryboardOrchestrator {
   async run(sceneInput: string, opts: StoryboardRunOptions, onStage?: (label: string, detail?: string) => void): Promise<StoryboardResult> {
     const wf = this.registry.get(opts.workflow ?? DEFAULT_WORKFLOW);
 
-    // ① 批量召回（剧情记忆 ∥ 世界书 ∥ 分镜 Skill 并行）
+    // ① 批量召回（剧情记忆 ∥ 世界书 ∥ 分镜 Skill 并行；导演模式用会话增强 query 而非 sceneInput 前24字）
     onStage?.('召回', '批量轮次召回（剧情 RAG ∥ 世界书 ∥ 分镜 Skill）');
+    const recallQuery = opts.recallQuery ?? sceneInput.slice(0, 24);
     const [recall, scan, skillMatches] = await Promise.all([
-      this.deps.ret.recallAsync({ query: sceneInput.slice(0, 24), round: this.deps.round, budgetTokens: 400 }),
+      this.deps.ret.recallAsync({ query: recallQuery, round: this.deps.round, budgetTokens: 400 }),
       Promise.resolve(this.deps.scanner.scan({ text: sceneInput, seed: this.deps.round, budgetTokens: 1200 })),
       Promise.resolve(matchSkills(sceneInput)),
     ]);
     const skillBlock = renderMatches(skillMatches);
     const anchors = this.anchorBlock();
+    const ctxBlock = opts.extraContext ? `【选中文本上下文】\n${opts.extraContext}\n` : '';
 
     // ② 逐阶段执行
     let validation: { stage: string; errors: string[]; warnings: string[] }[] = [];
@@ -172,16 +178,16 @@ export class StoryboardOrchestrator {
       const skillBody = stage.skill ? readSkillBody(stage.skill) : '';
       if (stage.key === 'read') {
         onStage?.(stage.label);
-        directorsRead = await this.genDirectorsRead(sceneInput, recall.injectedBlock, scan.injectedBlock, skillBlock, skillBody, opts.voice ?? '');
+        directorsRead = await this.genDirectorsRead(sceneInput, recall.injectedBlock, scan.injectedBlock, skillBlock, skillBody, opts.voice ?? '', anchors, ctxBlock);
       } else if (stage.key === 'shots') {
         onStage?.(stage.label, `${opts.mode === 'shot' ? '单镜接力' : `批量 ${opts.shotCount} 镜`}`);
-        panels = await this.genPanels(sceneInput, opts, directorsRead, recall.injectedBlock, scan.injectedBlock, anchors, skillBlock, skillBody);
+        panels = await this.genPanels(sceneInput, opts, directorsRead, recall.injectedBlock, scan.injectedBlock, anchors, skillBlock, skillBody, ctxBlock);
       } else if (stage.key === 'link') {
         onStage?.(stage.label);
-        if (panels.length > 0) sequence = await this.genSequence(panels, directorsRead, anchors, skillBlock, skillBody);
+        if (panels.length > 0) sequence = await this.genSequence(panels, directorsRead, anchors, skillBlock, skillBody, ctxBlock);
       } else if (stage.key === 'humanize') {
         onStage?.(stage.label);
-        if (directorsRead && sequence) humanized = await this.genHumanize(directorsRead, sequence, skillBody);
+        if (directorsRead && sequence) humanized = await this.genHumanize(directorsRead, sequence, skillBody, ctxBlock);
       }
     }
 
@@ -197,10 +203,11 @@ export class StoryboardOrchestrator {
 
   // ── Stage 0 导演读本 ──
   private async genDirectorsRead(
-    sceneInput: string, recallBlock: string, worldbookBlock: string, skillBlock: string, skillBody: string, voice: string,
+    sceneInput: string, recallBlock: string, worldbookBlock: string, skillBlock: string, skillBody: string,
+    voice: string, anchors: string, ctxBlock: string,
   ): Promise<DirectorsRead | null> {
-    const sys = `你是一位商用级电影分镜导演。\n\n${skillBody}\n\n【已发生剧情氛围（召回）】\n${recallBlock || '（无历史召回）'}\n\n【场景背景（世界书激活）】\n${worldbookBlock || '（无激活条目）'}\n\n${skillBlock}`;
-    const usr = `场景输入：\n${sceneInput}${voice ? `\n\n调用方已指定导演之声「${voice}」，直接采用并简要说明为何适合。` : '\n\n从 6 种导演之声选一（观察自然主义/古典构图/动态visceral/表现主义/亲密极简/图形形式主义）。'}`;
+    const sys = `你是一位商用级电影分镜导演。\n\n${skillBody}\n\n【已发生剧情氛围（召回）】\n${recallBlock || '（无历史召回）'}\n\n【场景背景（世界书激活）】\n${worldbookBlock || '（无激活条目）'}\n\n【跨镜锚点 — 读本阶段即锁定，后续各镜禁止漂移】\n${anchors}\n\n${ctxBlock}${skillBlock}`;
+    const usr = `场景输入（用户选中的剧本片段）：\n${sceneInput}${voice ? `\n\n调用方已指定导演之声「${voice}」，直接采用并简要说明为何适合。` : '\n\n从 6 种导演之声选一（观察自然主义/古典构图/动态visceral/表现主义/亲密极简/图形形式主义）。'}`;
     const args = await this.callTool('storyboard_read', sys, usr);
     return args ? safeParseStage(args, DirectorsReadSchema) : null;
   }
@@ -208,17 +215,17 @@ export class StoryboardOrchestrator {
   // ── Stage 1 逐镜分镜 ──
   private async genPanels(
     sceneInput: string, opts: StoryboardRunOptions, directorsRead: DirectorsRead | null,
-    recallBlock: string, worldbookBlock: string, anchors: string, skillBlock: string, skillBody: string,
+    recallBlock: string, worldbookBlock: string, anchors: string, skillBlock: string, skillBody: string, ctxBlock: string,
   ): Promise<Panel[]> {
     if (opts.mode === 'shot') {
-      const p = await this.genPanelsRange(sceneInput, directorsRead, recallBlock, worldbookBlock, anchors, skillBlock, skillBody, opts.shotCount, opts.shotCount, opts.shotCount);
+      const p = await this.genPanelsRange(sceneInput, directorsRead, recallBlock, worldbookBlock, anchors, skillBlock, skillBody, ctxBlock, opts.shotCount, opts.shotCount, opts.shotCount);
       return p.length ? [p[p.length - 1]] : [];
     }
     const batchCount = Math.ceil(opts.shotCount / MAX_PANELS_PER_CALL);
     const batches = Array.from({ length: batchCount }, (_, i) => {
       const start = i * MAX_PANELS_PER_CALL + 1;
       const end = Math.min(opts.shotCount, (i + 1) * MAX_PANELS_PER_CALL);
-      return this.genPanelsRange(sceneInput, directorsRead, recallBlock, worldbookBlock, anchors, skillBlock, skillBody, start, end, opts.shotCount);
+      return this.genPanelsRange(sceneInput, directorsRead, recallBlock, worldbookBlock, anchors, skillBlock, skillBody, ctxBlock, start, end, opts.shotCount);
     });
     const all = (await Promise.all(batches)).flat();
     return all.sort((a, b) => a.panel - b.panel);
@@ -226,10 +233,10 @@ export class StoryboardOrchestrator {
 
   private async genPanelsRange(
     sceneInput: string, directorsRead: DirectorsRead | null, recallBlock: string, worldbookBlock: string,
-    anchors: string, skillBlock: string, skillBody: string, start: number, end: number, total: number,
+    anchors: string, skillBlock: string, skillBody: string, ctxBlock: string, start: number, end: number, total: number,
   ): Promise<Panel[]> {
-    const sys = `你是一个分镜专家。\n\n${skillBody}\n\n【已发生剧情氛围（召回）】\n${recallBlock || '（无历史召回）'}\n\n【场景背景（世界书激活）】\n${worldbookBlock || '（无激活条目）'}\n\n【跨镜锚点 — 禁止漂移】\n${anchors}\n\n导演意图：${directorsRead?.intention || ''}\n导演之声：${directorsRead?.voice || ''}\n\n${skillBlock}`;
-    const usr = `场景：\n${sceneInput}\n\n镜头数共 ${total} 镜。本次只生成第 ${start}~${end} 镜，跳过其他镜头，逐条对应。每镜严格满足 Shot Contract 字段。`;
+    const sys = `你是一个分镜专家。\n\n${skillBody}\n\n【已发生剧情氛围（召回）】\n${recallBlock || '（无历史召回）'}\n\n【场景背景（世界书激活）】\n${worldbookBlock || '（无激活条目）'}\n\n【跨镜锚点 — 禁止漂移】\n${anchors}\n\n导演意图：${directorsRead?.intention || ''}\n导演之声：${directorsRead?.voice || ''}\n\n${ctxBlock}${skillBlock}`;
+    const usr = `场景：\n${sceneInput}\n\n镜头数共 ${total} 镜。本次只生成第 ${start}~${end} 镜，跳过其他镜头，逐条对应。每镜严格满足 Shot Contract 字段；positive_prompt 按八段全面精准结构输出（含 positive_prompt_short 简版），narrative_prompt 写清动态因果链。`;
     const args = await this.callTool('storyboard_shots', sys, usr);
     if (!args) return [];
     const parsed = safeParseStage(args, PanelsSchema);
@@ -237,19 +244,19 @@ export class StoryboardOrchestrator {
   }
 
   // ── Stage 2 串联序列 ──
-  private async genSequence(panels: Panel[], directorsRead: DirectorsRead | null, anchors: string, skillBlock: string, skillBody: string): Promise<Sequence | null> {
+  private async genSequence(panels: Panel[], directorsRead: DirectorsRead | null, anchors: string, skillBlock: string, skillBody: string, ctxBlock: string): Promise<Sequence | null> {
     const summary = panels.map((p) => ({
       镜: p.panel, 时间: p.time, 景别: p.shot_size, 画布: `${p.canvas.width}x${p.canvas.height}`, 光线: p.lighting, 转场: p.transition_hint,
     }));
-    const sys = `你是一个电影剪辑师。\n\n${skillBody}\n\n【跨镜锚点】\n${anchors}\n\n导演意图：${directorsRead?.intention || ''}\n导演之声：${directorsRead?.voice || ''}\n\n${skillBlock}`;
+    const sys = `你是一个电影剪辑师。\n\n${skillBody}\n\n【跨镜锚点】\n${anchors}\n\n导演意图：${directorsRead?.intention || ''}\n导演之声：${directorsRead?.voice || ''}\n\n${ctxBlock}${skillBlock}`;
     const usr = `${panels.length} 格数据：\n${JSON.stringify(summary, null, 2)}\n\n按六段式输出完整串联序列（master_prompt/rhythm_map/narrative/consistency/sfx/checklist）。`;
     const args = await this.callTool('storyboard_link', sys, usr);
     return args ? safeParseStage(args, SequenceSchema) : null;
   }
 
   // ── Stage 4 人类化改写 ──
-  private async genHumanize(directorsRead: DirectorsRead, sequence: Sequence, skillBody: string): Promise<Humanize | null> {
-    const sys = `你是文字编辑。\n\n${skillBody}`;
+  private async genHumanize(directorsRead: DirectorsRead, sequence: Sequence, skillBody: string, ctxBlock: string): Promise<Humanize | null> {
+    const sys = `你是文字编辑。\n\n${skillBody}\n\n${ctxBlock}`;
     const usr = `导演读本：\n${JSON.stringify(directorsRead, null, 2)}\n\n逐镜串联描述：\n${sequence.narrative}\n\n整体分镜概括（前 3000 字符）：\n${sequence.master_prompt.slice(0, 3000)}`;
     const args = await this.callTool('storyboard_humanize', sys, usr);
     return args ? safeParseStage(args, HumanizeSchema) : null;
