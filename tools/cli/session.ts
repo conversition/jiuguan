@@ -394,6 +394,18 @@ export class ChatSession {
     };
   }
 
+  /** 外部 key/配置更新后热更 LLM 客户端（ProviderPanel 保存 Key → 对已建会话立即生效，无需重启/新建会话）
+   *  原 client 构造函数内一次性绑定旧 key，导致前台写新 key 仅对新会话生效。 */
+  rebindProvider(cfg: ReturnType<typeof loadProviderConfig>): void {
+    this.cfg = cfg;
+    try {
+      this.client = new OpenAICompatibleClient(cfg);
+      console.log(`[Provider] 会话 client 热更: baseUrl=${cfg.baseUrl} model=${cfg.model} key=${cfg.keyFingerprint ?? ''}`);
+    } catch (e) {
+      console.warn(`[Provider] client 重建失败（维持旧配置）: ${(e as Error).message.slice(0, 80)}`);
+    }
+  }
+
   /** 引擎可见聊天上下文（chat_log → {is_user,is_system,content}；末条为 assistant 时引擎才计算） */
   private getChatForEngine(): { is_user: boolean; is_system: boolean; content: string }[] {
     const rows = this.mem.db.prepare('SELECT role, content FROM chat_log ORDER BY id').all() as { role: string; content: string }[];

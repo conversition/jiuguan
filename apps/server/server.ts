@@ -517,7 +517,7 @@ const server = createServer(async (req, res) => {
       return json(res, { ok: true, models: models.slice(0, 30), count: models.length });
     }
 
-    // Provider 写 key（启动流程审查 P0-2：UI 填写 → data/provider.json，不回显；新会话即时生效）
+    // Provider 写 key（启动流程审查 P0-2：UI 填写 → data/provider.json 立即热更，不回显）
     if (method === 'POST' && p === '/api/provider/key') {
       const { writeProviderJson, loadProviderConfig } = await import('../../packages/proxy/src/config.ts');
       const body = await readBody(req);
@@ -525,7 +525,11 @@ const server = createServer(async (req, res) => {
       if (!apiKey) return json(res, { error: 'API key 为空' }, 400);
       writeProviderJson({ apiKey });
       const cfg = loadProviderConfig();
-      return json(res, { ok: true, hasKey: Boolean(cfg.apiKey), baseUrl: cfg.baseUrl, model: cfg.model });
+      // 热更：所有已建会话立即重建 client（新 key 即时生效，无需重启/新建会话；否则旧会话仍绑旧 client）
+      for (const s of sessions.values()) {
+        try { s.rebindProvider(cfg); } catch { /* 单个会话热更失败不阻塞 */ }
+      }
+      return json(res, { ok: true, hasKey: Boolean(cfg.apiKey), baseUrl: cfg.baseUrl, model: cfg.model, keyFingerprint: cfg.keyFingerprint });
     }
 
     // ── P3 资产工具 ──

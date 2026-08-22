@@ -38,7 +38,7 @@ export function ProviderPanel() {
       });
       const d = await res.json();
       if (!res.ok) throw new Error(d.error ?? `HTTP ${res.status}`);
-      setKeyMsg('已保存（data/provider.json，不回显）。新会话即时生效。');
+      setKeyMsg(`已保存（data/provider.json，不回显）→ 已对当前会话即时生效。新指纹 ${d.keyFingerprint ?? ''}`);
       setApiKey('');
       reload();
     } catch (e) { setError((e as Error).message); }
