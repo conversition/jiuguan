@@ -17,6 +17,9 @@ import { useAutoScrollToMessage } from './hooks/useAutoScrollToMessage.ts';
 import { MessageRuler } from './components/MessageRuler.tsx';
 import { ErrorBoundary } from './components/ErrorBoundary.tsx';
 import { logger } from './lib/logger.ts';
+import { DirectorModal } from './DirectorModal.tsx';
+import { useTextSelectionDirector } from './hooks/useTextSelectionDirector.ts';
+import type { TextSelection } from './hooks/useTextSelectionDirector.ts';
 
 /** 单回合生成超时（秒）：上游迟迟不返回/不结束 → 前端主动 abort，避免 busy 卡死、页面永久空转 */
 const GENERATION_TIMEOUT_MS = 300_000;
@@ -591,6 +594,10 @@ export function App() {
     deleteFromHere: (r) => deleteMessagesOp(r, 'fromHere'),
   };
 
+  // 导演模式：文本选区浮动按钮（启用条件=已有会话）+ 探窗目标（点击 🎬 时快照选区传入弹窗）
+  const { sel: directorSel, dismiss: dismissDirector } = useTextSelectionDirector(Boolean(sessionId));
+  const [directorTarget, setDirectorTarget] = useState<TextSelection | null>(null);
+
   return (
     <div className="layout">
       {!adultOk && (
@@ -794,6 +801,23 @@ export function App() {
           </>
         )}
       </main>
+
+      {directorSel && !busy && (
+        <button
+          className="director-float"
+          style={{ left: directorSel.x, top: directorSel.y }}
+          onClick={() => { setDirectorTarget(directorSel); dismissDirector(); }}
+          title="🎬 导演模式：基于该片段 + 剧情上下文生成分镜"
+        >🎬</button>
+      )}
+
+      <DirectorModal
+        open={Boolean(directorTarget && sessionId)}
+        sessionId={sessionId}
+        selection={directorTarget}
+        onClose={() => setDirectorTarget(null)}
+        onSaved={refreshSessions}
+      />
     </div>
   );
 }
