@@ -144,11 +144,14 @@ export interface StoryboardResult {
 export class StoryboardOrchestrator {
   private tools = storyboardStageTools();
   private registry = new StoryboardRegistry();
+  /** 模型调用失败收集（429/超时/网络/未调工具 → 并入 result.errors，前端可见，避免静默空结果） */
+  private modelFailures: string[] = [];
 
   constructor(private deps: StoryboardDeps) {}
 
   /** 执行分镜工作流：召回 → 分阶段（导演读本/逐镜/串联/校验/人类化）→ 落库 */
   async run(sceneInput: string, opts: StoryboardRunOptions, onStage?: (label: string, detail?: string) => void): Promise<StoryboardResult> {
+    this.modelFailures = [];
     const wf = this.registry.get(opts.workflow ?? DEFAULT_WORKFLOW);
 
     // ① 批量召回（剧情记忆 ∥ 世界书 ∥ 分镜 Skill 并行；导演模式用会话增强 query 而非 sceneInput 前24字）
@@ -193,7 +196,7 @@ export class StoryboardOrchestrator {
       }
     }
 
-    const errors = validation.flatMap((v) => v.errors);
+    const errors = [...validation.flatMap((v) => v.errors), ...this.modelFailures];
     const warnings = validation.flatMap((v) => v.warnings);
     const passed = errors.length === 0;
     onStage?.('完成', `${panels.length} 镜 | VP ${passed ? 'PASS' : 'FAIL'} (${errors.length} errors, ${warnings.length} warns)`);
@@ -284,12 +287,13 @@ export class StoryboardOrchestrator {
   }
 
   // ── 内部工具 ──
-  /** 调模型工具（结构化输出），返回 toolCall.arguments 或 null */
+  /** 调模型工具（结构化输出），返回 toolCall.arguments 或 null；调用失败/未调用工具均记入 modelFailures（前端可见） */
   private async callTool(toolName: string, system: string, user: string): Promise<string | null> {
     try {
       // 工具注册表键为 stage0/1/2/4，此处按 function.name 解析（storyboard_read 等）
       const tool = Object.values(this.tools).find((t) => (t as { function?: { name?: string } }).function?.name === toolName);
       if (!tool) {
+        this.modelFailures.push(`工具定义缺失: ${toolName}`);
         console.warn(`[分镜] 未找到工具定义: ${toolName}`);
         return null;
       }
@@ -298,9 +302,17 @@ export class StoryboardOrchestrator {
         () => {},
       );
       const tc = res.toolCalls.find((t) => t.name === toolName);
-      return tc?.arguments ?? null;
+      if (!tc) {
+        // 模型给了文字而非工具调用 → 无分镜内容，必须让用户看见（finish=stop/length 多为额度/模型行为）
+        this.modelFailures.push(`模型未调用工具 ${toolName}（finish=${res.finishReason}${res.content ? '，返回了文字而非工具结果' : '，无内容'}）`);
+        return null;
+      }
+      return tc.arguments ?? null;
     } catch (e) {
-      console.warn(`[分镜] ${toolName} 调用失败: ${(e as Error).message.slice(0, 120)}`);
+      const msg = (e as Error).message.slice(0, 200);
+      // 关键：API 失败（429 额度/超时/网络）不得静默吞掉 → 并入 errors 浮到前端
+      this.modelFailures.push(`模型调用失败 ${toolName}: ${msg}`);
+      console.warn(`[分镜] ${toolName} 调用失败: ${msg.slice(0, 120)}`);
       return null;
     }
   }

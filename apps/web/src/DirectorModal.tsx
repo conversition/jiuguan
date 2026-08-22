@@ -161,12 +161,23 @@ export function DirectorModal({ open, sessionId, selection, onClose, onSaved }: 
           </select>
           <button onClick={run} disabled={busy || !sessionId}>🔄 {busy ? '执行中…' : '重新生成'}</button>
           <button onClick={download} disabled={!result?.markdown}>📥 下载 .md</button>
-          <span className={`director-status ${result && !passedErrors ? 'ok' : ''}`}>
-            {busy ? '分镜生成中…' : result ? `✅ ${result.passed ? 'PASS' : 'FAIL'} ｜ ${result.panels.length} 镜 ｜ e${passedErrors}/w${passedWarns}` : '就绪'}
+          <span className={`director-status ${result && result.passed && !passedErrors ? 'ok' : ''}`}>
+            {busy ? '分镜生成中…' : result ? `${result.passed && !passedErrors ? '✅' : '⚠'} ${result.passed ? 'PASS' : 'FAIL'} ｜ ${result.panels.length} 镜 ｜ e${passedErrors}/w${passedWarns}` : '就绪'}
           </span>
         </div>
 
         {error && <p className="director-error">⚠ {error}</p>}
+
+        {result && (result.errors.length > 0 || passedWarns > 0) && (
+          <div className="director-val">
+            {result.errors.slice(0, 8).map((e, i) => (
+              <p key={`e${i}`} className="director-error">✕ {e}</p>
+            ))}
+            {result.warnings.slice(0, 5).map((w, i) => (
+              <p key={`w${i}`} className="director-warn">△ {w}</p>
+            ))}
+          </div>
+        )}
 
         {stages.length > 0 && (
           <div className="director-stages">
