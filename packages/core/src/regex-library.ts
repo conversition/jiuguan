@@ -56,13 +56,26 @@ export class RegexLibrary {
     return true;
   }
 
-  /** 智能导入卡片正则脚本（按 findRegex+name 去重；返回新增条数） */
-  importFromCard(scripts: { scriptName?: string; findRegex?: string; replaceString?: string; markdownOnly?: boolean; promptOnly?: boolean; disabled?: boolean }[]): { imported: number; skipped: number } {
+  /** 智能导入卡片正则脚本：按 name 对 source='card' 规则 upsert（刷新陈旧规则），跳过用户已编辑的 source='user' 覆盖
+   *  不按 findRegex 去重——同名不同 find 的规则（如 [删除] 与 [开场白] 共用 \[角色创建与故事开场\]）应并存 */
+  importFromCard(scripts: { scriptName?: string; name?: string; findRegex?: string; replaceString?: string; markdownOnly?: boolean; promptOnly?: boolean; disabled?: boolean }[]): { imported: number; skipped: number } {
     let imported = 0;
     let skipped = 0;
     for (const rule of importCardRegexScripts(scripts)) {
-      const dup = [...this.userRules.values()].some((r) => r.source === 'card' && (r.name === rule.name || r.findRegex === rule.findRegex));
-      if (dup) { skipped++; continue; }
+      // 用户已编辑该 id 的规则（source='user'，UI 保存强制写入）→ 不覆盖
+      const userOverride = this.userRules.get(rule.id);
+      if (userOverride && userOverride.source === 'user') { skipped++; continue; }
+      // 已有同名 card 规则：完全一致 → 幂等跳过；不同 → upsert 刷新
+      const existing = [...this.userRules.values()].find((r) => r.source === 'card' && r.name === rule.name);
+      if (existing) {
+        if (existing.findRegex === rule.findRegex && existing.replaceString === rule.replaceString
+          && existing.enabled === rule.enabled && existing.scope === rule.scope && existing.inject === rule.inject) {
+          skipped++; continue;
+        }
+        this.userRules.set(rule.id, rule);
+        imported++;
+        continue;
+      }
       this.userRules.set(rule.id, rule);
       imported++;
     }

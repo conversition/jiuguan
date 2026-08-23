@@ -632,6 +632,7 @@ const server = createServer(async (req, res) => {
         enabled: rule.enabled !== false,
         scope: (rule.scope === 'prompt' || rule.scope === 'both' ? rule.scope : 'display') as 'display' | 'prompt' | 'both',
         source: 'user',
+        inject: rule.inject === true,
         note: typeof rule.note === 'string' ? rule.note : undefined,
         order: Number(rule.order ?? 999),
       });

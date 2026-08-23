@@ -402,6 +402,10 @@ body { font-family: system-ui, 'PingFang SC', 'Microsoft YaHei', sans-serif; bac
 .html-msg { width: 100%; color: var(--ink-2); }
 .html-msg > :first-child { margin-top: 0; }
 .html-msg img { max-width: 100%; height: auto; border-radius: 8px; }
+/* 完整文档前端（开场页/状态栏 HUD）→ 沙箱 iframe：透明底、圆角、无边框，内容高度由 postMessage 自动适配 */
+.html-msg-frame { display: block; width: 100%; border: none; border-radius: 10px; background: transparent; }
+.html-msg-frame::-webkit-scrollbar { width: 6px; }
+.html-msg-frame::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 
 /* ═══════════ 剧情分支按钮（AI 索引 → 点按填入输入框）═══════════ */
 .story-branches { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }

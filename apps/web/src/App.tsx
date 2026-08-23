@@ -8,7 +8,7 @@ import { EditorPanel } from './EditorPanel.tsx';
 import { SkillsPanel } from './SkillsPanel.tsx';
 import { MarkdownMessage, StreamText } from './MarkdownMessage.tsx';
 import { HtmlMessage, looksLikeHtml, extractHtmlFromCodeFence } from './HtmlMessage.tsx';
-import { applyRegexRules } from '../../../packages/core/src/regex.ts';
+import { applyDisplayRules } from '../../../packages/core/src/regex.ts';
 import type { RegexRule } from '../../../packages/core/src/regex.ts';
 import { useMessageRefs, toMessageKey } from './hooks/useMessageRefs.ts';
 import { useScrollToMessage } from './hooks/useScrollToMessage.ts';
@@ -141,7 +141,7 @@ const MessageRow = React.memo(function MessageRow({
   streamingMsgRef: React.RefObject<HTMLDivElement>;
   registerAnchor: (key: string) => (el: HTMLDivElement | null) => void;
 }) {
-  const shown = showRaw || !regexRules ? m.content : applyRegexRules(m.content, regexRules, 'display').text;
+  const shown = showRaw || !regexRules ? m.content : applyDisplayRules(m.content, regexRules).text;
   const msgHtml = !streaming && m.role === 'assistant'
     ? extractHtmlFromCodeFence(shown) ?? (looksLikeHtml(shown) ? shown : null)
     : null;
@@ -448,7 +448,7 @@ export function App() {
     logger.info('session', '会话创建', { session: sid, card: cardName, mode });
     setSessionId(sid);
     setContentMode(mode === 'nsf' ? 'nsf' : 'nsfw');
-    setMessages([{ id: nextMsgId(), round: 0, role: 'assistant', content: `${greeting}\n\n（角色卡：${cardName} · ${mode}）` }]);
+    setMessages([{ id: nextMsgId(), round: 0, role: 'assistant', content: greeting }]);
     refreshSessions();
     setTab('chat');
     fetchTurnState(sid);

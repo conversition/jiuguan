@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { applyRegexRules, parseFindRegex } from '../../../packages/core/src/regex.ts';
+import { applyDisplayRules, parseFindRegex } from '../../../packages/core/src/regex.ts';
 import type { RegexRule } from '../../../packages/core/src/regex.ts';
 
 const API = (import.meta as unknown as { env: Record<string, string> }).env?.VITE_API_BASE ?? '';
@@ -74,8 +74,8 @@ export function RegexLibraryPanel() {
 
   const test = () => {
     if (!rules) return;
-    const r = applyRegexRules(testText, rules, 'display');
-    setTestResult({ text: r.text, applied: r.applied });
+    const r = applyDisplayRules(testText, rules);
+    setTestResult({ text: r.text, applied: [...r.applied, ...r.injected] });
   };
 
   const importCard = async (cardId: string) => {
