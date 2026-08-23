@@ -7,7 +7,7 @@ import { SessionSetup } from './SessionSetup.tsx';
 import { EditorPanel } from './EditorPanel.tsx';
 import { SkillsPanel } from './SkillsPanel.tsx';
 import { MarkdownMessage, StreamText } from './MarkdownMessage.tsx';
-import { HtmlMessage, looksLikeHtml, extractHtmlFromCodeFence } from './HtmlMessage.tsx';
+import { HtmlMessage, splitHtmlSegments } from './HtmlMessage.tsx';
 import { applyDisplayRules } from '../../../packages/core/src/regex.ts';
 import type { RegexRule } from '../../../packages/core/src/regex.ts';
 import { useMessageRefs, toMessageKey } from './hooks/useMessageRefs.ts';
@@ -142,9 +142,10 @@ const MessageRow = React.memo(function MessageRow({
   registerAnchor: (key: string) => (el: HTMLDivElement | null) => void;
 }) {
   const shown = showRaw || !regexRules ? m.content : applyDisplayRules(m.content, regexRules).text;
-  const msgHtml = !streaming && m.role === 'assistant'
-    ? extractHtmlFromCodeFence(shown) ?? (looksLikeHtml(shown) ? shown : null)
-    : null;
+  // 分段渲染：围栏内 HTML 前端（开场页/状态栏）抽为 iframe 段，周围叙事留在气泡段；纯文本走原气泡
+  const segs = !streaming && m.role === 'assistant' ? splitHtmlSegments(shown) : null;
+  const singleText = !!segs && segs.length === 1 && segs[0].type === 'text';
+  const hasHtmlSeg = !!segs && !singleText;
   const anchorKey = toMessageKey(m.round, m.role);
   // 锚点 ref 记忆化（v0.6.1）：registerAnchor(key) 每次调用都返回新函数，
   // 直接内联会导致非流式行每渲染触发 ref 解绑/重绑、锚点 Map 反复增删（抖动）。
@@ -160,8 +161,14 @@ const MessageRow = React.memo(function MessageRow({
       data-message-key={anchorKey}
     >
       <div className="msg-body">
-        {msgHtml ? (
-          <HtmlMessage text={msgHtml} />
+        {hasHtmlSeg && segs ? (
+          <div className="msg-segments">
+            {segs.map((seg, i) =>
+              seg.type === 'html'
+                ? <HtmlMessage key={i} text={seg.content} />
+                : <div key={i} className="bubble read"><MarkdownMessage text={seg.content} /></div>
+            )}
+          </div>
         ) : m.role === 'assistant' ? (
           <div className={`bubble read${streaming ? ' streaming' : ''}`}>
             {streaming ? <StreamText text={shown} /> : <MarkdownMessage text={shown} />}
