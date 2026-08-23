@@ -11,8 +11,8 @@ rmSync(process.env.JG_USER_DATA_DIR, { recursive: true, force: true });
 mkdirSync(process.env.JG_USER_DATA_DIR, { recursive: true });
 
 const {
-  resolveAsset, listAssets, readAsset, saveUserAsset, deleteUserAsset,
-  USER_PRESET_DIR, USER_WORLDBOOK_DIR,
+  resolveAsset, listAssets, readAsset, saveUserAsset, deleteUserAsset, deleteUserCard, saveAssetBuffer, resolveCard,
+  USER_PRESET_DIR, USER_WORLDBOOK_DIR, USER_CARD_DIR,
 } = await import('../src/asset-paths.ts');
 const { parseWorldBook } = await import('../src/worldbook.ts');
 const { parsePreset } = await import('../src/preset.ts');
@@ -64,6 +64,16 @@ const removed = deleteUserAsset('worldbook', '测试世界书.json');
 check('删除返回 true', removed === true);
 check('用户层文件已删', !existsSync(resolve(USER_WORLDBOOK_DIR, '测试世界书.json')));
 check('源世界书不受影响', resolveAsset('worldbook', '足交百科全书.json')?.source === 'asset');
+
+console.log('\n== 角色卡用户层删除（json+png 同基名一并删）==');
+saveUserAsset('card', '测试角色卡.json', '{}');
+saveAssetBuffer('card', '测试角色卡.png', Buffer.from('89504e470d0a1a0a00000000', 'hex'));
+const cardRemoved = deleteUserCard('测试角色卡.json');
+check('删除返回 true', cardRemoved === true);
+check('json 与 png 同基名一并删除', !existsSync(resolve(USER_CARD_DIR, '测试角色卡.json')) && !existsSync(resolve(USER_CARD_DIR, '测试角色卡.png')));
+check('源角色卡不受影响', resolveCard('夜璃·魔法少女侵蚀录（七曜主角）.json')?.source === 'asset');
+check('路径穿越被拒', deleteUserCard('../../evil.json') === false && !existsSync(resolve('..', 'evil.json')));
+check('未知文件删除返回 false', deleteUserCard('不存在.json') === false);
 
 console.log('\n== 文件名校验（防路径穿越）==');
 let traversalRejected = false;

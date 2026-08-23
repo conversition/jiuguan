@@ -80,6 +80,18 @@ export function deleteUserAsset(kind: AssetKind, file: string): boolean {
   return true;
 }
 
+/** 删除角色卡用户层副本（PNG 卡导入会同时落 .json + .png，须同基名一并删除；源资产只读不删） */
+export function deleteUserCard(file: string): boolean {
+  if (basename(file) !== file || !/^[^\\/]+\.(json|png)$/i.test(file)) return false; // 防路径穿越
+  const base = file.replace(/\.(json|png)$/i, '');
+  let removed = false;
+  for (const ext of ['json', 'png']) {
+    const p = resolve(USER_CARD_DIR, `${base}.${ext}`);
+    if (existsSync(p)) { rmSync(p, { force: true }); removed = true; }
+  }
+  return removed;
+}
+
 /** 保存二进制到用户层（PNG 卡原件；文件名校验同 saveUserAsset） */
 export function saveAssetBuffer(kind: AssetKind, file: string, buf: Buffer): string {
   if (basename(file) !== file || !/^[^\\/]+\.[a-zA-Z0-9]+$/.test(file)) {

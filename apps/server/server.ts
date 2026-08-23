@@ -15,7 +15,7 @@ import { resolve } from 'node:path';
 import { ChatSession } from '../../tools/cli/session.ts';
 import { MemoryDb } from '../../packages/memory/src/db.ts';
 import { PluginRegistry } from '../../packages/plugin/src/registry.ts';
-import { listAssets, readAsset, saveUserAsset, deleteUserAsset, listCards, resolveCard, readCardText, saveAssetBuffer } from '../../packages/core/src/asset-paths.ts';
+import { listAssets, readAsset, saveUserAsset, deleteUserAsset, deleteUserCard, listCards, resolveCard, readCardText, saveAssetBuffer } from '../../packages/core/src/asset-paths.ts';
 import { parseWorldBook } from '../../packages/core/src/worldbook.ts';
 import { parsePreset } from '../../packages/core/src/preset.ts';
 import { parseCharaCard, extractCharaFromPng, pngPayloadToJson, buildCharaPng } from '../../packages/core/src/chara.ts';
@@ -737,6 +737,14 @@ const server = createServer(async (req, res) => {
         return json(res, { error: `世界书生成失败: ${(e as Error).message.slice(0, 120)}` }, 400);
       }
       return json(res, { ok: true, file: wbFile, name: wbName, count: wbEntries.length, overwritten });
+    }
+
+    // 角色卡删除（仅用户层副本；PNG 卡 .json+.png 同基名一并删除，源资产只读不删）
+    if (method === 'POST' && p === '/api/card/delete') {
+      const body = await readBody(req);
+      const file = (body.file ?? '').toString().trim();
+      const removed = file ? deleteUserCard(file) : false;
+      return json(res, { ok: true, removed, file });
     }
 
     // 角色卡原文导出（JSON / PNG → 角色卡 JSON 文本）

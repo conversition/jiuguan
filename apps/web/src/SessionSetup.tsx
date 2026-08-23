@@ -4,8 +4,8 @@ import { downloadText, downloadBase64, readFileAsText, readFileAsBase64 } from '
 
 const API = (import.meta as unknown as { env: Record<string, string> }).env?.VITE_API_BASE ?? '';
 
-interface CardInfo { id: string; name: string }
-interface WorldbookInfo { id: string; name: string }
+interface CardInfo { id: string; name: string; source: 'user' | 'asset' }
+interface WorldbookInfo { id: string; name: string; source: 'user' | 'asset' }
 interface PresetInfo { id: string; name: string }
 interface PresetBlock { index: number; role: string; name: string; enabled: boolean; contentLen: number; preview: string }
 
@@ -48,6 +48,8 @@ export function SessionSetup({ onCreated, onCardsChanged }: {
   const [error, setError] = useState('');
   /** 首次加载+回填完成前，禁止把初始空态写回 localStorage（避免覆盖上次配置） */
   const loadedRef = useRef(false);
+  /** 卡片/世界书两步内联确认删除（同会话删除：第一次点击进入确认态，第二次执行） */
+  const [confirmDel, setConfirmDel] = useState<{ kind: 'card' | 'worldbook'; id: string } | null>(null);
   /** 卡片导入检测到内嵌世界书 → 弹窗确认是否单独导入世界书库 */
   const [importPrompt, setImportPrompt] = useState<{ file: string; cardName: string; count: number; bookName: string } | null>(null);
 
@@ -208,6 +210,47 @@ export function SessionSetup({ onCreated, onCardsChanged }: {
     } catch (e) { setError((e as Error).message); }
   };
 
+  /** 删除角色卡（仅用户导入；两步确认 → 刷新列表 + 同步侧栏；删除选中卡时清空选择） */
+  const deleteCard = async (c: CardInfo) => {
+    if (confirmDel?.kind !== 'card' || confirmDel.id !== c.id) { setConfirmDel({ kind: 'card', id: c.id }); return; }
+    setConfirmDel(null);
+    setBusy(true);
+    setError('');
+    try {
+      const r = await fetch(`${API}/api/card/delete`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ file: c.id }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error ?? `HTTP ${r.status}`);
+      if (card === c.id) setCard('');
+      const list = await fetch(`${API}/api/cards`).then((x) => x.json());
+      setCards(list.cards ?? []);
+      onCardsChanged?.(); // 同步 App 侧栏卡列表，删除后立即消失
+    } catch (e) { setError((e as Error).message); }
+    setBusy(false);
+  };
+
+  /** 删除世界书（仅用户导入；两步确认 → 刷新列表，移除已勾选） */
+  const deleteWorldbook = async (w: WorldbookInfo) => {
+    if (confirmDel?.kind !== 'worldbook' || confirmDel.id !== w.id) { setConfirmDel({ kind: 'worldbook', id: w.id }); return; }
+    setConfirmDel(null);
+    setBusy(true);
+    setError('');
+    try {
+      const r = await fetch(`${API}/api/worldbook/delete`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ file: w.id }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error ?? `HTTP ${r.status}`);
+      setSelectedBooks((prev) => prev.filter((x) => x !== w.id));
+      const list = await fetch(`${API}/api/worldbooks`).then((x) => x.json());
+      setWorldbooks(list.worldbooks ?? []);
+    } catch (e) { setError((e as Error).message); }
+    setBusy(false);
+  };
+
   const importPreset = async (file: File) => {
     try {
       const raw = await readFileAsText(file);
@@ -320,6 +363,16 @@ export function SessionSetup({ onCreated, onCardsChanged }: {
                       {c.name}
                     </button>
                     <button className="mini-btn" title="导出为酒馆兼容 PNG" onClick={() => exportCard(c)}>⇩</button>
+                    {c.source === 'user' && (
+                      <button
+                        className={`mini-btn${confirmDel?.kind === 'card' && confirmDel.id === c.id ? ' mini-btn-danger' : ''}`}
+                        title={confirmDel?.kind === 'card' && confirmDel.id === c.id ? '再次点击确认删除（用户导入卡片）' : '删除卡片（用户导入）'}
+                        disabled={busy}
+                        onClick={() => deleteCard(c)}
+                      >
+                        {confirmDel?.kind === 'card' && confirmDel.id === c.id ? '✕' : '🗑'}
+                      </button>
+                    )}
                   </div>
                 ))}
               </div>
@@ -343,6 +396,16 @@ export function SessionSetup({ onCreated, onCardsChanged }: {
                       {w.name}
                     </label>
                     <button className="mini-btn" title="导出" onClick={() => exportWorldbook(w.id)}>⇩</button>
+                    {w.source === 'user' && (
+                      <button
+                        className={`mini-btn${confirmDel?.kind === 'worldbook' && confirmDel.id === w.id ? ' mini-btn-danger' : ''}`}
+                        title={confirmDel?.kind === 'worldbook' && confirmDel.id === w.id ? '再次点击确认删除（用户导入世界书）' : '删除世界书（用户导入）'}
+                        disabled={busy}
+                        onClick={() => deleteWorldbook(w)}
+                      >
+                        {confirmDel?.kind === 'worldbook' && confirmDel.id === w.id ? '✕' : '🗑'}
+                      </button>
+                    )}
                   </div>
                 ))}
               </div>
