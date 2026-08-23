@@ -29,7 +29,7 @@ interface StageEvent { label: string; detail: string }
 /** 导演分镜面板（第三个创作选项：读本→逐镜→串联→人类化，SSE 阶段进度） */
 export function StoryboardPanel() {
   const [scene, setScene] = useState('');
-  const [shots, setShots] = useState(9);
+  const [shots, setShots] = useState(3);
   const [mode, setMode] = useState<'batch' | 'shot'>('batch');
   const [voice, setVoice] = useState('');
   const [workflows, setWorkflows] = useState<string[]>([]);

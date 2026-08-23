@@ -63,19 +63,27 @@ function mkPanel(n: number) {
 }
 const PANELS = [1, 2, 3, 4, 5].map(mkPanel);
 
-// ── Mock 客户端（结构对齐 OpenAICompatibleClient.stream）──
+// ── Mock 客户端（结构对齐 OpenAICompatibleClient.stream / complete）──
 class MockClient {
   calls: string[] = [];
-  async stream(req: ChatRequest, _onDelta: (d: string) => void): Promise<ChatResponse> {
-    const tool = ((req.tools?.[0] as { function?: { name?: string } } | undefined)?.function?.name) ?? '';
-    this.calls.push(tool);
-    const canned: Record<string, string> = {
+  private canned(): Record<string, string> {
+    return {
       storyboard_read: JSON.stringify(readFixture),
       storyboard_shots: JSON.stringify({ panels: PANELS }),
       storyboard_link: JSON.stringify(seqFixture),
       storyboard_humanize: JSON.stringify(humanizeFixture),
     };
-    return { content: null, toolCalls: [{ id: 'c1', name: tool, arguments: canned[tool] ?? '{}' }], finishReason: 'tool_calls', usage: null, raw: '' };
+  }
+  private toolName(req: ChatRequest): string {
+    return ((req.tools?.[0] as { function?: { name?: string } } | undefined)?.function?.name) ?? '';
+  }
+  async complete(req: ChatRequest): Promise<ChatResponse> {
+    const tool = this.toolName(req);
+    this.calls.push(tool);
+    return { content: null, toolCalls: [{ id: 'c1', name: tool, arguments: this.canned()[tool] ?? '{}' }], finishReason: 'tool_calls', usage: null, raw: '' };
+  }
+  async stream(req: ChatRequest, _onDelta: (d: string) => void): Promise<ChatResponse> {
+    return this.complete(req);
   }
 }
 

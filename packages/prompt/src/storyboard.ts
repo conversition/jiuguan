@@ -57,6 +57,41 @@ export const PanelsSchema = z.object({
 });
 export type Panels = z.infer<typeof PanelsSchema>;
 
+// ── 逐镜容错 schema（Stage1 恢复用，2026-08-23）──
+// 严格 PanelSchema(22 必填) 遇模型偶发漏字段（如 camera——skill Shot Contract 未列、schema 却必填）→ 整批丢弃 → 0 镜静默。
+// 降级策略：辅助字段缺省补默认、数值 coerce；关键产出（shot_size/positive_prompt/narrative_prompt）仍必填，垃圾输出依旧被拒。
+export const PanelSchemaLenient = z.object({
+  panel: z.coerce.number().int().positive().default(1),
+  time: z.string().default(''),
+  shot_size: z.string().min(1, 'shot_size 不能为空'),
+  angle: z.string().default(''),
+  lens_feel: z.string().default(''),
+  camera_support: z.string().default(''),
+  movement: z.string().default(''),
+  subject_relation: z.string().default(''),
+  start_frame: z.string().default(''),
+  end_frame: z.string().default(''),
+  fragile_anchors: z.string().default(''),
+  canvas: z.object({
+    width: z.coerce.number().int().positive().catch(1920),
+    height: z.coerce.number().int().positive().catch(1080),
+    ratio: z.string().default('16:9'),
+  }).catch({ width: 1920, height: 1080, ratio: '16:9' }),
+  camera: z.string().default(''),
+  lighting: z.string().default(''),
+  focus: z.string().default(''),
+  positive_prompt: z.string().min(1, 'positive_prompt 不能为空'),
+  positive_prompt_short: z.string().default(''),
+  negative_prompt: z.string().default(''),
+  nltags_sentences: z.array(z.string()).default([]),
+  narrative_prompt: z.string().min(1, 'narrative_prompt 不能为空'),
+  transition_hint: z.string().default(''),
+}).passthrough();
+export const PanelsSchemaLenient = z.object({
+  panels: z.array(PanelSchemaLenient),
+});
+export type PanelsLenient = z.infer<typeof PanelsSchemaLenient>;
+
 // ── Stage 2 串联序列（plan/07 §八.3 六段式）──
 export const SequenceSchema = z.object({
   master_prompt: z.string().describe('整体分镜概括提示词（Sequence Master Prompt，含统一视觉锚点表）'),
@@ -282,7 +317,7 @@ export function validatePanels(panels: Panel[]): ValidationIssue {
     if (!p.positive_prompt) errors.push(`S1-E5: 格${p.panel} positive_prompt 为空`);
     if (!p.negative_prompt) errors.push(`S1-E6: 格${p.panel} negative_prompt 为空`);
     if (!p.canvas?.width || !p.canvas?.height || !p.canvas?.ratio) errors.push(`S1-E7: 格${p.panel} canvas 不完整`);
-    if (!p.camera || !p.lighting || !p.focus) errors.push(`S1-E8: 格${p.panel} camera/lighting/focus 不完整`);
+    if (!p.camera || !p.lighting || !p.focus) warnings.push(`S1-W18: 格${p.panel} camera/lighting/focus 不完整（辅助字段缺失不阻断，可整镜重生成补齐）`);
     if (!p.nltags_sentences || p.nltags_sentences.length < 2 || p.nltags_sentences.length > 5) {
       errors.push(`S1-E9: 格${p.panel} nltags ${p.nltags_sentences?.length || 0} 条（需2-5）`);
     }

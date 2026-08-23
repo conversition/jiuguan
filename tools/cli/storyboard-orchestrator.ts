@@ -17,7 +17,7 @@ import type { SkillMatch } from '../../packages/core/src/skills.ts';
 import { MemoryDb } from '../../packages/memory/src/db.ts';
 import {
   DirectorsReadSchema, PanelsSchema, SequenceSchema, HumanizeSchema,
-  safeParseStage, validatePanels, validateSequence, storyboardStageTools,
+  safeParseStage, validatePanels, validateSequence, storyboardStageTools, PanelsSchemaLenient,
 } from '../../packages/prompt/src/storyboard.ts';
 import type { DirectorsRead, Panel, Sequence, Humanize } from '../../packages/prompt/src/storyboard.ts';
 
@@ -244,8 +244,17 @@ export class StoryboardOrchestrator {
     const usr = `场景：\n${sceneInput}\n\n镜头数共 ${total} 镜。本次只生成第 ${start}~${end} 镜，跳过其他镜头，逐条对应。每镜严格满足 Shot Contract 字段；positive_prompt 按八段全面精准结构输出（含 positive_prompt_short 简版），narrative_prompt 写清动态因果链。`;
     const args = await this.callTool('storyboard_shots', sys, usr);
     if (!args) return [];
-    const parsed = safeParseStage(args, PanelsSchema);
-    return parsed?.panels ?? [];
+    const strict = safeParseStage(args, PanelsSchema);
+    if (strict) return strict.panels;
+    // 严格失败 → 容错降级：辅助字段补默认、关键产出仍必填；再失败才记 error（杜绝"0 镜静默 PASS"空中壳）
+    const lenient = safeParseStage(args, PanelsSchemaLenient);
+    if (lenient) {
+      const missingAux = lenient.panels.filter((p) => !(p as Record<string, unknown>).camera).length;
+      console.log(`  [分镜] 严格 schema 失败，容错解析 ${lenient.panels.length} 镜（${missingAux} 镜缺 camera 等辅助字段，已补默认）`);
+      return lenient.panels;
+    }
+    this.modelFailures.push('分镜参数解析失败（严格 + 容错 schema 均未通过）');
+    return [];
   }
 
   // ── Stage 2 串联序列 ──
@@ -287,7 +296,11 @@ export class StoryboardOrchestrator {
   }
 
   // ── 内部工具 ──
-  /** 调模型工具（结构化输出），返回 toolCall.arguments 或 null；调用失败/未调用工具均记入 modelFailures（前端可见） */
+  /** 调模型工具（结构化输出），返回 toolCall.arguments 或 null；调用失败/未调用工具均记入 modelFailures（前端可见）
+   *  修复：原用 client.stream()，但部分中转（opencode/deepseek-v4-flash）在「大 system prompt + 流式工具调用」下
+   *        静默返回空（finish=空、无内容、无 tool_calls）→ 导演模式真实使用必现 0 镜空壳；
+   *        分镜阶段不需要流式增量（只要最终工具参数），改走非流式 complete()，大 sys 亦正常出 tool_calls（已实测）。
+   *        另加兜底：模型直接返回 JSON 文本而非工具调用时，把 content 当作结构化结果交给上层 safeParseStage 容错解析。 */
   private async callTool(toolName: string, system: string, user: string): Promise<string | null> {
     try {
       // 工具注册表键为 stage0/1/2/4，此处按 function.name 解析（storyboard_read 等）
@@ -297,13 +310,14 @@ export class StoryboardOrchestrator {
         console.warn(`[分镜] 未找到工具定义: ${toolName}`);
         return null;
       }
-      const res = await this.deps.client.stream(
-        { messages: [{ role: 'system', content: system }, { role: 'user', content: user }], tools: [tool], temperature: 0.9 },
-        () => {},
+      const res = await this.deps.client.complete(
+        { messages: [{ role: 'system', content: system }, { role: 'user', content: user }], tools: [tool], tool_choice: 'auto', temperature: 0.9 },
       );
       const tc = res.toolCalls.find((t) => t.name === toolName);
       if (!tc) {
-        // 模型给了文字而非工具调用 → 无分镜内容，必须让用户看见（finish=stop/length 多为额度/模型行为）
+        // 模型直接返回 JSON 文本而非工具调用 → 视作结构化结果（上层 safeParseStage 容错），不静默归零
+        if (res.content) return res.content;
+        // 既无工具调用也无正文 → 必须让用户看见（finish=stop/length 多为额度/模型行为）
         this.modelFailures.push(`模型未调用工具 ${toolName}（finish=${res.finishReason}${res.content ? '，返回了文字而非工具结果' : '，无内容'}）`);
         return null;
       }

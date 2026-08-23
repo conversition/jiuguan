@@ -224,7 +224,7 @@
 
 ### 导演分镜编排器 `tools/cli/storyboard*.ts`（Commit B）
 - 平行于 prose 主循环的批量工作流引擎：**工作流 yaml 注册表**（`data/storyboard-workflows/`，新增工作流=丢一个 yaml 零代码改动）+ 批量召回（剧情 RAG ∥ 世界书 ∥ 分镜 Skill）+ 四阶段模型编排（导演读本→逐镜 Shot Contract→串联六段式→人类化改写，≤5 镜/调用超限并行）+ **五级校验内联**（VP0 读本/VP1 反陈词·设备词/VP2 SFX 禁 BGM）+ `memory_state(storyboard)` 落库
-- 用法：`pnpm storyboard --scene "深夜铁桥相拥" --shots 9 --voice 亲密极简`；`pnpm test:storyboard`（mock 端到端 22/22，绕 API 限流）
+- 用法：`pnpm storyboard --scene "深夜铁桥相拥" --shots 3 --voice 亲密极简`；`pnpm test:storyboard`（mock 端到端 22/22，绕 API 限流）
 - 提交：`2064e38`（数据资产 data/skills、data/storyboard-workflows 按约定不入库，落盘验证）
 
 ---

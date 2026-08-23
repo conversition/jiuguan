@@ -36,7 +36,7 @@ interface DirectorModalProps {
 }
 
 export function DirectorModal({ open, sessionId, selection, onClose, onSaved }: DirectorModalProps) {
-  const [shots, setShots] = useState(9);
+  const [shots, setShots] = useState(3);
   const [voice, setVoice] = useState('');
   const [workflow, setWorkflow] = useState('');
   const [workflows, setWorkflows] = useState<string[]>([]);

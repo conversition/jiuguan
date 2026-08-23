@@ -927,7 +927,7 @@ const server = createServer(async (req, res) => {
           scene,
           {
             mode: body.mode === 'shot' ? 'shot' : 'batch',
-            shotCount: Math.min(30, Math.max(1, Number(body.shots ?? 9))),
+            shotCount: Math.min(30, Math.max(1, Number(body.shots ?? 3))),
             workflow: typeof body.workflow === 'string' && body.workflow ? body.workflow : undefined,
             voice: typeof body.voice === 'string' && body.voice ? body.voice : undefined,
           },

@@ -1,7 +1,7 @@
 /**
  * tools/cli - 导演分镜 CLI 入口（Commit B）
  * 用法：
- *   node storyboard.ts --scene "深夜雨后铁桥，两人相拥坠落" [--shots 9] [--mode batch|shot]
+ *   node storyboard.ts --scene "深夜雨后铁桥，两人相拥坠落" [--shots 3] [--mode batch|shot]
  *       [--voice 亲密极简] [--workflow cinematic-default] [--db data/storyboard-run.db]
  * 说明：直连 provider（.env.local / data/provider.json）；记忆库可为空（批量召回自然退化为 0 命中）。
  */
@@ -23,11 +23,11 @@ function arg(k: string, d?: string): string | undefined {
 
 const scene = arg('--scene') ?? arg('--s');
 if (!scene) {
-  console.log('用法: node storyboard.ts --scene "场景描述" [--shots 9] [--mode batch|shot] [--voice 导演之声] [--workflow cinematic-default] [--db path]');
+  console.log('用法: node storyboard.ts --scene "场景描述" [--shots 3] [--mode batch|shot] [--voice 导演之声] [--workflow cinematic-default] [--db path]');
   process.exit(1);
 }
 
-const shots = Number(arg('--shots', '9'));
+const shots = Number(arg('--shots', '3'));
 const mode = (arg('--mode') === 'shot' ? 'shot' : 'batch') as 'batch' | 'shot';
 const dbPath = arg('--db', resolve('data', 'storyboard-run.db'));
 if (!existsSync(dirname(dbPath))) mkdirSync(dirname(dbPath), { recursive: true });
