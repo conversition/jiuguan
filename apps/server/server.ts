@@ -511,14 +511,28 @@ const server = createServer(async (req, res) => {
       });
     }
 
-    // Provider 测试连接（模型列表）
+    // Provider 测试连接（校验草稿 baseUrl/key + 拉取模型列表；草稿值不落盘）
     if (method === 'POST' && p === '/api/provider/test') {
       const { loadProviderConfig } = await import('../../packages/proxy/src/config.ts');
-      const { OpenAICompatibleClient } = await import('../../packages/proxy/src/client.ts');
-      const cfg = loadProviderConfig();
+      const body = await readBody(req);
+      const overrides = {
+        ...(body.baseUrl ? { baseUrl: String(body.baseUrl) } : {}),
+        ...(body.apiKey ? { apiKey: String(body.apiKey) } : {}),
+      };
+      const cfg = loadProviderConfig(overrides);
+      if (!cfg.apiKey) {
+        return json(res, { ok: false, error: '缺少 API key：请在下方填入 key 后测试，或在 .env.local 配置 JG_API_KEY' }, 400);
+      }
       const client = new OpenAICompatibleClient(cfg);
-      const models = await client.listModels();
-      return json(res, { ok: true, models: models.slice(0, 30), count: models.length });
+      try {
+        const models = await client.listModels();
+        return json(res, { ok: true, models: models.slice(0, 50), count: models.length, baseUrl: cfg.baseUrl, model: cfg.model });
+      } catch (e) {
+        const status = (e as { status?: number }).status;
+        const msg = (e as Error).message.slice(0, 300);
+        const where = status ? `HTTP ${status}` : '网络';
+        return json(res, { ok: false, error: `连接失败（${where}）：${msg}`, status: status ?? 0 }, status && status >= 400 ? status : 502);
+      }
     }
 
     // Provider 写 key（启动流程审查 P0-2：UI 填写 → data/provider.json 立即热更，不回显）
@@ -534,6 +548,36 @@ const server = createServer(async (req, res) => {
         try { s.rebindProvider(cfg); } catch { /* 单个会话热更失败不阻塞 */ }
       }
       return json(res, { ok: true, hasKey: Boolean(cfg.apiKey), baseUrl: cfg.baseUrl, model: cfg.model, keyFingerprint: cfg.keyFingerprint });
+    }
+
+    // Provider 统一保存（baseUrl / model / key → data/provider.json 立即热更会话；key 不回显）
+    if (method === 'POST' && p === '/api/provider/save') {
+      const { writeProviderJson, loadProviderConfig } = await import('../../packages/proxy/src/config.ts');
+      const body = await readBody(req);
+      const partial: Record<string, unknown> = {};
+      if (body.baseUrl) partial.baseUrl = String(body.baseUrl).trim().replace(/\/+$/, '');
+      if (body.model) partial.model = String(body.model).trim();
+      if (body.apiKey) partial.apiKey = String(body.apiKey).trim();
+      if (body.kind === 'anthropic' || body.kind === 'openai') partial.kind = body.kind;
+      if (body.prefixCacheThreshold) partial.prefixCacheThreshold = Number(body.prefixCacheThreshold);
+      if (Object.keys(partial).length === 0) {
+        return json(res, { error: '无可保存的配置（Base URL / 模型 / API key 至少填一项）' }, 400);
+      }
+      writeProviderJson(partial);
+      const cfg = loadProviderConfig();
+      for (const s of sessions.values()) {
+        try { s.rebindProvider(cfg); } catch { /* 单个会话热更失败不阻塞 */ }
+      }
+      return json(res, {
+        ok: true,
+        baseUrl: cfg.baseUrl,
+        model: cfg.model,
+        kind: cfg.kind,
+        hasKey: Boolean(cfg.apiKey),
+        keySource: cfg.keySource,
+        keyFingerprint: cfg.keyFingerprint,
+        prefixCacheThreshold: cfg.prefixCacheThreshold,
+      });
     }
 
     // ── P3 资产工具 ──
@@ -616,7 +660,8 @@ const server = createServer(async (req, res) => {
     }
 
     // ── 资产导入/导出（前端可视化；JSON 原文 / 卡片 PNG base64，无 multipart 依赖）──
-    const MAX_IMPORT = 5 * 1024 * 1024;
+    // 导入大小上限：PNG 角色卡常 >10MB（base64 再 ×4/3），5MB 会误伤真实卡；64MB 覆盖绝大多数
+    const MAX_IMPORT = 64 * 1024 * 1024;
 
     // 角色卡导入（JSON 或 PNG；PNG 自动解包 chara 元数据，强校验后写用户层 data/cards/）
     if (method === 'POST' && p === '/api/card/import') {
@@ -638,15 +683,59 @@ const server = createServer(async (req, res) => {
       } else {
         cardJson = data;
       }
+      let parsedCard: ReturnType<typeof parseCharaCard>;
       try {
-        parseCharaCard(cardJson);
+        parsedCard = parseCharaCard(cardJson);
       } catch (e) {
         return json(res, { error: `角色卡校验失败: ${(e as Error).message.slice(0, 120)}` }, 400);
       }
       const jsonFile = `${name}.json`;
       saveUserAsset('card', jsonFile, cardJson);
       if (pngBuf) saveAssetBuffer('card', `${name}.png`, pngBuf);
-      return json(res, { ok: true, file: jsonFile, name, format: 'json', pngSaved: Boolean(pngBuf) });
+      // 内嵌世界书检测：供前端弹窗确认是否单独导入世界书库（区分卡与内嵌世界书分别记录）
+      const wbEntries = parsedCard.worldbookEntries;
+      return json(res, {
+        ok: true, file: jsonFile, name, format: 'json', pngSaved: Boolean(pngBuf),
+        embeddedWorldbook: wbEntries.length > 0
+          ? { count: wbEntries.length, name: parsedCard.card.data.character_book?.name ?? '' }
+          : null,
+      });
+    }
+
+    // 卡片内嵌世界书 → 独立世界书资产（导入卡片后前端弹窗确认调用；同名用户层覆盖=幂等）
+    if (method === 'POST' && p === '/api/card/import-worldbook') {
+      const body = await readBody(req);
+      const file = (body.file ?? '').toString().trim();
+      if (!/\.json$/i.test(file)) return json(res, { error: '需指定已导入的角色卡 JSON 文件' }, 400);
+      let raw: string;
+      try {
+        const card = readCardText(file);
+        if (!card) return json(res, { error: '角色卡不存在' }, 404);
+        raw = card.raw;
+      } catch (e) {
+        return json(res, { error: (e as Error).message.slice(0, 120) }, 400);
+      }
+      let parsed: ReturnType<typeof parseCharaCard>;
+      try {
+        parsed = parseCharaCard(raw);
+      } catch (e) {
+        return json(res, { error: `角色卡解析失败: ${(e as Error).message.slice(0, 120)}` }, 400);
+      }
+      const wbEntries = parsed.worldbookEntries;
+      if (wbEntries.length === 0) return json(res, { error: '该角色卡未携带内嵌世界书' }, 400);
+      const base = file.replace(/\.json$/i, '');
+      const wbName = parsed.card.data.character_book?.name || `${base}-世界书`;
+      const wbFile = `${base.replace(/[\\/:*?"<>|]/g, '_')}-世界书.json`;
+      let overwritten = false;
+      try {
+        parseWorldBook(JSON.stringify({ name: wbName, entries: wbEntries }, null, 2)); // 强校验后再落盘
+        const existing = readAsset('worldbook', wbFile);
+        overwritten = existing?.source === 'user';
+        saveUserAsset('worldbook', wbFile, JSON.stringify({ name: wbName, entries: wbEntries }, null, 2));
+      } catch (e) {
+        return json(res, { error: `世界书生成失败: ${(e as Error).message.slice(0, 120)}` }, 400);
+      }
+      return json(res, { ok: true, file: wbFile, name: wbName, count: wbEntries.length, overwritten });
     }
 
     // 角色卡原文导出（JSON / PNG → 角色卡 JSON 文本）

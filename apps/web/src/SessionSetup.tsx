@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import { StoryboardPanel } from './StoryboardPanel.tsx';
 import { downloadText, downloadBase64, readFileAsText, readFileAsBase64 } from './filetools.ts';
 
@@ -19,6 +19,16 @@ const STAGE_LABEL: Record<string, string> = {
 
 type CreateMode = 'nsfw' | 'nsf' | 'director';
 
+/** 新建配置快照（localStorage jg-setup：卡/世界书/预设/预设块勾选，下次新建自动回填） */
+const SETUP_KEY = 'jg-setup';
+interface SetupSnapshot {
+  card: string;
+  mode: CreateMode;
+  worldbooks: string[];
+  preset: string;
+  overrides: Record<number, boolean>;
+}
+
 /** 新建创作前置面板（创作模式三项并列：NSFW / NSF / 导演分镜；对话走会话入参，分镜走编排器） */
 export function SessionSetup({ onCreated, onCardsChanged }: {
   onCreated: (sid: string, greeting: string, card: string, mode: string) => void;
@@ -36,6 +46,10 @@ export function SessionSetup({ onCreated, onCardsChanged }: {
   const [busy, setBusy] = useState(false);
   const [stage, setStage] = useState('');
   const [error, setError] = useState('');
+  /** 首次加载+回填完成前，禁止把初始空态写回 localStorage（避免覆盖上次配置） */
+  const loadedRef = useRef(false);
+  /** 卡片导入检测到内嵌世界书 → 弹窗确认是否单独导入世界书库 */
+  const [importPrompt, setImportPrompt] = useState<{ file: string; cardName: string; count: number; bookName: string } | null>(null);
 
   React.useEffect(() => {
     const load = async () => {
@@ -48,13 +62,55 @@ export function SessionSetup({ onCreated, onCardsChanged }: {
         setCards(c.cards ?? []);
         setWorldbooks(w.worldbooks ?? []);
         setPresets(p.presets ?? []);
-        // 默认：nsfw → XP 大全世界书
-        const def = (w.worldbooks ?? []).filter((b: WorldbookInfo) => b.id.includes('XP大全绿灯') || b.id.startsWith('__XP'));
-        if (def.length > 0) setSelectedBooks(def.map((b: WorldbookInfo) => b.id));
+        // 回填上次新建配置（存在快照时优先；仅缺失条目/已删预设按存活过滤）
+        let snap: SetupSnapshot | null = null;
+        try { snap = JSON.parse(localStorage.getItem(SETUP_KEY) ?? 'null'); } catch { snap = null; }
+        if (snap) {
+          const bookIds = new Set((w.worldbooks ?? []).map((b: WorldbookInfo) => b.id));
+          const books = (snap.worldbooks ?? []).filter((id) => bookIds.has(id));
+          if (snap.card && (c.cards ?? []).some((x: CardInfo) => x.id === snap.card)) setCard(snap.card);
+          if (snap.mode === 'nsf' || snap.mode === 'director') setMode(snap.mode);
+          setSelectedBooks(books);
+          if (snap.preset) {
+            setPreset(snap.preset);
+            const prompts = await fetchPresetPrompts(snap.preset);
+            if (prompts) {
+              setBlocks(prompts);
+              const o: Record<number, boolean> = {};
+              for (const b of prompts) {
+                o[b.index] = snap.overrides && snap.overrides[b.index] !== undefined ? snap.overrides[b.index] : b.enabled;
+              }
+              setOverrides(o);
+            }
+          }
+        } else {
+          // 默认：nsfw → XP 大全世界书
+          const def = (w.worldbooks ?? []).filter((b: WorldbookInfo) => b.id.includes('XP大全绿灯') || b.id.startsWith('__XP'));
+          if (def.length > 0) setSelectedBooks(def.map((b: WorldbookInfo) => b.id));
+        }
       } catch (e) { setError((e as Error).message); }
+      loadedRef.current = true;
     };
     load();
   }, []);
+
+  // 记住最近一次新建配置（含预设块勾选）；切换标签页/刷新后自动回填
+  // 预设已选但块未加载完成时跳过（避免切换预设中途把旧勾选瞬时写入）
+  React.useEffect(() => {
+    if (!loadedRef.current) return;
+    if (preset && !blocks) return;
+    const snap: SetupSnapshot = { card, mode, worldbooks: selectedBooks, preset, overrides };
+    try { localStorage.setItem(SETUP_KEY, JSON.stringify(snap)); } catch { /* localStorage 不可用则跳过 */ }
+  }, [card, mode, selectedBooks, preset, overrides, blocks]);
+
+  /** 拉取预设块列表（失败返回 null，不抛错） */
+  const fetchPresetPrompts = async (file: string): Promise<PresetBlock[] | null> => {
+    try {
+      const d = await fetch(`${API}/api/preset/${encodeURIComponent(file)}`).then((r) => r.json());
+      if (d.error) return null;
+      return d.prompts ?? [];
+    } catch { return null; }
+  };
 
   const openPreset = async (file: string) => {
     setPreset(file);
@@ -63,11 +119,11 @@ export function SessionSetup({ onCreated, onCardsChanged }: {
     if (!file) return;
     setError('');
     try {
-      const d = await fetch(`${API}/api/preset/${encodeURIComponent(file)}`).then((r) => r.json());
-      if (d.error) throw new Error(d.error);
-      setBlocks(d.prompts ?? []);
+      const prompts = await fetchPresetPrompts(file);
+      if (!prompts) throw new Error('预设加载失败');
+      setBlocks(prompts);
       const o: Record<number, boolean> = {};
-      (d.prompts ?? []).forEach((b: PresetBlock) => { o[b.index] = b.enabled; });
+      prompts.forEach((b: PresetBlock) => { o[b.index] = b.enabled; });
       setOverrides(o);
     } catch (e) { setError((e as Error).message); }
   };
@@ -91,7 +147,34 @@ export function SessionSetup({ onCreated, onCardsChanged }: {
       const c = await fetch(`${API}/api/cards`).then((x) => x.json());
       setCards(c.cards ?? []);
       onCardsChanged?.(); // 同步 App 侧栏卡列表，导入后立即可选
+      // 内嵌世界书：弹窗告知并确认是否单独导入世界书库（卡与内嵌世界书分别记录）
+      if (d.embeddedWorldbook?.count > 0) {
+        setImportPrompt({
+          file: d.file,
+          cardName: d.name ?? file.name.replace(/\.(json|png)$/i, ''),
+          count: d.embeddedWorldbook.count,
+          bookName: d.embeddedWorldbook.name ?? '',
+        });
+      }
     } catch (e) { setError((e as Error).message); }
+  };
+
+  /** 将卡片内嵌世界书另存为独立世界书资产（弹窗确认后；成功后刷新世界书列表） */
+  const importCardWorldbook = async () => {
+    if (!importPrompt) return;
+    setBusy(true);
+    setError('');
+    try {
+      const r = await fetch(`${API}/api/card/import-worldbook`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ file: importPrompt.file }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error ?? `HTTP ${r.status}`);
+      setImportPrompt(null);
+      setWorldbooks((await fetch(`${API}/api/worldbooks`).then((x) => x.json()).then((w) => w.worldbooks ?? [])));
+    } catch (e) { setError((e as Error).message); setImportPrompt(null); }
+    setBusy(false);
   };
 
   const exportCard = async (c: CardInfo) => {
@@ -313,6 +396,23 @@ export function SessionSetup({ onCreated, onCardsChanged }: {
             <button onClick={create} disabled={busy || !card}>创建会话并开始</button>
           </div>
         </>
+      )}
+
+      {importPrompt && (
+        <div className="import-prompt" role="dialog" aria-modal="true">
+          <div className="import-prompt-box">
+            <h3>检测到内嵌世界书</h3>
+            <p>
+              角色卡「{importPrompt.cardName}」内嵌了{importPrompt.bookName ? `世界书「${importPrompt.bookName}」` : '一份世界书'}，共{' '}
+              <b>{importPrompt.count}</b> 条。
+            </p>
+            <p className="muted">角色卡已导入。是否将内嵌世界书单独导入世界书库（可与卡片分开选择、跨会话复用）？</p>
+            <div className="import-prompt-actions">
+              <button onClick={importCardWorldbook} disabled={busy}>导入世界书</button>
+              <button className="ghost" onClick={() => setImportPrompt(null)} disabled={busy}>仅导入卡片</button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
