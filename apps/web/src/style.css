@@ -335,8 +335,10 @@ body { font-family: system-ui, 'PingFang SC', 'Microsoft YaHei', sans-serif; bac
 
 /* ═══════════ 会话列表操作（删除会话）═══════════ */
 .session-row { display: flex; gap: 6px; align-items: center; }
+/* 覆盖 .sidebar button 的全局 width:100%（特异性更高会压掉子按钮定宽）——容器内按钮按各自布局定宽 */
+.session-row > button { width: auto; }
 .session-del {
-  flex: 0 0 auto; width: 26px; height: 26px;
+  flex: 0 0 26px; height: 26px;   /* flex-basis 直接定主轴宽度，不依赖 width，免疫特异性覆盖 */
   display: flex; align-items: center; justify-content: center;
   padding: 0; line-height: 1;
   background: var(--bg-card); color: var(--ink-3);
