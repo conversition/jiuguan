@@ -59,8 +59,8 @@
 /* ═══════════ 基础 ═══════════ */
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { font-family: system-ui, 'PingFang SC', 'Microsoft YaHei', sans-serif; background: var(--bg); color: var(--ink-1); }
-.layout { display: flex; height: 100vh; }
-.sidebar { width: 264px; background: var(--bg-elev); padding: 16px; overflow-y: auto; border-right: 1px solid var(--border); }
+.layout { display: flex; height: 100vh; position: relative; }
+.sidebar { width: 300px; background: var(--bg-elev); padding: 16px; overflow-y: auto; border-right: 1px solid var(--border); }
 .sidebar h1 { font-size: 20px; color: var(--accent-ink); margin: 0; }
 .sidebar h2 { font-size: 13px; color: var(--ink-3); margin: 16px 0 8px; }
 .sidebar ul { list-style: none; }
@@ -73,10 +73,10 @@ body { font-family: system-ui, 'PingFang SC', 'Microsoft YaHei', sans-serif; bac
 .sidebar button:hover { background: var(--bg-hover); }
 .sidebar button:disabled { opacity: 0.5; cursor: not-allowed; }
 
-/* 侧栏顶栏：标题 + 主题/字号控件 */
-.sidebar-top { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; }
+/* 侧栏顶栏：标题独占一行，主题/字号控件换行排列（小屏不挤） */
+.sidebar-top { display: flex; flex-direction: column; align-items: stretch; gap: 8px; margin-bottom: 14px; }
 .sidebar-top h1 { flex: 1; }
-.theme-controls { display: flex; gap: 4px; align-items: center; }
+.theme-controls { display: flex; gap: 4px; align-items: center; justify-content: flex-end; }
 .theme-controls select {
   background: var(--bg-card); color: var(--ink-2); border: 1px solid var(--border);
   border-radius: 6px; padding: 3px 6px; font-size: 12px;
@@ -86,6 +86,10 @@ body { font-family: system-ui, 'PingFang SC', 'Microsoft YaHei', sans-serif; bac
   border-radius: 6px; padding: 3px 8px; font-size: 12px; cursor: pointer;
 }
 .theme-controls button:hover { background: var(--bg-hover); }
+
+/* 侧栏右缘拖把（App 内联 left 定位；hover 高亮提示可拖动） */
+.sidebar-resizer { position: absolute; top: 0; bottom: 0; width: 6px; cursor: col-resize; z-index: 20; }
+.sidebar-resizer:hover { background: var(--accent); opacity: .3; }
 
 /* 侧栏常驻推进槽 */
 .status-box { border: 1px solid var(--border); background: var(--bg-card); border-radius: 8px; padding: 10px; margin-bottom: 12px; }

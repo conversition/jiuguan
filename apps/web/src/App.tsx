@@ -23,6 +23,10 @@ import type { TextSelection } from './hooks/useTextSelectionDirector.ts';
 
 /** 单回合生成超时（秒）：上游迟迟不返回/不结束 → 前端主动 abort，避免 busy 卡死、页面永久空转 */
 const GENERATION_TIMEOUT_MS = 300_000;
+/** 侧栏宽度（可拖动调整，localStorage jg-sidebar-w 持久化；范围 200~480） */
+const SIDEBAR_DEFAULT_W = 300;
+const SIDEBAR_MIN_W = 200;
+const SIDEBAR_MAX_W = 480;
 
 interface Card { id: string; name: string }
 interface SessionInfo { id: string; name: string; preview?: string; round?: number }
@@ -199,6 +203,11 @@ export function App() {
   // 美化：主题 / 字号 / 侧栏常驻推进槽
   const [theme, setTheme] = useState<Theme>(() => (localStorage.getItem('jg-theme') as Theme) || 'dark');
   const [readFs, setReadFs] = useState<number>(() => Number(localStorage.getItem('jg-read-fs')) || 16);
+  // 侧栏宽度（可拖动；读 localStorage，越界则回退默认值）
+  const [sidebarW, setSidebarW] = useState<number>(() => {
+    const saved = Number(localStorage.getItem('jg-sidebar-w'));
+    return saved >= SIDEBAR_MIN_W && saved <= SIDEBAR_MAX_W ? saved : SIDEBAR_DEFAULT_W;
+  });
   const [turnState, setTurnState] = useState<TurnState | null>(null);
   // 剧情分支索引（AI 生成，按轮缓存）
   const [storyIndex, setStoryIndex] = useState<string>('');
@@ -291,6 +300,34 @@ export function App() {
     document.documentElement.style.setProperty('--read-fs', `${readFs}px`);
     localStorage.setItem('jg-read-fs', String(readFs));
   }, [readFs]);
+  // 侧栏宽度持久化（与 theme/read-fs 一致：变化即写入 localStorage）
+  useEffect(() => {
+    localStorage.setItem('jg-sidebar-w', String(sidebarW));
+  }, [sidebarW]);
+
+  // 侧栏右缘拖把：mousedown 后在 document 级监听移动，宽度 clamp 到 [MIN,MAX]；松手清理
+  const sidebarDragRef = useRef<{ startX: number; startW: number } | null>(null);
+  const startSidebarDrag = (e: React.MouseEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    sidebarDragRef.current = { startX: e.clientX, startW: sidebarW };
+    document.body.style.userSelect = 'none'; // 拖动时禁止选中文本，避免拖出选区/闪烁
+    document.body.style.cursor = 'col-resize';
+    const onMove = (ev: MouseEvent) => {
+      const d = sidebarDragRef.current;
+      if (!d) return;
+      const w = Math.min(SIDEBAR_MAX_W, Math.max(SIDEBAR_MIN_W, d.startW + ev.clientX - d.startX));
+      setSidebarW(w);
+    };
+    const onUp = () => {
+      sidebarDragRef.current = null;
+      document.body.style.userSelect = '';
+      document.body.style.cursor = '';
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  };
 
   /** 拉取推进槽（会话创建/恢复/每轮结束后刷新）；顺带按轮拉取剧情分支索引（round>0 才拉，避免开场白空转一次 AI） */
   const fetchTurnState = async (sid: string) => {
@@ -613,7 +650,7 @@ export function App() {
           </div>
         </div>
       )}
-      <aside className="sidebar">
+      <aside className="sidebar" style={{ width: sidebarW }}>
         <div className="sidebar-top">
           <h1>jiuguan</h1>
           <div className="theme-controls">
@@ -708,6 +745,13 @@ export function App() {
         </div>
         {error && <p className="error">{error}</p>}
       </aside>
+      {/* 侧栏右缘拖把：绝对定位于 layout，left 由 React 内联（sidebarW-3 使中心对准边框线） */}
+      <div
+        className="sidebar-resizer"
+        style={{ left: sidebarW - 3 }}
+        onMouseDown={startSidebarDrag}
+        title="拖动调整侧栏宽度"
+      />
       <main className="chat">
         {tab === 'setup' ? (
           <SessionSetup onCreated={onSessionCreated} onCardsChanged={refreshCards} />
