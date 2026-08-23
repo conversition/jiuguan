@@ -10,7 +10,7 @@
  * 会话实例进程内 Map + DB 文件持久化。
  */
 import { createServer, IncomingMessage, ServerResponse } from 'node:http';
-import { readdirSync, existsSync, readFileSync, rmSync, appendFileSync } from 'node:fs';
+import { readdirSync, existsSync, readFileSync, rmSync, appendFileSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { ChatSession } from '../../tools/cli/session.ts';
 import { MemoryDb } from '../../packages/memory/src/db.ts';
@@ -106,9 +106,8 @@ function chunkText(text: string, size = 60): string[] {
   return out;
 }
 
-/** 读取会话 DB 摘要名（首条 assistant 消息前 15 字） */
-/** 读取会话摘要（卡名/最新消息预览/轮次；HTML 清洗后截断） */
-function readSessionMeta(dbPath: string): { card: string; preview: string; round: number } {
+/** 读取会话摘要（卡名/最新消息预览/轮次/开始文字/创建时间；HTML 清洗后截断） */
+function readSessionMeta(dbPath: string): { card: string; preview: string; round: number; start: string; createdAt: string } {
   try {
     const mem = new MemoryDb({ path: dbPath });
     const meta = mem.db.prepare('SELECT config FROM memory_meta WHERE id = 1').get() as { config: string } | undefined;
@@ -118,6 +117,8 @@ function readSessionMeta(dbPath: string): { card: string; preview: string; round
       mem.db.prepare("SELECT content FROM chat_log WHERE role='assistant' AND round > 0 ORDER BY id DESC LIMIT 1").get()
       ?? mem.db.prepare("SELECT content FROM chat_log WHERE role='assistant' ORDER BY id DESC LIMIT 1").get()
     ) as { content: string } | undefined;
+    // 开始文字取首条消息（开场白 round 0）；创建时间优先 chat_log.created_at，缺失时用 DB 文件 mtime 兜底
+    const first = mem.db.prepare("SELECT content, created_at FROM chat_log ORDER BY id ASC LIMIT 1").get() as { content: string; created_at?: string } | undefined;
     const r = mem.db.prepare('SELECT COALESCE(MAX(round), 0) AS m FROM chat_log').get() as { m: number };
     mem.db.close();
     const strip = (t: string) => t
@@ -125,8 +126,11 @@ function readSessionMeta(dbPath: string): { card: string; preview: string; round
       .replace(/<[^>]+>/g, ' ')          // HTML 标签
       .replace(/\/\*[\s\S]*?\*\//g, ' ') // CSS/注释
       .replace(/\s+/g, ' ').trim();
-    return { card: cfg.card ?? '', preview: last?.content ? strip(last.content).slice(0, 42) : '', round: r?.m ?? 0 };
-  } catch { return { card: '', preview: '', round: 0 }; }
+    const start = first?.content ? strip(first.content).slice(0, 100) : '';
+    const createdAt = first?.created_at
+      ?? (() => { try { return statSync(dbPath).mtime.toISOString(); } catch { return ''; } })();
+    return { card: cfg.card ?? '', preview: last?.content ? strip(last.content).slice(0, 42) : '', round: r?.m ?? 0, start, createdAt };
+  } catch { return { card: '', preview: '', round: 0, start: '', createdAt: '' }; }
 }
 
 /** 分镜完成载荷（/api/storyboard/run 与 /api/session/:id/director 共用；含下载用全量 Markdown，探窗展示/下载复用） */
@@ -184,7 +188,7 @@ const server = createServer(async (req, res) => {
         const dbPath = resolve(DATA_DIR, f);
         const meta = readSessionMeta(dbPath);
         const id = f.replace(/\.db$/, '');
-        return { id, file: f, name: meta.card || id, preview: meta.preview, round: meta.round };
+        return { id, file: f, name: meta.card || id, preview: meta.preview, round: meta.round, start: meta.start, createdAt: meta.createdAt };
       });
       return json(res, { sessions: list });
     }

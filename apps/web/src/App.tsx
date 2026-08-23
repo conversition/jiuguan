@@ -29,7 +29,7 @@ const SIDEBAR_MIN_W = 200;
 const SIDEBAR_MAX_W = 480;
 
 interface Card { id: string; name: string }
-interface SessionInfo { id: string; name: string; preview?: string; round?: number }
+interface SessionInfo { id: string; name: string; preview?: string; round?: number; start?: string; createdAt?: string }
 interface Message { id: number; round: number; role: string; content: string }
 /** 推进槽 / 轮次状态（/api/session/:id/turn-state，侧栏常驻） */
 interface TurnState {
@@ -98,6 +98,17 @@ const apiStream = async (
 const mergeHistory = (prev: Message[], server: { id: number; round: number; role: string; content: string }[]): Message[] => {
   const localIds = new Map(prev.map((m) => [`${m.round}:${m.role}`, m.id]));
   return server.map((m) => ({ ...m, id: localIds.get(`${m.round}:${m.role}`) ?? nextMsgId() }));
+};
+
+/** 会话时间显示：当天 HH:MM，当年 MM-DD，跨年 YYYY-MM-DD */
+const formatSessionTime = (iso: string): string => {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  const now = new Date();
+  const pad = (n: number) => String(n).padStart(2, '0');
+  if (d.toDateString() === now.toDateString()) return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  if (d.getFullYear() === now.getFullYear()) return `${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 };
 
 const STAGE_LABEL: Record<string, string> = {
@@ -720,15 +731,19 @@ export function App() {
         <ul>
           {sessions.map((s) => (
             <li key={s.id} className="session-row">
-              <button className="session-resume" onClick={() => { setConfirmDel(null); resumeSession(s.id); }} disabled={busy}>
-                <span className="session-name">{s.name}</span>
-                {s.preview && <span className="session-preview">{s.preview}</span>}
-              </button>
               <button
-                className={`mini-btn${confirmDel === s.id ? ' mini-btn-danger' : ''}`}
+                className={`session-del${confirmDel === s.id ? ' session-del-confirm' : ''}`}
                 title={confirmDel === s.id ? '再点一次确认删除（历史不可恢复）' : '删除本会话'}
                 onClick={() => deleteSession(s)} disabled={busy}
-              >{confirmDel === s.id ? '✓?' : '🗑'}</button>
+              >{confirmDel === s.id ? '✕' : '🗑'}</button>
+              <button className="session-resume" onClick={() => { setConfirmDel(null); resumeSession(s.id); }} disabled={busy}>
+                <span className="session-name">{s.name}</span>
+                {(s.start || s.preview) && <span className="session-start">{s.start || s.preview}</span>}
+                <span className="session-meta">
+                  {s.round !== undefined && s.round > 0 && <span className="session-round">R{s.round}</span>}
+                  {s.createdAt && <span className="session-time">{formatSessionTime(s.createdAt)}</span>}
+                </span>
+              </button>
             </li>
           ))}
         </ul>
