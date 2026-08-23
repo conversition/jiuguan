@@ -334,14 +334,14 @@ body { font-family: system-ui, 'PingFang SC', 'Microsoft YaHei', sans-serif; bac
 .btn-file:hover { opacity: .9; }
 
 /* ═══════════ 会话列表操作（删除会话）═══════════ */
-.session-row { display: flex; gap: 6px; align-items: stretch; }
+.session-row { display: flex; gap: 6px; align-items: center; }
 .session-del {
-  flex: 0 0 auto; width: 30px; align-self: stretch;
+  flex: 0 0 auto; width: 26px; height: 26px;
   display: flex; align-items: center; justify-content: center;
   padding: 0; line-height: 1;
   background: var(--bg-card); color: var(--ink-3);
   border: 1px solid var(--border); border-radius: 6px;
-  cursor: pointer; font-size: 14px;
+  cursor: pointer; font-size: 13px;
 }
 .session-del:hover { background: var(--bg-hover); color: var(--danger); }
 .session-del:disabled { opacity: .4; cursor: not-allowed; }
