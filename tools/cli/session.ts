@@ -20,12 +20,14 @@ import { parsePreset } from '../../packages/core/src/preset.ts';
 import { RegexLibrary } from '../../packages/core/src/regex-library.ts';
 import { applyRegexRules } from '../../packages/core/src/regex.ts';
 import { LorebookScanner } from '../../packages/core/src/scanner.ts';
+import { parseLoreEntries, buildAliasIndex } from '../../packages/core/src/lore-parse.ts';
+import type { AliasEntry } from '../../packages/core/src/lore-parse.ts';
 import { matchSkills, renderSkillBlock, type SkillMatch } from '../../packages/core/src/skills.ts';
 import { ToolDag, type ToolContext, type ToolDefinition } from '../../packages/core/src/tool-dag.ts';
 import { MemoryDb } from '../../packages/memory/src/db.ts';
 import { WriteLoop } from '../../packages/memory/src/writer.ts';
 import type { WriteResult } from '../../packages/memory/src/writer.ts';
-import { RetrievalEngine } from '../../packages/memory/src/retrieval.ts';
+import { RetrievalEngine, readableLoreContent, renderRecallBlock } from '../../packages/memory/src/retrieval.ts';
 import { Vectorizer } from '../../packages/memory/src/vectorize.ts';
 import { createEmbeddingProvider, HashEmbeddingProvider } from '../../packages/memory/src/embedding.ts';
 import { getPgVectorStore } from '../../packages/memory/src/pg-vector.ts';
@@ -211,6 +213,10 @@ export class ChatSession {
   /** 上下文提供者运行时（L1：依赖满足激活 + 干净撤销）与 cost/priority 台账（L2 调度） */
   private ctxRuntime = new ContextProviderRuntime();
   private ctxCost = new Map<string, { cost: number; priority: number; reducible?: boolean }>();
+  /** 实体名册（buildAliasIndex：entityName → AliasEntry，惰性构建一次）——角色档案层的数据源 */
+  private entityRoster: Map<string, AliasEntry> | null = null;
+  /** 本轮已注入档案的 lore 条目 id（记忆块去重用） */
+  private archiveIds = new Set<number>();
   /** 每回合预计算结果暂存（provider build 闭包读取：L3 内容源） */
   private turnInput: { recall: RecallResult | null; scan: ScanResult | null; bars: Record<string, number>; vmsValues: Record<string, string | number | boolean> } =
     { recall: null, scan: null, bars: {}, vmsValues: {} };
@@ -299,6 +305,13 @@ export class ChatSession {
   /** 世界书激活扫描调试：返回激活条目与统计 */
   debugScan(input: string): import('../../packages/core/src/scanner.ts').ScanResult {
     return this.scanner.scan({ text: input, seed: Date.now() % 100000, budgetTokens: 600 });
+  }
+
+  /** 角色档案调试：返回当前输入命中的角色档案注入块（text + 已注入条目 id） */
+  debugArchive(input: string): { text: string; ids: number[] } {
+    const focus: TurnFocus = { round: this.round, scene: this.currentScene(), present: this.presentEntities(input), bars: {}, input };
+    const r = this.buildArchiveBlock(focus);
+    return { text: r.text, ids: [...r.ids] };
   }
 
   /** 推进槽持久化：累加 bars_delta 到 memory_meta.bars（clamp 0-100） */
@@ -474,14 +487,90 @@ export class ChatSession {
     return input.split(/[，。！？、,.!?\s]+/).filter((s) => s.length >= 2 && s.length <= 8).slice(0, 6);
   }
 
-  /** 检索 query 增强：压缩摘要 + 完整输入 + 在场实体裸词 + 推进槽（替代仅 24 字截断），预算内截断
+  /** 实体名册（惰性构建一次）：世界书启用条目 → buildAliasIndex「实体名→所属条目」。
+   *  复用离线索引同一逻辑（lore-parse），纯 core 计算，无 PG 依赖；CLI/Web 同享。
+   *  注意：必须显式带 uid=行 id——parseLoreEntries 在缺 uid 时用数组下标覆盖 id（0 基），
+   *  会与 lorebook_entry 自增 id（1 基）错位，导致档案条目选取漂移。 */
+  private buildEntityRoster(): Map<string, AliasEntry> {
+    if (this.entityRoster) return this.entityRoster;
+    try {
+      const rows = this.mem.db.prepare(
+        'SELECT id, book, key, comment, content, constant, active FROM lorebook_entry WHERE active = 1'
+      ).all() as { id: number; book: string; key: string; comment: string; content: string; constant: number; active: number }[];
+      this.entityRoster = buildAliasIndex(parseLoreEntries(rows.map((r) => ({ ...r, uid: r.id })) as never, ''));
+    } catch {
+      this.entityRoster = new Map();
+    }
+    return this.entityRoster;
+  }
+
+  /** 角色档案恒定层：名册实体（entityName/别名，含「会长→桐月樱佳」职位简写）命中本轮回话线索 →
+   *  完整注入该实体「本体设定」条目（active=1 且 constant/comment 含实体名），绕开 120/200 字截断与 L2 调度。
+   *  返回注入文本 + 已注入 lore 条目 id（记忆块去重）。预算 JG_ARCHIVE_TOKENS（默认 8000），≤2 实体。 */
+  private buildArchiveBlock(focus: TurnFocus): { text: string; ids: Set<number> } {
+    const empty = { text: '', ids: new Set<number>() };
+    const roster = this.buildEntityRoster();
+    if (roster.size === 0) return empty;
+    const clue = `${focus.input} ${focus.present.join(' ')} ${focus.scene}`;
+    // byEntity 携带 AliasEntry 引用：roster 的 key 是「别名」而非 entityName，不能靠 roster.get(entityName)
+    const byEntity = new Map<string, { entry: AliasEntry; strength: number }>();
+    for (const [alias, entry] of roster) {
+      if (!entry.entityName) continue;
+      const nameHit = clue.includes(entry.entityName);
+      const aliasHit = alias !== entry.entityName && clue.includes(alias);
+      if (!nameHit && !aliasHit) continue;
+      const prev = byEntity.get(entry.entityName);
+      const strength = Math.max(prev?.strength ?? 0, nameHit ? 2 : 1);
+      byEntity.set(entry.entityName, { entry, strength });
+    }
+    const top = [...byEntity.entries()].sort((a, b) => b[1].strength - a[1].strength).slice(0, 2);
+    if (top.length === 0) return empty;
+
+    const globalBudget = Number(process.env.JG_ARCHIVE_TOKENS ?? 8000);
+    const perEntityBudget = Math.max(1500, Math.floor(globalBudget / top.length));
+    const ids = new Set<number>();
+    const blocks: string[] = [];
+    let used = 0;
+    for (const [, { entry }] of top) {
+      if (entry.entryIds.length === 0) continue;
+      const placeholders = entry.entryIds.map(() => '?').join(',');
+      const rows = this.mem.db.prepare(
+        `SELECT id, comment, content, constant FROM lorebook_entry
+         WHERE active = 1 AND id IN (${placeholders})
+         ORDER BY constant DESC, id ASC`
+      ).all(...entry.entryIds) as { id: number; comment: string; content: string; constant: number }[];
+      // 本体设定：常驻条目 或 comment 含实体名的条目（排除情节/EJS 变量条目之外的同名碎片）
+      const profile = rows.filter((r) => r.constant === 1 || String(r.comment ?? '').includes(entry.entityName));
+      if (profile.length === 0) continue;
+      for (const r of profile) ids.add(r.id);
+      const text = profile.map((r) => `[${entry.entityName}] ${r.comment}: ${readableLoreContent(r.content)}`).join('\n');
+      const capped = used + estimateTokens(text) > globalBudget
+        ? shrinkToBudget(text, Math.min(perEntityBudget, globalBudget - used))
+        : text;
+      used += estimateTokens(capped);
+      blocks.push(capped);
+    }
+    if (blocks.length === 0) return empty;
+    return { text: `<角色档案>\n${blocks.join('\n\n')}\n</角色档案>`, ids };
+  }
+
+  /** 检索 query 增强：压缩摘要 + 完整输入 + 名册实体锚点 + 在场实体裸词 + 推进槽，预算内截断
    *  压缩摘要（memory_meta.longterm）并入 query 头：被滑动窗口压缩掉的旧文/远史靠摘要词项仍能被记忆检索召回；
-   *  实体裸词（不加前缀）：与内容同词形，FTS/LIKE 才能命中；<300 字预算 */
+   *  名册实体锚点（新）：input 命中任一枚实体别名/真名 → 追加该实体规范名（「会长」→「桐月樱佳」），
+   *  解决用户不点全名时检索失去角色锚的问题；<300 字预算 */
   private buildRecallQuery(input: string, bars: Record<string, number>): string {
     const lt = this.getLongTermCompact();
+    const roster = this.buildEntityRoster();
+    const anchors: string[] = [];
+    for (const [alias, entry] of roster) {
+      if (!entry.entityName || anchors.includes(entry.entityName)) continue;
+      if (input.includes(entry.entityName) || input.includes(alias)) anchors.push(entry.entityName);
+      if (anchors.length >= 6) break;
+    }
     const parts = [
       lt,
       input,
+      ...anchors,
       ...this.presentEntities(input),
       Object.entries(bars).map(([k, v]) => `${k}:${v}`).join(' '),
     ].filter(Boolean);
@@ -530,12 +619,14 @@ export class ChatSession {
     });
     if (relevant.length === 0) return '';
     return relevant.map((e) => {
-      // medium 语义：注入标题 + 摘要而非完整内容（LLM 决定是否展开）；其余注入完整
+      // medium 语义：注入标题 + 摘要而非完整内容（LLM 决定是否展开）；其余注入完整；
+      // 统一用可读设定（剥 EJS/MVU/{{//}} 代码），模型读到设定正文而非代码噪音
+      const readable = readableLoreContent(e.content);
       const content = e.matchType === 'semantic' && e.priority === 'medium'
-        ? `${e.content.slice(0, 100)}…(可展开)`
-        : e.content;
+        ? `${readable.slice(0, 240)}…(可展开)`
+        : readable;
       const tag = e.constant ? '恒定' : e.matchType;
-      return `[${tag}] ${e.comment}: ${content.slice(0, 200)}`;
+      return `[${tag}] ${e.comment}: ${content.slice(0, 500)}`;
     }).join('\n');
   }
 
@@ -800,7 +891,7 @@ export class ChatSession {
           const input = c.runtime.input as string;
           const bars = c.runtime.bars as Record<string, number>;
           const ns = basename(self.dbPath).replace(/\.db$/i, ''); // PG 命名空间 = 会话 DB 基名（隔离跨卡，同会话多世界书共享）
-          const hits = await c.runtime.ret!.recallAsync({ query: self.buildRecallQuery(input, bars), round, budgetTokens: 400, namespace: ns });
+          const hits = await c.runtime.ret!.recallAsync({ query: self.buildRecallQuery(input, bars), round, budgetTokens: 600, namespace: ns });
           // data 必须直接是完整 RecallResult（调用方据此读 injectedBlock/codes 进装配）；包一层 {hits,raw}
           // 会让 provider 的 turnInput.recall.injectedBlock 读到 undefined → 记忆块静默失活（0.5.0 回归）
           return { ok: true, data: hits, cost: hits.hits.length };
@@ -873,7 +964,16 @@ export class ChatSession {
     const variableValues = { ...(vmsResult?.values ?? {}), ...(this.bridge?.getFlat() ?? {}) };
     this.turnInput = { recall: recall ?? null, scan: scan ?? null, bars, vmsValues: variableValues };
     const focus: TurnFocus = { round, scene: this.currentScene(), present: this.presentEntities(userInput), bars, input: userInput };
+    // 角色档案恒定层：命中实体本体设定完整注入（绕开 120/200 字截断与 L2 调度预算）
+    const archive = this.buildArchiveBlock(focus);
+    this.archiveIds = archive.ids;
     const ctx = this.scheduleTurnContext(focus);
+    // 记忆块去重：已被档案完整注入的 lore 条目从记忆召回剔除（避免同条目「短版+全版」重复喂给模型）
+    let memoryBlock = ctx.memoryBlock;
+    if (this.archiveIds.size > 0 && recall && Array.isArray(recall.hits)) {
+      const deduped = recall.hits.filter((h) => !(h.category === 'lore' && this.archiveIds.has(h.rowId)));
+      memoryBlock = renderRecallBlock(deduped);
+    }
     // 动态状态：优先世界状态结构化块（L2 规范化呈现）；被预算裁掉则退回紧凑推进槽
     let dynamicState = ctx.worldStateBlock || `轮次: ${round}\n推进槽: ${JSON.stringify({
       personal: bars.personal ?? 0, accident: bars.accident ?? 0, main: bars.main ?? 0, erotic: bars.erotic ?? 0,
@@ -886,10 +986,10 @@ export class ChatSession {
     const userContent = `<最新互动>\n${userInput}\n</最新互动>${pluginInject.length ? `\n<插件注入>\n${pluginInject.join('\n')}\n</插件注入>` : ''}${skillBlock ? `\n${skillBlock}` : ''}`;
     const assembled = assembleTurn({
       systemCore: DEFAULT_SYSTEM_CORE,
-      staticSettings: `角色卡：${this.cardName}\n${this.cardDesc.slice(0, 400)}${ctx.worldbookBlock ? `\n\n<世界书激活>\n${ctx.worldbookBlock}\n</世界书激活>` : ''}`,
+      staticSettings: `角色卡：${this.cardName}\n${this.cardDesc.slice(0, 400)}${ctx.worldbookBlock ? `\n\n<世界书激活>\n${ctx.worldbookBlock}\n</世界书激活>` : ''}${archive.text ? `\n\n${archive.text}` : ''}\n\n<设定纪律>\n世界书/角色档案未记载的具体细节（外貌细节、能力名号与数值、未登场事件）严禁自行捏造；如剧情确需，向对方或世界意志询问，或以「（设定未记载）」留白。\n</设定纪律>`,
       dynamicState,
       presetBlocks: this.presetBlocks,
-      memoryBlock: ctx.memoryBlock,
+      memoryBlock,
       longTermBlock: ctx.longTermBlock,
       chatHistory: windowInfo.messages,
       lastTurn: this.lastTurn,
@@ -1433,7 +1533,7 @@ ${context}`;
     const ns = basename(this.dbPath).replace(/\.db$/i, '');
     return orch.run(text, {
       mode: 'batch',
-      shotCount: Math.min(30, Math.max(1, Number(params.shots ?? 9))),
+      shotCount: Math.min(30, Math.max(1, Number(params.shots ?? 3))),
       workflow: params.workflow,
       voice: params.voice,
       recallQuery,

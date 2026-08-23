@@ -6,6 +6,7 @@
  */
 import { MemoryDb } from '../../memory/src/db.ts';
 import type { EmbeddingProvider } from '../../memory/src/embedding.ts';
+import { readableLoreContent } from '../../memory/src/retrieval.ts';
 import { estimateTokens } from '../../prompt/src/assembly.ts';
 import { SemanticWorldbookActivator } from './worldbook/semantic-activator.ts';
 import type { ActivationContext } from './worldbook/types.ts';
@@ -167,9 +168,10 @@ export class LorebookScanner {
       if (deterministicIds.has(s.entryId)) continue;
       const row = this.mem.db.prepare('SELECT * FROM lorebook_entry WHERE id = ?').get(s.entryId) as unknown as LoreRow | undefined;
       if (!row) continue;
-      // 语义补充不重复应用确定性概率门（概率已作为融合信号计入得分，避免双重过滤）
+      // 语义补充不重复应用确定性概率门（概率已作为融合信号计入得分，避免双重过滤）；
+      // 注入可读设定（剥 EJS/MVU/{{//}} 代码），模型看到的是设定正文而非代码噪音
       supplements.push({
-        id: row.id, uid: row.uid, comment: row.comment, content: row.content,
+        id: row.id, uid: row.uid, comment: row.comment, content: readableLoreContent(row.content),
         constant: false, matchType: 'semantic', score: s.score, order: 2,
         priority: s.priority, triggeredBy: s.triggeredBy,
       });
@@ -196,7 +198,7 @@ export class LorebookScanner {
     for (const row of rows) {
       // 1. 常量恒激活
       if (row.constant === 1) {
-        activated.push({ id: row.id, uid: row.uid, comment: row.comment, content: row.content, constant: true, matchType: 'constant', score: 1.0, order: 0 });
+        activated.push({ id: row.id, uid: row.uid, comment: row.comment, content: readableLoreContent(row.content), constant: true, matchType: 'constant', score: 1.0, order: 0 });
         stats.constant++;
         continue;
       }
@@ -231,7 +233,7 @@ export class LorebookScanner {
       }
 
       activated.push({
-        id: row.id, uid: row.uid, comment: row.comment, content: row.content,
+        id: row.id, uid: row.uid, comment: row.comment, content: readableLoreContent(row.content),
         constant: false, matchType, score: matchType === 'regex' ? 0.9 : 0.8, order: row.constant === 1 ? 0 : 1,
       });
     }
@@ -274,7 +276,7 @@ export class LorebookScanner {
     if (entries.length === 0) return '';
     const lines = entries.map((e) => {
       const tag = e.constant ? '[恒定]' : `[${e.matchType}]`;
-      return `${tag} ${e.comment}: ${e.content.slice(0, 200)}`;
+      return `${tag} ${e.comment}: ${e.content.slice(0, 500)}`;
     });
     return lines.join('\n');
   }

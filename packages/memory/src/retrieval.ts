@@ -171,6 +171,16 @@ export function readableLoreContent(raw: string): string {
     .trim();
 }
 
+/** 记忆块渲染（带来源与置信度标注；导出供 session 对去重后的 hits 重渲染，截断长度可调） */
+export function renderRecallBlock(hits: RecallHit[], truncate = 240): string {
+  if (hits.length === 0) return '<记忆召回>\n（本轮无高置信记忆命中）\n</记忆召回>';
+  const lines = hits.map((h) => {
+    const tag = h.confidence === 'low' ? ' [存疑]' : '';
+    return `[${h.code || `ROW${h.rowId}`}|${h.category}|${h.score.toFixed(2)}|${h.source}]${tag} ${h.content.slice(0, truncate)}`;
+  });
+  return `<记忆召回>\n${lines.join('\n')}\n</记忆召回>`;
+}
+
 export class RetrievalEngine {
   /** 注入的 embedding provider（真实语义向量；缺省用内置 hash） */
   private embedProvider: { embed: (t: string) => Promise<number[]> } | null = null;
@@ -207,9 +217,10 @@ export class RetrievalEngine {
         for (const a of aliasHits) {
           // 反查该实体的 lorebook_entry.rowId：优先 comment 精确含实体名（角色本体设），退而 content 含
           const entity = a.entityName.replace(/[%_\]]/g, ' ').trim();
+          // 仅启用条目：废弃（active=0）旧档案不得进入召回（0.9.x RAG 卫生）
           const rows = this.mem.db.prepare(
             `SELECT id AS rowId, CASE WHEN comment LIKE ?1 COLLATE NOCASE THEN 0 ELSE 1 END AS rank
-             FROM lorebook_entry WHERE comment LIKE ?1 OR content LIKE ?2
+             FROM lorebook_entry WHERE active = 1 AND (comment LIKE ?1 OR content LIKE ?2)
              ORDER BY rank ASC, id ASC LIMIT 6`
           ).all(`%${entity}%`, `%${entity}%`) as { rowId: number; rank: number }[];
           for (const { rowId } of rows.slice(0, 2)) {
@@ -436,12 +447,7 @@ export class RetrievalEngine {
 
   /** 注入块渲染（带来源与置信度标注） */
   private renderBlock(hits: RecallHit[]): string {
-    if (hits.length === 0) return '<记忆召回>\n（本轮无高置信记忆命中）\n</记忆召回>';
-    const lines = hits.map((h) => {
-      const tag = h.confidence === 'low' ? ' [存疑]' : '';
-      return `[${h.code || `ROW${h.rowId}`}|${h.category}|${h.score.toFixed(2)}|${h.source}]${tag} ${h.content.slice(0, 120)}`;
-    });
-    return `<记忆召回>\n${lines.join('\n')}\n</记忆召回>`;
+    return renderRecallBlock(hits);
   }
 
   /** FTS trigram 查询词元：3-6 字短词（trigram 完整匹配语义） */
@@ -503,7 +509,8 @@ export class RetrievalEngine {
     const meta = FTS_TABLES[category];
     const src = meta.srcTable;
     try {
-      const row = this.mem.db.prepare(`SELECT * FROM ${src} WHERE id = ? LIMIT 1`).get(rowId) as Record<string, unknown> | undefined;
+      // 世界书静态条目仅取启用（active=1）：废弃/停用旧档案不得从任意通道注入
+      const row = this.mem.db.prepare(`SELECT * FROM ${src} WHERE id = ? ${category === 'lore' ? 'AND active = 1' : ''} LIMIT 1`).get(rowId) as Record<string, unknown> | undefined;
       if (!row) return null;
       const content = category === 'state'
         ? `${row.name ?? ''} ${row.state_json ?? ''}`

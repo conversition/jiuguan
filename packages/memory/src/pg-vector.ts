@@ -177,8 +177,35 @@ export class PgVectorStore {
     }
   }
 
-  /**
-   * 别名/职位简写确定性检索（限定 namespace）。优先精确匹配，再退化到包含匹配——"会长"
+  /** 清理某命名空间内指定条目的向量/设定残留（废弃 active=0 条目不再索引，但旧 chunk 仍在 → 显式 DELETE） */
+  async purgeLore(namespace: string, ids: number[]): Promise<void> {
+    if (!this.ready || !this.pool || ids.length === 0) return;
+    try {
+      const ph = ids.map((_, i) => `$${i + 2}`).join(',');
+      await this.pool.query(
+        `DELETE FROM lore_chunk WHERE namespace = $1 AND lore_id IN (${ph})`,
+        [namespace, ...ids],
+      );
+      await this.pool.query(
+        `DELETE FROM lore_text WHERE namespace = $1 AND id IN (${ph})`,
+        [namespace, ...ids],
+      );
+    } catch (e) {
+      console.warn(`[pgvector] purgeLore 失败(${ids.length}): ${(e as Error).message.slice(0, 100)}`);
+    }
+  }
+
+  /** 清空某命名空间全部别名（重新构建前先清理，避免废弃实体别名残留） */
+  async resetAliases(namespace: string): Promise<void> {
+    if (!this.ready || !this.pool) return;
+    try {
+      await this.pool.query('DELETE FROM lore_alias WHERE namespace = $1', [namespace]);
+    } catch (e) {
+      console.warn(`[pgvector] resetAliases 失败: ${(e as Error).message.slice(0, 100)}`);
+    }
+  }
+
+  /** 别名/职位简写确定性检索（限定 namespace）。优先精确匹配，再退化到包含匹配——"会长"
    * 应对应"桐月樱佳"，不依赖 FTS trigram（2 字词 FTS 天然失效）。
    */
   async queryByAlias(namespace: string, query: string, k = 8): Promise<{ alias: string; entityName: string; explicit: boolean }[]> {

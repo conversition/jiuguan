@@ -56,9 +56,10 @@ async function main(): Promise<void> {
 
   // 1) 收集「解析条目」
   const parsedLore: ReturnType<typeof parseLoreEntry>[] = [];
+  let mem: MemoryDb | null = null;
   if (o.db) {
-    const mem = new MemoryDb({ path: o.db, autoInit: false });
-    const rows = mem.db.prepare('SELECT id, book, key, comment, content, constant, active FROM lorebook_entry').all();
+    mem = new MemoryDb({ path: o.db, autoInit: false });
+    const rows = mem.db.prepare('SELECT id, book, key, comment, content, constant, active FROM lorebook_entry WHERE active = 1').all();
     for (const r of rows as { id: number; book: string; key: string; comment: string; content: string; constant: number; active: number }[]) {
       if ((r.content ?? '').trim().length === 0) continue;
       parsedLore.push(parseLoreEntry({ id: r.id, book: r.book, key: r.key, comment: r.comment, content: r.content, constant: r.constant, active: r.active }));
@@ -68,7 +69,7 @@ async function main(): Promise<void> {
     const json = JSON.parse(readFileSync(wb, 'utf8'));
     let entries: unknown[] = json.entries ?? json.originalData?.entries ?? [];
     if (!Array.isArray(entries)) entries = Object.values(entries);
-    parsedLore.push(...parseLoreEntries(entries as never, wb));
+    parsedLore.push(...parseLoreEntries(entries as never, wb).filter((p) => p.meta.active !== false));
   }
   // 去重（同 id 保留先到者）
   const seen = new Set<number>();
@@ -125,7 +126,18 @@ async function main(): Promise<void> {
   for (const w of writeBatch) await pg.upsertLore(w);
   written += writeBatch.length;
 
+  // 4.5) 废弃条目（active=0）残留清理：旧 chunk/text 不再索引但仍在 PG，显式 DELETE
+  if (mem) {
+    const inactive = mem.db.prepare('SELECT id FROM lorebook_entry WHERE active = 0').all() as { id: number }[];
+    if (inactive.length > 0) {
+      await pg.purgeLore(namespace, inactive.map((r) => r.id));
+      console.log(`[索引] 清理废弃条目 ${inactive.length} 条的 PG 残留`);
+    }
+  }
+
   // 5) 别名/职位简写写入 lore_alias（`会长→桐月樱佳` 确定性检索，解决 2 字词 FTS 失效）
+  //    resetAliases 先清空该命名空间旧别名（含废弃实体推导），再写入当前启用条目别名，避免残留
+  await pg.resetAliases(namespace);
   const aliasIndex = buildAliasIndex(unique);
   const aliasRows: { alias: string; entityName: string; explicit: boolean }[] = [];
   for (const [alias, entry] of aliasIndex) {
