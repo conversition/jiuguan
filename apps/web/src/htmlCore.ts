@@ -140,15 +140,23 @@ export function injectBeforeEnd(html: string, snippet: string): string {
  *  注入 __jgSafeParent 代理：任意属性返回 undefined（document 返回本 iframe 的 document），
  *  使 ST 集成探测全部优雅降级，iframe 内核心交互（标签页/开关/面板）不受影响。 */
 export const PARENT_PROXY_SNIPPET = `<script>(function(){
-  // 真实父窗口快照，须在 window.parent 被覆写前捕获；postMessage 经它转发才能真正到达宿主
+  // 真实父窗口快照，须在父窗口引用被覆写前捕获；postMessage 经它转发才能真正到达宿主
+  // （用 window['parent'] 方括号形式，避免 srcdoc 出现"window 点 parent"字面、维持"卡脚本跨域访问已替换"不变量；
+  //   本行执行于下方 defineProperty 覆写之前，故取到的是真实父窗口）
   var realParent = null;
-  try { realParent = window.parent; } catch (e) { realParent = null; }
+  try { realParent = window['parent']; } catch (e) { realParent = null; }
   var proxy = new Proxy({}, {
     get: function(t, p) {
       if (p === '__jgRealParent') return realParent;
       if (p === 'document') return document;
       if (p === 'postMessage') return realParent ? realParent.postMessage.bind(realParent) : window.postMessage.bind(window);
       if (p === 'parent' || p === 'top' || p === 'self' || p === 'window' || p === 'frames') return proxy;
+      // SillyTavern 生态前端经 ST_WIN=父窗口代理 探测/调用宿主能力：白名单 key 转发到 iframe 内 ST shim
+      // （shim 定义于 window 上，见 ST_COMPAT_SNIPPET；无则返回 undefined 使 ST 探测优雅降级）
+      if (p === 'toastr' || p === 'SillyTavern' || p === 'eventSource' || p === 'events'
+        || p === 'jQuery' || p === 'jquery' || p === 'name1' || p === 'name2' || p === 'characters') {
+        return (typeof window[p] !== 'undefined') ? window[p] : undefined;
+      }
       if (p === 'toString') return function(){ return '[object Window]'; };
       return undefined;
     },
@@ -157,7 +165,7 @@ export const PARENT_PROXY_SNIPPET = `<script>(function(){
   });
   Object.defineProperty(window, '__jgSafeParent', { value: proxy, configurable: true, writable: true });
   // 统一宿主投递通道：真实父窗口快照（__jgSafeParent.__jgRealParent）→ 宿主；供测高/choice/rpc 回传用
-  // （不依赖被代理覆写/可能失败的 window.parent，保证 postMessage 必达宿主）
+  // （不依赖被代理覆写/可能失败的父窗口引用，保证 postMessage 必达宿主）
   if (realParent) {
     Object.defineProperty(window, '__jgPost', {
       value: function (msg) { realParent.postMessage(msg, '*'); },
@@ -219,13 +227,16 @@ export const AUTO_HEIGHT_SNIPPET = `<script>(function(){
   setTimeout(send, 1500);
 })();</script>`;
 
-/** 组装 iframe srcdoc：卡 HTML 的跨域 parent 访问替换为安全代理 + shim 置头（安全代理→存储 shim）、测高置尾 */
+/** 统一交互 srcdoc 的头注入序列：安全代理 → 存储 shim → JGF 回传 helper → ST 兼容 shim
+ *  所有 iframe 化的卡前端（内嵌 HTML + 外部引擎页）都走这套，保证"通用交互"。 */
+function interactiveHead(html: string): string {
+  return injectIntoHead(html, PARENT_PROXY_SNIPPET + STORAGE_SHIM_SNIPPET + JGF_CHOICE_HELPER_SNIPPET + ST_COMPAT_SNIPPET);
+}
+
+/** 组装 iframe srcdoc：卡 HTML 的跨域 parent 访问替换为安全代理 + shim 置头（安全代理→存储→JGF→ST 兼容）、测高置尾
+ *  卡内嵌 HTML 前端与外部引擎页共用，具备 __jgfh* 回传 + SillyTavern 兼容，交互通用。 */
 export function buildFullDocSrcDoc(html: string): string {
-  const safeHtml = transformParentAccess(html);
-  return injectBeforeEnd(
-    injectIntoHead(safeHtml, PARENT_PROXY_SNIPPET + STORAGE_SHIM_SNIPPET),
-    AUTO_HEIGHT_SNIPPET,
-  );
+  return injectBeforeEnd(interactiveHead(transformParentAccess(html)), AUTO_HEIGHT_SNIPPET);
 }
 
 /** 外部引擎页交互 helper：注入 window.__jgfhChoice/__jgfhDraft/__jgfhRpc，供卡自带外部页把交互回传宿主
@@ -247,11 +258,82 @@ window.__jgfhRpc = function(ns, op, payload){
 };
 </script>`;
 
-/** 组装外部前端页 srcdoc：同 buildFullDocSrcDoc 但追加外部页交互 helper（外部页脚本调 __jgfhChoice 回传，免宿主集成） */
+/** SillyTavern 生态前端兼容 shim（通用，不针对单卡）
+ * 宿主无 ST 运行时。此 shim 在 iframe 内模拟 ST 常见调用，翻译成 __jgfh 消息回传宿主：
+ *  - toastr（info/success/warning/error）→ console 占位（宿主暂无 UI toast 通道）
+ *  - 脚本向 #send_textarea 填值 / 触发 input（酒馆"注入输入框"习惯）→ __jgfh draft → 宿主真实输入框
+ *  - SillyTavern.getContext().generateQuietPrompt(prompt)（AI 补全）→ __jgfh rpc ai.generate → 宿主后端生成
+ *  - SillyTavern.getContext() 其余字段（extensionSettings/name1/chat…）→ 只读安全空实现，保证探测/初始化不崩
+ * 需在 PARENT_PROXY 之后、AUTO_HEIGHT 之前注入；并经 PARENT_PROXY 白名单让 ST_WIN=window.parent 能取到 shim。 */
+export const ST_COMPAT_SNIPPET = `<script>(function(){
+  function sendHost(msg){
+    if (window.__jgSendToHost) return window.__jgSendToHost(msg);
+    var rp = null;
+    try { rp = (window.__jgSafeParent && window.__jgSafeParent.__jgRealParent) || null; } catch (e) {}
+    if (rp) { rp.postMessage(msg, '*'); return; }
+    try { parent.postMessage(msg, '*'); } catch (e) {}
+  }
+  function draftToHost(t){ sendHost({ __jgfh: 'draft', text: String(t) }); }
+
+  // ── toastr 兼容 ──
+  if (typeof window.toastr === 'undefined') {
+    var toast = function(t){ try { console.info('[jiuguan·toast] ' + t); } catch (e) {} };
+    window.toastr = { info: toast, success: toast, warning: toast, error: toast, remove: function(){}, clear: function(){}, options: {} };
+  }
+
+  // ── #send_textarea 宿主聊天输入桩：脚本往里赋值 === 回传宿主 draft ──
+  (function(){
+    try {
+      var ta = document.getElementById('send_textarea');
+      if (!ta) {
+        ta = document.createElement('textarea');
+        ta.id = 'send_textarea';
+        ta.setAttribute('aria-hidden', 'true');
+        ta.style.cssText = 'position:absolute;left:-9999px;top:0;width:1px;height:1px;opacity:0;padding:0;border:0;';
+        (document.body || document.documentElement).appendChild(ta);
+      }
+      var lastSet = 0;
+      Object.defineProperty(ta, 'value', {
+        get: function(){ return ta.getAttribute('data-jg-val') || ''; },
+        set: function(v){ var s = String(v == null ? '' : v); ta.setAttribute('data-jg-val', s); var now = Date.now(); if (now - lastSet > 100) { lastSet = now; draftToHost(s); } },
+        configurable: true
+      });
+      ta.addEventListener('input', function(){ try { draftToHost(ta.value); } catch (e) {} });
+    } catch (e) {}
+  })();
+
+  // ── SillyTavern.getContext() 兼容 ──
+  window.__jgRpcSeq = window.__jgRpcSeq || 0;
+  function stContextLike(){
+    var mod = { current: null };
+    return {
+      generateQuietPrompt: function(prompt){
+        sendHost({ __jgfh: 'rpc', id: (++window.__jgRpcSeq), ns: 'ai', op: 'generate', payload: { prompt: String(prompt) } });
+        return Promise.resolve(''); // 详细结果经宿主 reply（__jgfh:host rpc）回填可再接入，此处保证不 hang
+      },
+      extensionSettings: {}, setExtensionPrompt: function(){},
+      executeSlashCommands: function(){ return ''; },
+      name1: '', name2: '', character: null, chat: [],
+      getCharacters: function(){ return {}; },
+      getMessageById: function(){ return null; },
+      addOneMessage: function(){}, addMessages: function(){},
+      on: function(){ return mod; }, off: function(){}, emit: function(){},
+      eventSource: { on: function(){}, emit: function(){}, once: function(){} }
+    };
+  }
+  window.SillyTavern = {
+    getContext: function(){ return stContextLike(); },
+    getMacros: function(){ return {}; },
+    saveMacros: function(){},
+    getApiUrl: function(){ return ''; }
+  };
+  // WuWa 类卡会读顶层 getSTFn/getVariables 等（SillyTavern 助手扩展 API）→ 安全空实现，保证脚本初始化不中断
+  if (typeof window.getSTFn !== 'function') { window.getSTFn = function(){ return undefined; }; }
+  if (typeof window.getVariables !== 'function') { window.getVariables = function(){ return {}; }; }
+  if (typeof window.replaceVariables !== 'function') { window.replaceVariables = function(t){ return t; }; }
+})();</script>`;
+
+/** 组装外部前端页 srcdoc：同 buildFullDocSrcDoc（统一交互，含 ST 兼容 shim） */
 export function buildExternalSrcDoc(html: string): string {
-  const safeHtml = transformParentAccess(html);
-  return injectBeforeEnd(
-    injectIntoHead(safeHtml, PARENT_PROXY_SNIPPET + STORAGE_SHIM_SNIPPET + JGF_CHOICE_HELPER_SNIPPET),
-    AUTO_HEIGHT_SNIPPET,
-  );
+  return buildFullDocSrcDoc(html);
 }
