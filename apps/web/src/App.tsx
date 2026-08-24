@@ -8,8 +8,8 @@ import { EditorPanel } from './EditorPanel.tsx';
 import { SkillsPanel } from './SkillsPanel.tsx';
 import { MarkdownMessage, StreamText } from './MarkdownMessage.tsx';
 import { HtmlMessage, splitGalSegments } from './HtmlMessage.tsx';
-import { GalStage } from './gal/GalStage.tsx';
-import { isJgFrameMessage, findFrame } from './gal/bridge.ts';
+import { GalSegment } from './gal/GalSegment.tsx';
+import { isJgFrameMessage, findFrame, broadcastToFrames } from './gal/bridge.ts';
 import type { JgFrameMessage } from './gal/bridge.ts';
 import { setGalRuntime } from './gal/rt.ts';
 import type { GalRuntime } from './gal/rt.ts';
@@ -152,6 +152,8 @@ const MessageRow = React.memo(function MessageRow({
   const segs = !streaming && m.role === 'assistant' ? splitGalSegments(shown, dr.gal) : null;
   const singleText = !!segs && segs.length === 1 && segs[0].type === 'text';
   const hasHtmlSeg = !!segs && !singleText;
+  // 卡片"前端界面"规则的外链引擎 URL（存在 → gal 段提供「原生/外部前端」切换）
+  const galExternalUrl = regexRules?.find((r) => r.galExternalUrl)?.galExternalUrl;
   const anchorKey = toMessageKey(m.round, m.role);
   // 锚点 ref 记忆化（v0.6.1）：registerAnchor(key) 每次调用都返回新函数，
   // 直接内联会导致非流式行每渲染触发 ref 解绑/重绑、锚点 Map 反复增删（抖动）。
@@ -171,7 +173,7 @@ const MessageRow = React.memo(function MessageRow({
           <div className="msg-segments">
             {segs.map((seg, i) =>
               seg.type === 'gal'
-                ? <GalStage key={i} script={seg.content} busy={busy} />
+                ? <GalSegment key={i} script={seg.content} busy={busy} externalUrl={galExternalUrl} />
                 : seg.type === 'html'
                   ? <HtmlMessage key={i} text={seg.content} />
                   : <div key={i} className="bubble read"><MarkdownMessage text={seg.content} /></div>
@@ -322,6 +324,8 @@ export function App() {
     document.documentElement.dataset.theme = theme;
     localStorage.setItem('jg-theme', theme);
   }, [theme]);
+  // 主题同步到已注册 iframe/外部页（__jgfh:host）
+  useEffect(() => { broadcastToFrames({ __jgfh: 'host', op: 'theme', value: theme }); }, [theme]);
   useEffect(() => {
     document.documentElement.style.setProperty('--read-fs', `${readFs}px`);
     localStorage.setItem('jg-read-fs', String(readFs));

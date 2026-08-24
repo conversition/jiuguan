@@ -214,3 +214,27 @@ export function buildFullDocSrcDoc(html: string): string {
     AUTO_HEIGHT_SNIPPET,
   );
 }
+
+/** 外部引擎页交互 helper：注入 window.__jgfhChoice/__jgfhDraft/__jgfhRpc，供卡自带外部页把交互回传宿主
+ *  （与原生 GalStage 的 choice 走同一 __jgfh 协议，宿主无需区分来源） */
+export const JGF_CHOICE_HELPER_SNIPPET = `<script>
+window.__jgfhChoice = function(text, mode){
+  parent.postMessage({ __jgfh: 'choice', text: String(text), mode: mode === 'draft' ? 'draft' : 'send' }, '*');
+};
+window.__jgfhDraft = function(text){
+  parent.postMessage({ __jgfh: 'draft', text: String(text) }, '*');
+};
+window.__jgfhRpc = function(ns, op, payload){
+  window.__jgfhRpcSeq = (window.__jgfhRpcSeq || 0) + 1;
+  parent.postMessage({ __jgfh: 'rpc', id: window.__jgfhRpcSeq, ns: ns, op: op, payload: payload }, '*');
+};
+</script>`;
+
+/** 组装外部前端页 srcdoc：同 buildFullDocSrcDoc 但追加外部页交互 helper（外部页脚本调 __jgfhChoice 回传，免宿主集成） */
+export function buildExternalSrcDoc(html: string): string {
+  const safeHtml = transformParentAccess(html);
+  return injectBeforeEnd(
+    injectIntoHead(safeHtml, PARENT_PROXY_SNIPPET + STORAGE_SHIM_SNIPPET + JGF_CHOICE_HELPER_SNIPPET),
+    AUTO_HEIGHT_SNIPPET,
+  );
+}

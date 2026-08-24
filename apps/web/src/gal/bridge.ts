@@ -42,6 +42,11 @@ export function findFrame(source: MessageEventSource | null): JgFrameHandle | un
   return undefined;
 }
 
+/** 向所有已注册 iframe 广播（宿主 → iframe：主题/缩放同步等） */
+export function broadcastToFrames(msg: JgHostMessage): void {
+  for (const h of frames) h.post(msg);
+}
+
 /** 构造向某个 iframe 定向发消息的函数（不透明源 targetOrigin 只能 '*'） */
 export function buildFramePost(win: Window, targetOrigin = '*'): (msg: JgHostMessage) => void {
   return (msg) => win.postMessage(msg, targetOrigin);

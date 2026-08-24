@@ -730,6 +730,22 @@ const server = createServer(async (req, res) => {
       return json(res, { ok: true, removed });
     }
 
+    // 服务端代理抓取外部前端页文本（如卡自带 amakano3/index.html；浏览器 fetch 跨域受限，由服务器侧解决 CORS）
+    if (method === 'POST' && p === '/api/assets/page') {
+      const body = await readBody(req);
+      const pageUrl = String(body.url ?? '').trim();
+      if (!/^https?:\/\//.test(pageUrl)) return json(res, { error: 'url 必须为 http(s)' }, 400);
+      try {
+        const resp = await fetch(pageUrl, { headers: { 'User-Agent': 'jiuguan-assets/1' }, signal: AbortSignal.timeout(20000) });
+        if (!resp.ok) return json(res, { error: `HTTP ${resp.status}` }, 502);
+        const html = await resp.text();
+        if (html.length > 2_000_000) return json(res, { error: '页面过大（>2MB）' }, 400);
+        return json(res, { ok: true, url: pageUrl, html: html.slice(0, 2_000_000) });
+      } catch (e) {
+        return json(res, { error: (e as Error).message.slice(0, 200) }, 502);
+      }
+    }
+
     // ── P3 资产工具 ──
 
     // 正则调试器：测试 findRegex 对输入文本的匹配/替换（P3）

@@ -105,3 +105,27 @@
   background: rgba(10, 14, 24, 0.5); color: #b8c0d6; font-size: 11px;
   padding: 4px 10px; border-radius: 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+/* ── 原生/外部前端切换条 + 外部页 ── */
+.gal-segment { margin: 4px 0; }
+.gal-switch {
+  display: flex; align-items: center; gap: 6px;
+  margin: 0 0 6px; padding: 4px 8px; width: fit-content;
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: 999px;
+}
+.gal-switch-label { font-size: 11px; color: var(--ink-3); margin-right: 2px; }
+.gal-switch-btn {
+  font-size: 11px; color: var(--ink-3); background: transparent; border: none;
+  cursor: pointer; padding: 2px 8px; border-radius: 999px;
+}
+.gal-switch-btn.on { background: var(--accent); color: #fff; }
+
+.gal-ext-state {
+  padding: 36px 16px; text-align: center; color: var(--ink-3);
+  border: 1px dashed var(--border); border-radius: 12px; background: var(--bg-card); font-size: 13px;
+}
+.gal-ext-error { color: var(--warn); }
+.gal-ext-hint { margin-top: 6px; font-size: 12px; color: var(--ink-4); }
+.gal-ext-frame {
+  width: 100%; border: none; border-radius: 12px; background: #10141c;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35); display: block;
+}

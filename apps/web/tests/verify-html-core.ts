@@ -18,6 +18,8 @@ import {
   STORAGE_SHIM_SNIPPET,
   AUTO_HEIGHT_SNIPPET,
   splitGalSegments,
+  buildExternalSrcDoc,
+  JGF_CHOICE_HELPER_SNIPPET,
 } from '../src/htmlCore.ts';
 
 let passed = 0;
@@ -153,6 +155,14 @@ const galSeg3 = splitGalSegments('普通文本。', null);
 check('gal 为 null → 行为一致', galSeg3.length === 1 && galSeg3[0].type === 'text');
 const galSeg4 = splitGalSegments('# 标题\n\x00JGGAL0\x00\n[bg|A]\n对话\n\x00JGGAL1\x00\n\n结尾', ['[bg|A]', '[cg|B]']);
 check('多 gal 段顺序解析', galSeg4.filter((s) => s.type === 'gal').map((s) => s.index).join(',') === '0,1');
+
+console.log('\n== buildExternalSrcDoc（外部引擎页备选路径）==');
+const ext = buildExternalSrcDoc('<!DOCTYPE html><html><head></head><body><script>window.parent.something()</script></body></html>');
+check('helper __jgfhChoice 注入', ext.includes('__jgfhChoice') && ext.includes('__jgfhDraft') && ext.includes('__jgfhRpc'));
+check('安全代理 + helper 置头（先于 body 解析执行卡脚本）', ext.includes(PARENT_PROXY_SNIPPET) && ext.includes(JGF_CHOICE_HELPER_SNIPPET) && ext.indexOf(PARENT_PROXY_SNIPPET) < ext.indexOf('<body>'));
+check('测高脚本在 </body> 前注入（文档主体解析后执行）', ext.indexOf(AUTO_HEIGHT_SNIPPET) < ext.indexOf('</body>'));
+check('window.parent 替换为安全代理', !/window\.parent/.test(ext) && ext.includes('window.__jgSafeParent'));
+check('JGF_CHOICE_HELPER_SNIPPET 含协议', JGF_CHOICE_HELPER_SNIPPET.includes("__jgfh: 'choice'"));
 
 console.log(`\n结果: ${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);
