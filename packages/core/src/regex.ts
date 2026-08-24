@@ -6,8 +6,16 @@
  *  - findRegex 解析（/.../flags 正则 或 字面串）
  *  - 按 scope 应用规则（顺序执行，返回应用统计）
  *  - 卡片 regex_scripts 智能导入（前端注入规则 display 专属启用，其余按卡片 disabled 标记）
- *  - display 两阶段管线 applyDisplayRules：注入 HTML 先抽离为令牌，其它规则不触碰注入产物
+ *  - display 三阶段管线 applyDisplayRules：GLA 场景块抽令牌 + 注入 HTML 抽令牌，其它规则不触碰注入产物
  */
+import { extractGalBlocks } from './gal.ts';
+
+/** 提取"GLA 前端界面"规则的外链引擎 URL（find 命中 <gal_inface> 且 replace 引用外链页），供外部前端备选路径 */
+function galExternalUrlHint(find: string, replace: string): string | undefined {
+  if (!/gal_inface/i.test(find)) return undefined;
+  const m = /https?:\/\/[^\s'"`\]>]+/.exec(replace);
+  return m ? m[0].replace(/\)$/, '') : undefined;
+}
 
 export interface RegexRule {
   id: string;
@@ -21,6 +29,9 @@ export interface RegexRule {
   source: 'builtin' | 'user' | 'card';
   /** 整文档前端注入（replaceString 为完整 HTML 文档/围栏）：display 专属、字面替换、绝进模型 prompt */
   inject?: boolean;
+  /** GLA「前端界面」规则（find 命中 <gal_inface> 且 replace 引外链引擎页）：原生引擎消费 gal 块后此类规则结构性失效，
+   *  此字段记录外链引擎 URL，供"外部前端"备选路径（Phase 6）使用 */
+  galExternalUrl?: string;
   note?: string;
   order: number;
 }
@@ -77,18 +88,21 @@ export function applyRegexRules(text: string, rules: RegexRule[], scope: RegexSc
   return { text: out, applied, count: applied.length };
 }
 
-/** display 两阶段管线：前端注入规则（inject）先把占位符替换为唯一令牌，其余 display 规则在令牌化文本上运行，
- *  最后令牌还原为 HTML。保证注入的 HTML 对其它 strip/杀八股 规则完全不透明（防止 <status>/<options> 等被误删）。
+/** display 三阶段管线：① GLA 块（<gal_inface>）先抽离为令牌（对其它规则完全不透明）；② 注入规则把占位符替换为唯一令牌；
+ *  ③ 其余 display 规则在令牌化文本上运行；最后令牌还原为 HTML。
+ *  保证注入的 HTML 与 gal 前端对其它 strip/杀八股 规则完全不透明（防止 <status>/<options> 等被误删）。
  *  Phase A 用函数替换 → replaceString 按字面（整文档注入无 $n 反向引用依赖）。 */
 export function applyDisplayRules(
   text: string,
   rules: RegexRule[],
-): { text: string; applied: string[]; injected: string[] } {
+): { text: string; applied: string[]; injected: string[]; gal: string[] } {
+  // Phase 0：GLA 场景块抽令牌（gal[] 保留块内脚本，前端 GalStage 消费；块对其它规则不可见）
+  const { text: gText, gal } = extractGalBlocks(text);
   const injectRules = rules.filter((r) => r.inject && r.enabled);
   const otherRules = rules.filter((r) => !r.inject);
   // Phase A：注入 → 令牌（占位符先于一切 strip 被消费，如 <StatusPlaceHolderImpl/> 先注入后 strip 不抢先）
   const fragments = new Map<string, string>();
-  let tokenized = text;
+  let tokenized = gText;
   const injected: string[] = [];
   for (let idx = 0; idx < injectRules.length; idx++) {
     const r = injectRules[idx];
@@ -110,7 +124,7 @@ export function applyDisplayRules(
   for (const [token, html] of fragments) {
     out = out.split(token).join(html);
   }
-  return { text: out, applied: mid.applied, injected };
+  return { text: out, applied: mid.applied, injected, gal };
 }
 
 /** 内置默认库：屏蔽卡片/模型常见的原始标记（display 为主；美化类默认禁用） */
@@ -170,6 +184,7 @@ export function importCardRegexScripts(
       scope: isFrontendDoc ? 'display' : matchesPlain ? 'prompt' : scope,
       source: 'card',
       inject: isFrontendDoc,
+      galExternalUrl: galExternalUrlHint(find, replace),
       note: isFrontendDoc ? '前端注入（仅展示，不进模型）' : isContextTransformer ? '整文/全局变换（跨卡易污染），默认禁用' : isHide ? '隐藏类，自动启用' : undefined,
       order: 100 + rules.length,
     });

@@ -17,6 +17,7 @@ import {
   PARENT_PROXY_SNIPPET,
   STORAGE_SHIM_SNIPPET,
   AUTO_HEIGHT_SNIPPET,
+  splitGalSegments,
 } from '../src/htmlCore.ts';
 
 let passed = 0;
@@ -141,6 +142,17 @@ if (statusBar) {
 } else {
   console.log('  ⚠️ 未找到 MVU 状态栏规则，跳过真实卡断言');
 }
+
+console.log('\n== splitGalSegments（GLA 分段；不传 gal 时行为同 splitHtmlSegments）==');
+const galSeg1 = splitGalSegments('叙事A\n\x00JGGAL0\x00\n叙事B', ['[bg|乐乐浦寮会客厅早晨]\n叶梦|呀吼！']);
+check('gal 令牌 → gal 段', galSeg1.length === 3 && galSeg1[1].type === 'gal' && galSeg1[1].content.includes('叶梦|呀吼'));
+check('gal 前后叙事保留', galSeg1[0].type === 'text' && galSeg1[2].type === 'text');
+const galSeg2 = splitGalSegments('纯文本\n```html\n<!DOCTYPE html><html><body>前端页面</body></html>\n```\n结尾', ['x']);
+check('无 gal 令牌 → 回退 splitHtmlSegments', galSeg2.some((s) => s.type === 'html') && !galSeg2.some((s) => s.type === 'gal'));
+const galSeg3 = splitGalSegments('普通文本。', null);
+check('gal 为 null → 行为一致', galSeg3.length === 1 && galSeg3[0].type === 'text');
+const galSeg4 = splitGalSegments('# 标题\n\x00JGGAL0\x00\n[bg|A]\n对话\n\x00JGGAL1\x00\n\n结尾', ['[bg|A]', '[cg|B]']);
+check('多 gal 段顺序解析', galSeg4.filter((s) => s.type === 'gal').map((s) => s.index).join(',') === '0,1');
 
 console.log(`\n结果: ${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);

@@ -38,8 +38,11 @@ export function extractHtmlFromCodeFence(text: string): string | null {
   return looksLikeHtml(inner) ? inner : null;
 }
 
-/** 消息分段类型：普通文本段（气泡渲染） / HTML 前端段（iframe 或 Shadow DOM 渲染） */
-export type HtmlSegment = { type: 'text'; content: string } | { type: 'html'; content: string };
+/** 消息分段类型：普通文本段（气泡渲染） / HTML 前端段（iframe 或 Shadow DOM 渲染） / GLA 场景段（GalStage 渲染） */
+export type HtmlSegment =
+  | { type: 'text'; content: string }
+  | { type: 'html'; content: string }
+  | { type: 'gal'; content: string; index: number };
 
 /** 把消息内容拆成文本段与 HTML 段：
  *  - 行首 ``` 围栏且内容像 HTML（开场页/状态栏整文档）→ html 段（围栏剥掉）
@@ -86,6 +89,34 @@ export function splitHtmlSegments(text: string): HtmlSegment[] {
     return looksLikeHtml(t) ? [{ type: 'html', content: t }] : [{ type: 'text', content: t }];
   }
   return segments;
+}
+
+/** GLA 令牌（applyDisplayRules Phase 0 抽取 <gal_inface> 块的占位符） */
+export const GAL_TOKEN_RE = /\x00JGGAL(\d+)\x00/g;
+
+/** 把消息内容拆成文本/HTML/GLA 段：
+ *  - text 里含 \x00JGGAL<i>\x00 令牌（来自 applyDisplayRules 的 gal 抽取）→ 抽出为 {type:'gal'} 段（内容=块内脚本）
+ *  - 其余文本段落回退 splitHtmlSegments（HTML 围栏照常抽 iframe，叙事留气泡）
+ *  - 不传 gal（无 GLA 场景）时行为与 splitHtmlSegments 完全一致（旧视窗不破） */
+export function splitGalSegments(text: string, gal: string[] | null | undefined): HtmlSegment[] {
+  if (!gal || gal.length === 0) return splitHtmlSegments(text);
+  GAL_TOKEN_RE.lastIndex = 0;
+  const segs: HtmlSegment[] = [];
+  let last = 0;
+  let saw = false;
+  let m: RegExpExecArray | null;
+  while ((m = GAL_TOKEN_RE.exec(text))) {
+    saw = true;
+    const before = text.slice(last, m.index);
+    if (before.trim()) segs.push(...splitHtmlSegments(before));
+    const idx = Number(m[1]);
+    segs.push({ type: 'gal', content: gal[idx] ?? '', index: idx });
+    last = m.index + m[0].length;
+  }
+  if (!saw) return splitHtmlSegments(text);
+  const after = text.slice(last);
+  if (after.trim()) segs.push(...splitHtmlSegments(after));
+  return segs;
 }
 
 /** 在 <head> 开头注入（无 <head> 则文档最前）：shim 需先于卡片脚本执行 */

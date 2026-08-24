@@ -18,7 +18,7 @@ import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { sanitizeHtml, looksLikeFullDoc, buildFullDocSrcDoc } from './htmlCore.ts';
 import { buildFramePost, registerFrame } from './gal/bridge.ts';
 
-export { sanitizeHtml, looksLikeHtml, looksLikeFullDoc, extractHtmlFromCodeFence, splitHtmlSegments } from './htmlCore.ts';
+export { sanitizeHtml, looksLikeHtml, looksLikeFullDoc, extractHtmlFromCodeFence, splitHtmlSegments, splitGalSegments } from './htmlCore.ts';
 
 /** 完整文档 / 含脚本 → 沙箱 srcdoc iframe：原样放行卡自带 HTML/CSS/JS（沙箱即安全边界），shim 置头、测高置尾 */
 function FullDocFrame({ html }: { html: string }) {

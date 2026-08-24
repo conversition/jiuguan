@@ -7,7 +7,8 @@ import { SessionSetup } from './SessionSetup.tsx';
 import { EditorPanel } from './EditorPanel.tsx';
 import { SkillsPanel } from './SkillsPanel.tsx';
 import { MarkdownMessage, StreamText } from './MarkdownMessage.tsx';
-import { HtmlMessage, splitHtmlSegments } from './HtmlMessage.tsx';
+import { HtmlMessage, splitHtmlSegments, splitGalSegments } from './HtmlMessage.tsx';
+import { GalPlaceholder } from './gal/GalPlaceholder.tsx';
 import { isJgFrameMessage, findFrame } from './gal/bridge.ts';
 import type { JgFrameMessage } from './gal/bridge.ts';
 import { setGalRuntime } from './gal/rt.ts';
@@ -145,9 +146,10 @@ const MessageRow = React.memo(function MessageRow({
   streamingMsgRef: React.RefObject<HTMLDivElement>;
   registerAnchor: (key: string) => (el: HTMLDivElement | null) => void;
 }) {
-  const shown = showRaw || !regexRules ? m.content : applyDisplayRules(m.content, regexRules).text;
-  // 分段渲染：围栏内 HTML 前端（开场页/状态栏）抽为 iframe 段，周围叙事留在气泡段；纯文本走原气泡
-  const segs = !streaming && m.role === 'assistant' ? splitHtmlSegments(shown) : null;
+  const dr = showRaw || !regexRules ? { text: m.content, gal: [] as string[] } : applyDisplayRules(m.content, regexRules);
+  const shown = dr.text;
+  // 分段渲染：围栏内 HTML 前端 + GLA(<gal_inface>) 场景抽为独立段，周围叙事留在气泡段
+  const segs = !streaming && m.role === 'assistant' ? splitGalSegments(shown, dr.gal) : null;
   const singleText = !!segs && segs.length === 1 && segs[0].type === 'text';
   const hasHtmlSeg = !!segs && !singleText;
   const anchorKey = toMessageKey(m.round, m.role);
@@ -168,9 +170,11 @@ const MessageRow = React.memo(function MessageRow({
         {hasHtmlSeg && segs ? (
           <div className="msg-segments">
             {segs.map((seg, i) =>
-              seg.type === 'html'
-                ? <HtmlMessage key={i} text={seg.content} />
-                : <div key={i} className="bubble read"><MarkdownMessage text={seg.content} /></div>
+              seg.type === 'gal'
+                ? <GalPlaceholder key={i} index={seg.index} />
+                : seg.type === 'html'
+                  ? <HtmlMessage key={i} text={seg.content} />
+                  : <div key={i} className="bubble read"><MarkdownMessage text={seg.content} /></div>
             )}
           </div>
         ) : m.role === 'assistant' ? (

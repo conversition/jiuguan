@@ -28,3 +28,8 @@ console.log(`注入规则 ${lib.list().filter((r) => r.inject).length} 条：`);
 for (const r of lib.list().filter((x) => x.inject)) {
   console.log(`  - ${r.name}（${r.replaceString.length} 字符，scope=${r.scope}，enabled=${r.enabled}）`);
 }
+const galExt = lib.list().filter((r) => r.galExternalUrl);
+console.log(`GLA「前端界面」规则 ${galExt.length} 条（原生引擎消费 <gal_inface> 后结构性失效；外链引擎供"外部前端"备选）：`);
+for (const r of galExt) {
+  console.log(`  - ${r.name} → ${r.galExternalUrl}`);
+}
