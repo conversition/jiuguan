@@ -684,6 +684,7 @@ export function App() {
     if (d.ns === 'theme' && d.op === 'get') return reply({ theme });
     if (d.ns === 'viewport' && d.op === 'get') return reply({ w: window.innerWidth, h: window.innerHeight });
     if (d.ns === 'asset' && d.op === 'resolve') return reply({ status: 'miss' }); // 资源解析在资产模块落地后填充
+    if (d.ns === 'ai' && d.op === 'generate') return reply(undefined, 'ai.generate 暂未接入（宿主无静默生成端点）');
     return reply(undefined, `未知 rpc ${d.ns}.${d.op}`);
   };
   const frameMsgHandlerRef = useRef({ sendText, applyBranch, handleRpc: handleRpcMessage });
