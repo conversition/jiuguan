@@ -140,10 +140,14 @@ export function injectBeforeEnd(html: string, snippet: string): string {
  *  注入 __jgSafeParent 代理：任意属性返回 undefined（document 返回本 iframe 的 document），
  *  使 ST 集成探测全部优雅降级，iframe 内核心交互（标签页/开关/面板）不受影响。 */
 export const PARENT_PROXY_SNIPPET = `<script>(function(){
+  // 真实父窗口快照，须在 window.parent 被覆写前捕获；postMessage 经它转发才能真正到达宿主
+  var realParent = null;
+  try { realParent = window.parent; } catch (e) { realParent = null; }
   var proxy = new Proxy({}, {
     get: function(t, p) {
+      if (p === '__jgRealParent') return realParent;
       if (p === 'document') return document;
-      if (p === 'postMessage') return window.postMessage.bind(window);
+      if (p === 'postMessage') return realParent ? realParent.postMessage.bind(realParent) : window.postMessage.bind(window);
       if (p === 'parent' || p === 'top' || p === 'self' || p === 'window' || p === 'frames') return proxy;
       if (p === 'toString') return function(){ return '[object Window]'; };
       return undefined;
@@ -152,6 +156,14 @@ export const PARENT_PROXY_SNIPPET = `<script>(function(){
     ownKeys: function(){ return []; }
   });
   Object.defineProperty(window, '__jgSafeParent', { value: proxy, configurable: true, writable: true });
+  // 统一宿主投递通道：真实父窗口快照（__jgSafeParent.__jgRealParent）→ 宿主；供测高/choice/rpc 回传用
+  // （不依赖被代理覆写/可能失败的 window.parent，保证 postMessage 必达宿主）
+  if (realParent) {
+    Object.defineProperty(window, '__jgPost', {
+      value: function (msg) { realParent.postMessage(msg, '*'); },
+      configurable: true, writable: true,
+    });
+  }
   // 尽力把父窗口 / 顶窗口本体也指向安全代理（浏览器允许则更彻底；不允许则由 transformParentAccess 文本替换兜底）
   try { Object.defineProperty(window, 'parent', { configurable: true, get: function(){ return proxy; } }); } catch (e) {
     try { Object.defineProperty(Window.prototype, 'parent', { configurable: true, get: function(){ return proxy; } }); } catch (e2) {}
@@ -190,11 +202,12 @@ export const STORAGE_SHIM_SNIPPET = `<script>(function(){
  *  宽带上报供自适应宿主（容器宽度变化时可二次布局）；兼容旧 {__jgfh_h:'height'} 消费方。 */
 export const AUTO_HEIGHT_SNIPPET = `<script>(function(){
   var t = 0;
+  function post(msg){ if (window.__jgPost) window.__jgPost(msg); else parent.postMessage(msg, '*'); }
   function send(){
     var d = document.documentElement, b = document.body;
     var h = Math.max(d ? d.scrollHeight : 0, b ? b.scrollHeight : 0);
     var w = Math.max(d ? d.clientWidth : 0, b ? b.clientWidth : 0);
-    if (h > 0 || w > 0) parent.postMessage({ __jgfh_h: 'size', w: w, h: h }, '*');
+    if (h > 0 || w > 0) post({ __jgfh_h: 'size', w: w, h: h });
   }
   function deb(){ clearTimeout(t); t = setTimeout(send, 80); }
   window.addEventListener('load', send);
@@ -218,15 +231,19 @@ export function buildFullDocSrcDoc(html: string): string {
 /** 外部引擎页交互 helper：注入 window.__jgfhChoice/__jgfhDraft/__jgfhRpc，供卡自带外部页把交互回传宿主
  *  （与原生 GalStage 的 choice 走同一 __jgfh 协议，宿主无需区分来源） */
 export const JGF_CHOICE_HELPER_SNIPPET = `<script>
+function __jgSendToHost(msg){
+  if (window.__jgPost) { window.__jgPost(msg); return; }
+  parent.postMessage(msg, '*');
+}
 window.__jgfhChoice = function(text, mode){
-  parent.postMessage({ __jgfh: 'choice', text: String(text), mode: mode === 'draft' ? 'draft' : 'send' }, '*');
+  __jgSendToHost({ __jgfh: 'choice', text: String(text), mode: mode === 'draft' ? 'draft' : 'send' });
 };
 window.__jgfhDraft = function(text){
-  parent.postMessage({ __jgfh: 'draft', text: String(text) }, '*');
+  __jgSendToHost({ __jgfh: 'draft', text: String(text) });
 };
 window.__jgfhRpc = function(ns, op, payload){
   window.__jgfhRpcSeq = (window.__jgfhRpcSeq || 0) + 1;
-  parent.postMessage({ __jgfh: 'rpc', id: window.__jgfhRpcSeq, ns: ns, op: op, payload: payload }, '*');
+  __jgSendToHost({ __jgfh: 'rpc', id: window.__jgfhRpcSeq, ns: ns, op: op, payload: payload });
 };
 </script>`;
 
