@@ -86,8 +86,8 @@ async function main() {
   // 手工注入孤儿轮 2（有 user 无 assistant，模拟历史失败残留）
   dbOf(s2).prepare("INSERT INTO chat_log (round, role, content, created_at) VALUES (2, 'user', '孤儿输入', ?)").run(new Date().toISOString());
   const win = windowOf(s2)(2);
-  check('场景2 buildChatWindow 跳过孤儿轮', !win.messages.some((m) => m.content === '孤儿输入'), `got ${JSON.stringify(win.messages)}`);
-  check('场景2 窗口仍含正常轮', win.messages.some((m) => m.content === '第一句'), `got ${JSON.stringify(win.messages)}`);
+  check('场景2 buildChatWindow 跳过孤儿轮', !win.messages.some((m) => m.content.trim() === '孤儿输入'), `got ${JSON.stringify(win.messages)}`);
+  check('场景2 窗口仍含正常轮', win.messages.some((m) => m.content.trim() === '第一句'), `got ${JSON.stringify(win.messages)}`);
 
   // ---- 场景3：regenerate 失败 → 占位 assistant 成对，无孤儿 ----
   const db3 = join(dir, `fallback-test3-${Date.now()}.db`);

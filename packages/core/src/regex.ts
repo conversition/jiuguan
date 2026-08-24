@@ -17,6 +17,24 @@ function galExternalUrlHint(find: string, replace: string): string | undefined {
   return m ? m[0].replace(/\)$/, '') : undefined;
 }
 
+/** FNV-1a 32bit（hex，无 node 依赖，浏览器/服务端同可用）：内容 → 稳定规则 id 后缀（跨卡防碰撞） */
+function fnv1aHex(str: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, '0');
+}
+
+/** 卡片规则 id：name 拉丁 slug + 内容哈希。
+ *  纯中文名 slug 为单 '-'，若只加序号会与其它卡同序号碰撞（card---N 跨卡互相覆盖）——哈希保证按内容唯一、幂等可重导入。 */
+function cardRuleId(name: string, find: string, replace: string): string {
+  const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-') || '-';
+  const hash = fnv1aHex(`${name}\x00${find}\x00${replace}`);
+  return `card-${slug}-${hash}`;
+}
+
 export interface RegexRule {
   id: string;
   name: string;
@@ -174,7 +192,7 @@ export function importCardRegexScripts(
       return !!re && re.test(PLAIN_SAMPLE_TEXT);
     })();
     rules.push({
-      id: `card-${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${rules.length}`,
+      id: cardRuleId(name, find, replace),
       name,
       findRegex: find,
       replaceString: replace,
