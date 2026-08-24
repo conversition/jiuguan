@@ -155,13 +155,15 @@ export const STORAGE_SHIM_SNIPPET = `<script>(function(){
   try { Object.defineProperty(window, 'sessionStorage', { value: api, configurable: true, writable: true }); } catch (e) { try { window.sessionStorage = api; } catch (e2) {} }
 })();</script>`;
 
-/** 通用自动测高：load/resize/MutationObserver 三通道，动态展开/收缩的前端自适应 iframe 高度（防抖 80ms） */
+/** 通用自动测高/测宽：load/resize/MutationObserver 三通道，上报 {__jgfh_h:'size',w,h}（防抖 80ms）。
+ *  宽带上报供自适应宿主（容器宽度变化时可二次布局）；兼容旧 {__jgfh_h:'height'} 消费方。 */
 export const AUTO_HEIGHT_SNIPPET = `<script>(function(){
   var t = 0;
   function send(){
     var d = document.documentElement, b = document.body;
     var h = Math.max(d ? d.scrollHeight : 0, b ? b.scrollHeight : 0);
-    if (h > 0) parent.postMessage({ __jgfh_h: 'height', h: h }, '*');
+    var w = Math.max(d ? d.clientWidth : 0, b ? b.clientWidth : 0);
+    if (h > 0 || w > 0) parent.postMessage({ __jgfh_h: 'size', w: w, h: h }, '*');
   }
   function deb(){ clearTimeout(t); t = setTimeout(send, 80); }
   window.addEventListener('load', send);

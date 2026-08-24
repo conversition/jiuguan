@@ -9,11 +9,14 @@
  *    - 任意卡自带 <script>/onclick 原样放行 → 前端交互（标签页/开关/面板/上传）可用
  *    - 不透明源：卡脚本无法访问宿主 DOM / app 数据 / cookie / 宿主 localStorage，无法导航/弹窗/表单
  *    - 通用 shim + 通用测高见 htmlCore.ts
+ *    - 交互桥：iframe 挂载时注册进 __jgfh 注册表（gal/bridge.ts）→ 卡脚本 postMessage choice/draft/rpc
+ *      可把选项回传聊天（choice → 发用户消息触发 AI）、填输入框（draft）或远程调用宿主能力（rpc）
  *    残余风险（用户已确认取舍）：卡脚本可 fetch 外网泄露自身静态内容（无会话数据；静态 <img> 本就能外联）
  *  片段走 Shadow DOM（宿主同源）→ 仍剥离 script / 事件处理器 / javascript: 链接，防 XSS
  */
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { sanitizeHtml, looksLikeFullDoc, buildFullDocSrcDoc } from './htmlCore.ts';
+import { buildFramePost, registerFrame } from './gal/bridge.ts';
 
 export { sanitizeHtml, looksLikeHtml, looksLikeFullDoc, extractHtmlFromCodeFence, splitHtmlSegments } from './htmlCore.ts';
 
@@ -22,15 +25,22 @@ function FullDocFrame({ html }: { html: string }) {
   const ref = useRef<HTMLIFrameElement>(null);
   const [height, setHeight] = useState(480);
   useEffect(() => {
+    // 交互桥：把本 iframe 窗口注册进 __jgfh 注册表，宿主据此校验 choice/draft/rpc 来源并向其回发消息
+    const win = ref.current?.contentWindow;
+    const unregister = win ? registerFrame(win, buildFramePost(win)) : undefined;
     const onMsg = (e: MessageEvent) => {
-      if (e.source === ref.current?.contentWindow && e.data && typeof e.data === 'object' && e.data.__jgfh_h === 'height') {
+      if (e.source === ref.current?.contentWindow && e.data && typeof e.data === 'object'
+        && (e.data.__jgfh_h === 'height' || e.data.__jgfh_h === 'size')) {
         const h = Number(e.data.h);
         if (Number.isFinite(h) && h > 0) setHeight(Math.min(Math.max(h + 8, 100), 1200));
       }
     };
     window.addEventListener('message', onMsg);
-    return () => window.removeEventListener('message', onMsg);
-  }, []);
+    return () => {
+      unregister?.();
+      window.removeEventListener('message', onMsg);
+    };
+  }, [html]);
   return <iframe ref={ref} className="html-msg-frame" title="卡片前端" sandbox="allow-scripts allow-modals" srcDoc={buildFullDocSrcDoc(html)} style={{ height }} />;
 }
 

@@ -8,6 +8,10 @@ import { EditorPanel } from './EditorPanel.tsx';
 import { SkillsPanel } from './SkillsPanel.tsx';
 import { MarkdownMessage, StreamText } from './MarkdownMessage.tsx';
 import { HtmlMessage, splitHtmlSegments } from './HtmlMessage.tsx';
+import { isJgFrameMessage, findFrame } from './gal/bridge.ts';
+import type { JgFrameMessage } from './gal/bridge.ts';
+import { setGalRuntime } from './gal/rt.ts';
+import type { GalRuntime } from './gal/rt.ts';
 import { applyDisplayRules } from '../../../packages/core/src/regex.ts';
 import type { RegexRule } from '../../../packages/core/src/regex.ts';
 import { useMessageRefs, toMessageKey } from './hooks/useMessageRefs.ts';
@@ -497,11 +501,14 @@ export function App() {
     setBusy(false);
   };
 
-  const send = async () => {
-    const text = input.trim();
+  /** 公共发送路径：输入框 send 与前端卡 choice/draft 共用。
+   *  mode 'send' → 直接作为用户消息发出触发 AI；'draft' → 填入输入框不自动发送（与分支按钮一致）。
+   *  不清空输入框（外部调用者不应动用户输入）；输入框清空由 send() 自身处理。 */
+  const sendText = async (raw: string, mode: 'send' | 'draft' = 'send') => {
+    if (mode === 'draft') { applyBranch(raw); return; }
+    const text = String(raw ?? '').trim();
     if (!text || !sessionId || busy) return;
-    logger.info('turn', '发送消息', { session: sessionId, content_mode: contentMode });
-    setInput('');
+    logger.info('turn', '发送消息', { session: sessionId, content_mode: contentMode, via: 'gla' });
     setBusy(true);
     setStreamCompleted(false);
     setError('');
@@ -564,6 +571,13 @@ export function App() {
     stopGenTimer();
     setStreamCompleted(true);
     setBusy(false);
+  };
+
+  /** 输入框发送：先清空输入框再走公共发送路径（busy 守卫在 sendText 内） */
+  const send = async () => {
+    if (!input.trim()) return;
+    setInput('');
+    await sendText(input);
   };
 
   /** 重新生成某条 AI 回复（SSE 流式原地替换目标消息内容；可中止） */
@@ -648,6 +662,41 @@ export function App() {
     deleteRound: (r) => deleteMessagesOp(r, 'round'),
     deleteFromHere: (r) => deleteMessagesOp(r, 'fromHere'),
   };
+
+  // ── GLA 交互桥：__jgfh 协议（iframe ⇄ 宿主） ──
+  //  rpc：iframe/外部页经 ns.op 远程调用宿主能力，回发结果给来源帧；所有回复都必须定向到 findFrame(来源)
+  const handleRpcMessage = (e: MessageEvent, d: Extract<JgFrameMessage, { __jgfh: 'rpc' }>) => {
+    const frame = findFrame(e.source);
+    const reply = (result?: unknown, error?: string) => frame?.post({ __jgfh: 'rpc', id: d.id, ok: !error, result, error });
+    if (d.ns === 'message' && d.op === 'send') {
+      const p = (d.payload ?? {}) as { text?: string; draft?: boolean };
+      if (typeof p.text === 'string') { if (p.draft === true) applyBranch(p.text); else sendText(p.text); }
+      return reply({ ok: true });
+    }
+    if (d.ns === 'theme' && d.op === 'get') return reply({ theme });
+    if (d.ns === 'viewport' && d.op === 'get') return reply({ w: window.innerWidth, h: window.innerHeight });
+    if (d.ns === 'asset' && d.op === 'resolve') return reply({ status: 'miss' }); // 资源解析在资产模块落地后填充
+    return reply(undefined, `未知 rpc ${d.ns}.${d.op}`);
+  };
+  const frameMsgHandlerRef = useRef({ sendText, applyBranch, handleRpc: handleRpcMessage });
+  frameMsgHandlerRef.current = { sendText, applyBranch, handleRpc: handleRpcMessage };
+  // 模块单例：GalStage/ChoiceOverlay 经 getGalRuntime() 取稳定发送入口（不破 memo）
+  const galRuntimeRef = useRef<GalRuntime>({ busy: false, sessionId: null, sendText: () => {} });
+  galRuntimeRef.current = { busy, sessionId, sendText };
+  setGalRuntime(galRuntimeRef.current);
+  useEffect(() => {
+    const onMsg = (e: MessageEvent) => {
+      if (!isJgFrameMessage(e.data)) return;
+      const d: JgFrameMessage = e.data;
+      if ('__jgfh_h' in d) return; // height/size 由 HtmlMessage 组件级处理测高
+      const h = frameMsgHandlerRef.current;
+      if (d.__jgfh === 'choice') h.sendText(d.text, d.mode === 'draft' ? 'draft' : 'send');
+      else if (d.__jgfh === 'draft') h.applyBranch(d.text);
+      else if (d.__jgfh === 'rpc') h.handleRpc(e, d);
+    };
+    window.addEventListener('message', onMsg);
+    return () => window.removeEventListener('message', onMsg);
+  }, []);
 
   // 导演模式：文本选区浮动按钮（启用条件=已有会话）+ 探窗目标（点击 🎬 时快照选区传入弹窗）
   const { sel: directorSel, dismiss: dismissDirector } = useTextSelectionDirector(Boolean(sessionId));
