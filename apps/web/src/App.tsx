@@ -7,8 +7,8 @@ import { SessionSetup } from './SessionSetup.tsx';
 import { EditorPanel } from './EditorPanel.tsx';
 import { SkillsPanel } from './SkillsPanel.tsx';
 import { MarkdownMessage, StreamText } from './MarkdownMessage.tsx';
-import { HtmlMessage, splitHtmlSegments, splitGalSegments } from './HtmlMessage.tsx';
-import { GalPlaceholder } from './gal/GalPlaceholder.tsx';
+import { HtmlMessage, splitGalSegments } from './HtmlMessage.tsx';
+import { GalStage } from './gal/GalStage.tsx';
 import { isJgFrameMessage, findFrame } from './gal/bridge.ts';
 import type { JgFrameMessage } from './gal/bridge.ts';
 import { setGalRuntime } from './gal/rt.ts';
@@ -171,7 +171,7 @@ const MessageRow = React.memo(function MessageRow({
           <div className="msg-segments">
             {segs.map((seg, i) =>
               seg.type === 'gal'
-                ? <GalPlaceholder key={i} index={seg.index} />
+                ? <GalStage key={i} script={seg.content} busy={busy} />
                 : seg.type === 'html'
                   ? <HtmlMessage key={i} text={seg.content} />
                   : <div key={i} className="bubble read"><MarkdownMessage text={seg.content} /></div>
