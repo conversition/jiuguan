@@ -518,6 +518,7 @@ const server = createServer(async (req, res) => {
       const overrides = {
         ...(body.baseUrl ? { baseUrl: String(body.baseUrl) } : {}),
         ...(body.apiKey ? { apiKey: String(body.apiKey) } : {}),
+        ...(body.model ? { model: String(body.model) } : {}), // 记录历史模型用表单值，避免落回已保存/默认模型
       };
       const cfg = loadProviderConfig(overrides);
       if (!cfg.apiKey) {
@@ -526,7 +527,13 @@ const server = createServer(async (req, res) => {
       const client = new OpenAICompatibleClient(cfg);
       try {
         const models = await client.listModels();
-        return json(res, { ok: true, models: models.slice(0, 50), count: models.length, baseUrl: cfg.baseUrl, model: cfg.model });
+        // 测试成功 → 记忆该 URL+模型（best-effort 旁路：写盘失败不拖垮成功响应）
+        let history: { baseUrl: string; model: string; lastSuccessAt: string }[] = [];
+        try {
+          const h = await import('../../packages/proxy/src/history.ts');
+          history = h.recordProviderUrl(cfg.baseUrl, cfg.model);
+        } catch { /* 历史记忆失败忽略 */ }
+        return json(res, { ok: true, models: models.slice(0, 50), count: models.length, baseUrl: cfg.baseUrl, model: cfg.model, history });
       } catch (e) {
         const status = (e as { status?: number }).status;
         const msg = (e as Error).message.slice(0, 300);
@@ -578,6 +585,25 @@ const server = createServer(async (req, res) => {
         keyFingerprint: cfg.keyFingerprint,
         prefixCacheThreshold: cfg.prefixCacheThreshold,
       });
+    }
+
+    // Provider 历史 URL（测试成功自动记录，不含 key）—— 面板下拉快速切换
+    if (method === 'GET' && p === '/api/provider/history') {
+      const { readProviderHistory } = await import('../../packages/proxy/src/history.ts');
+      return json(res, { ok: true, history: readProviderHistory() });
+    }
+
+    // Provider 历史删除（POST 兼容 CORS：json() 只放行 GET/POST/OPTIONS；body: {baseUrl} | {all:true}）
+    if (method === 'POST' && p === '/api/provider/history/delete') {
+      const { readProviderHistory, removeProviderUrl, writeProviderHistory } = await import('../../packages/proxy/src/history.ts');
+      const body = await readBody(req);
+      if ((body as { all?: unknown }).all === true) {
+        writeProviderHistory([]);
+        return json(res, { ok: true, history: [] });
+      }
+      const baseUrl = String(body.baseUrl ?? '').trim();
+      if (!baseUrl) return json(res, { error: '缺少要删除的 Base URL（或传 all:true 清空）' }, 400);
+      return json(res, { ok: true, history: removeProviderUrl(baseUrl) });
     }
 
     // ── P3 资产工具 ──
