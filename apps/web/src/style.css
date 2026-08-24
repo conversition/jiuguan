@@ -526,3 +526,12 @@ body { font-family: system-ui, 'PingFang SC', 'Microsoft YaHei', sans-serif; bac
 .director-val { padding: 8px 22px 0; max-height: 96px; overflow-y: auto; }
 .director-val .director-error, .director-val .director-warn { margin: 4px 0; font-size: 12px; line-height: 1.5; }
 .director-warn { color: var(--ink-4); }
+
+/* ── GLA 远端资源面板（AssetsPanel） ── */
+.asset-status .console-meta { margin: 6px 0; }
+.asset-kinds { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
+.postload-done { margin-top: 8px; }
+.preload-line { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+.preload-bar { flex: 1; height: 8px; border-radius: 999px; background: var(--bg-deep); border: 1px solid var(--border); overflow: hidden; }
+.preload-fill { height: 100%; background: var(--accent); border-radius: 999px; transition: width 0.15s linear; }
+.preload-meta { font-size: 12px; color: var(--ink-3); white-space: nowrap; }

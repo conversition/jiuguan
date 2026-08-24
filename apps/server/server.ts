@@ -28,12 +28,24 @@ import { RetrievalEngine } from '../../packages/memory/src/retrieval.ts';
 import { HashEmbeddingProvider, createEmbeddingProvider } from '../../packages/memory/src/embedding.ts';
 import { LorebookScanner } from '../../packages/core/src/scanner.ts';
 import { VariableManager } from '../../packages/variable/src/vms.ts';
+import {
+  DiskCache,
+  loadManifest,
+  saveManifest,
+  mergeAssetIndex,
+  downloadOne,
+  downloadAll,
+  mimeForUrl,
+} from '../../packages/assets/src/downloader.ts';
+import { buildAssetIndex, countByKind, classifyAsset, entryName, assetId } from '../../packages/assets/src/build-index.ts';
 
 const PORT = Number(process.env.JG_WEB_PORT ?? 17800);
 const HOST = '127.0.0.1';
 const DATA_DIR = resolve('data');
 /** 前端日志落盘路径（日志模块 v0.6.1：浏览器批量上报 → 逐行追加） */
 const WEB_LOG_PATH = resolve(DATA_DIR, 'web.log');
+/** GLA 远端资源缓存目录（data/assets；惰性下载 + 手动预载，磁盘缓存不入库） */
+const ASSET_DIR = resolve('data', 'assets');
 
 /** 后端兜底脱敏：剥掉 data 里的敏感字段（apiKey/key/token/authorization…），避免 key 落盘 */
 function stripSensitive(value: unknown): unknown {
@@ -604,6 +616,118 @@ const server = createServer(async (req, res) => {
       const baseUrl = String(body.baseUrl ?? '').trim();
       if (!baseUrl) return json(res, { error: '缺少要删除的 Base URL（或传 all:true 清空）' }, 400);
       return json(res, { ok: true, history: removeProviderUrl(baseUrl) });
+    }
+
+    // ── GLA 远端资源（扫描 / 预载 / 出图；缓存 data/assets，惰性下载 + 手动预载） ──
+
+    if (method === 'GET' && p === '/api/assets/status') {
+      const m = loadManifest(ASSET_DIR);
+      const cache = new DiskCache(ASSET_DIR);
+      const entries = m.entries.map((e) => ({ id: e.id, url: e.url, kind: e.kind, name: e.name, cached: e.cached, bytes: e.bytes, failed: e.failed, sourceCard: e.sourceCard }));
+      return json(res, {
+        ok: true,
+        total: m.entries.length,
+        cachedCount: m.entries.filter((e) => e.cached).length,
+        failedCount: m.entries.filter((e) => e.failed).length,
+        diskBytes: cache.diskBytes(),
+        scannedAt: m.scannedAt,
+        byKind: countByKind(m.entries),
+        entries,
+      });
+    }
+
+    // 扫描角色卡 → 建资产索引并入 manifest（不下载）
+    if (method === 'POST' && p === '/api/assets/scan') {
+      const body = await readBody(req);
+      const card = String(body.card ?? '').trim();
+      if (!card) return json(res, { error: '缺少 card 参数' }, 400);
+      const ct = readCardText(card);
+      if (!ct) return json(res, { error: '角色卡不存在' }, 404);
+      const m = loadManifest(ASSET_DIR);
+      const entries = buildAssetIndex(ct.raw, card);
+      const { added } = mergeAssetIndex(m, entries);
+      saveManifest(m, ASSET_DIR);
+      return json(res, { ok: true, added, total: m.entries.length, counts: countByKind(m.entries), cachedCount: m.entries.filter((e) => e.cached).length });
+    }
+
+    // 预载全部资源（SSE 进度；失败逐条记录，允许重试）
+    if (method === 'POST' && p === '/api/assets/preload') {
+      const body = await readBody(req);
+      const card = String(body.card ?? '').trim();
+      sse(res);
+      const abortMsg = (message: string): void => { sseSend(res, { type: 'error', message }); res.end(); };
+      const ct = card ? readCardText(card) : null;
+      if (!ct) return abortMsg('角色卡不存在');
+      const m = loadManifest(ASSET_DIR);
+      const entries = buildAssetIndex(ct.raw, card);
+      mergeAssetIndex(m, entries);
+      const cache = new DiskCache(ASSET_DIR);
+      // 待下载 = 磁盘尚无缓存文件者（含此前 failed 的重试）；已缓存即跳过（幂等）
+      const pending = m.entries.filter((e) => !cache.has(e.id)).map((e) => e.url);
+      if (pending.length === 0) {
+        saveManifest(m, ASSET_DIR);
+        sseSend(res, { type: 'done', done: 0, total: 0, failed: [], downloadedBytes: 0 });
+        return res.end();
+      }
+      let downloadedBytes = 0;
+      const byUrl = new Map(m.entries.map((e) => [e.url, e]));
+      const onProgress = (ev: { url: string; ok: boolean; bytes?: number; error?: string; done: number; total: number }): void => {
+        const entry = byUrl.get(ev.url);
+        if (entry) {
+          entry.cached = ev.ok;
+          entry.failed = ev.ok ? undefined : (ev.error ?? 'download failed');
+          if (ev.ok && ev.bytes) { entry.bytes = ev.bytes; downloadedBytes += ev.bytes; }
+        }
+        sseSend(res, { type: 'progress', done: ev.done, total: ev.total, url: ev.url.slice(0, 140), ok: ev.ok, error: ev.error, kind: entry?.kind, name: entry?.name });
+      };
+      const { failed } = await downloadAll(pending, cache, onProgress, 4, 30000);
+      saveManifest(m, ASSET_DIR);
+      sseSend(res, { type: 'done', done: pending.length - failed.length, total: pending.length, failed, downloadedBytes });
+      res.end();
+    }
+
+    // 取资源（惰性下载→缓存→同源出图；浏览器 <img>/<audio> 直接用本地 URL，免 CDN CORS）
+    if (method === 'GET' && p === '/api/assets/img') {
+      const rawUrl = url.searchParams.get('url');
+      if (!rawUrl) return json(res, { error: '缺少 url 参数' }, 400);
+      const cache = new DiskCache(ASSET_DIR);
+      const m = loadManifest(ASSET_DIR);
+      const u = rawUrl.trim();
+      const entry = m.entries.find((e) => e.url === u);
+      const id = entry?.id ?? assetId(u);
+      let buf = cache.get(id);
+      if (!buf) {
+        const r = await downloadOne(u, cache, 30000);
+        if (!r.ok) return json(res, { error: `资源获取失败：${r.error ?? '未知'}`, url: u.slice(0, 160) }, 502);
+        buf = cache.get(id) ?? null;
+        if (buf) {
+          // 惰性新发现的资源也回写 manifest（后续状态/预载可见）
+          if (entry) { entry.cached = true; entry.failed = undefined; entry.bytes = buf.length; }
+          else { m.entries.push({ id, url: u, kind: classifyAsset(u), name: entryName(u), cached: true, bytes: buf.length, addedAt: new Date().toISOString() }); }
+          m.scannedAt = new Date().toISOString();
+          saveManifest(m, ASSET_DIR);
+        }
+      }
+      if (!buf) return json(res, { error: '资源为空' }, 502);
+      res.writeHead(200, {
+        'Content-Type': mimeForUrl(u),
+        'Content-Length': buf.length,
+        'Cache-Control': 'public, max-age=31536000, immutable',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+      });
+      res.end(buf);
+      return;
+    }
+
+    // 清空资源缓存（仅物理删除 + 重置 cached 状态，保留索引）
+    if (method === 'POST' && p === '/api/assets/cache/clear') {
+      const m = loadManifest(ASSET_DIR);
+      const cache = new DiskCache(ASSET_DIR);
+      const removed = cache.clear();
+      for (const e of m.entries) { e.cached = false; e.bytes = undefined; e.failed = undefined; }
+      saveManifest(m, ASSET_DIR);
+      return json(res, { ok: true, removed });
     }
 
     // ── P3 资产工具 ──
