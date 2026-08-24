@@ -21,8 +21,8 @@ export interface GalVisual {
 }
 
 export type GalCurrent =
-  | { type: 'line'; speaker: string; text: string; role: 'char' | 'narration' | 'user' }
-  | { type: 'choice'; options: string[] }
+  | { kind: 'line'; speaker: string; text: string; role: 'char' | 'narration' | 'user' }
+  | { kind: 'choice'; options: string[] }
   | null;
 
 /** kind/name → 服务端同源出图 URL（惰性下载+缓存，浏览器免 CDN CORS）；无规律构造的资源返回 null */

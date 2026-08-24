@@ -17,7 +17,7 @@ export function GalStage({ script, busy }: { script: string; busy: boolean }) {
   const rootRef = useRef<HTMLDivElement>(null);
   const [full, setFull] = useState(false);
   const current = player.current;
-  const canAdvance = !!current && current.type !== 'choice';
+  const canAdvance = !!current && current.kind !== 'choice';
 
   const advance = useCallback(() => { if (canAdvance) player.advance(); }, [canAdvance, player]);
 
@@ -70,7 +70,7 @@ export function GalStage({ script, busy }: { script: string; busy: boolean }) {
       <GalLayers visual={player.visual} />
       {current && (
         <div className="gal-overlay">
-          {current.type === 'line' ? (
+          {current.kind === 'line' ? (
             <div className={`gal-dialog${current.role === 'narration' ? ' gal-narration' : current.role === 'user' ? ' gal-user' : ''}`}>
               {current.role !== 'narration' && current.speaker && <div className="gal-name">{current.speaker}</div>}
               <div className="gal-text">{current.text}</div>

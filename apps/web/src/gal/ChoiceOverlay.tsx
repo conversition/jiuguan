@@ -14,7 +14,7 @@ export function ChoiceOverlay({
 }) {
   return (
     <div className="gal-choices">
-      {options.map((o, i) => (
+      {(options ?? []).map((o, i) => (
         <button key={i} className="gal-choice" onClick={() => onChoose(o)} disabled={busy}>{o}</button>
       ))}
     </div>
