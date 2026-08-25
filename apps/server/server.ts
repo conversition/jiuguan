@@ -30,6 +30,7 @@ import { LorebookScanner } from '../../packages/core/src/scanner.ts';
 import { VariableManager } from '../../packages/variable/src/vms.ts';
 import {
   DiskCache,
+  DEFAULT_ASSETS_DIR,
   loadManifest,
   saveManifest,
   mergeAssetIndex,
@@ -46,8 +47,8 @@ const HOST = '127.0.0.1';
 const DATA_DIR = resolve('data');
 /** 前端日志落盘路径（日志模块 v0.6.1：浏览器批量上报 → 逐行追加） */
 const WEB_LOG_PATH = resolve(DATA_DIR, 'web.log');
-/** GLA 远端资源缓存目录（data/assets；惰性下载 + 手动预载，磁盘缓存不入库） */
-const ASSET_DIR = resolve('data', 'assets');
+/** GLA 远端资源缓存目录（全局共享：默认 %TEMP%/jiuguan-assets，与启动目录无关；env JG_ASSETS_DIR 可覆盖） */
+const ASSET_DIR = DEFAULT_ASSETS_DIR;
 
 /** 后端兜底脱敏：剥掉 data 里的敏感字段（apiKey/key/token/authorization…），避免 key 落盘 */
 function stripSensitive(value: unknown): unknown {
@@ -643,7 +644,7 @@ const server = createServer(async (req, res) => {
       return json(res, { ok: true, history: removeProviderUrl(baseUrl) });
     }
 
-    // ── GLA 远端资源（扫描 / 预载 / 出图；缓存 data/assets，惰性下载 + 手动预载） ──
+    // ── GLA 远端资源（扫描 / 预载 / 出图；全局缓存 %TEMP%/jiuguan-assets，惰性下载 + 手动预载） ──
 
     if (method === 'GET' && p === '/api/assets/status') {
       const m = loadManifest(ASSET_DIR);

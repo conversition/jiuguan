@@ -1,19 +1,21 @@
 /**
  * 资产磁盘缓存 + 下载器（packages/assets）
  * 纯 Node（fetch 全局），不依赖浏览器：
- *  - DiskCache：data/assets/cache/<id>（内容寻址，无扩展名，MIME 由 URL 推断）
- *  - manifest 加载/保存/合并（data/assets/manifest.json；env JG_ASSETS_DIR 覆盖供测试隔离）
+ *  - DiskCache：<全局缓存根>/cache/<id>（内容寻址，无扩展名，MIME 由 URL 推断）
+ *  - manifest 加载/保存/合并（<全局缓存根>/manifest.json；env JG_ASSETS_DIR 覆盖供测试隔离）
  *  - downloadOne/downloadAll：并发限流 + 单 URL 超时 + 模块级 inflight 去重 + 失败记录
  */
 import { mkdirSync, existsSync, readFileSync, writeFileSync, rmSync, readdirSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
 import type { AssetEntry, AssetManifest } from './asset-types.ts';
 import { emptyManifest } from './asset-types.ts';
 import { assetId, buildAssetIndex } from './build-index.ts';
 
+/** 全局缓存根：默认在系统临时目录下（对所有卡共享一份、与启动目录无关），env JG_ASSETS_DIR 可覆盖 */
 export const DEFAULT_ASSETS_DIR = process.env.JG_ASSETS_DIR
   ? resolve(process.env.JG_ASSETS_DIR)
-  : resolve(process.cwd(), 'data', 'assets');
+  : join(tmpdir(), 'jiuguan-assets');
 
 /** 磁盘缓存：按内容寻址 id 存二进制（无扩展名），MIME 由 URL 推断 */
 export class DiskCache {
