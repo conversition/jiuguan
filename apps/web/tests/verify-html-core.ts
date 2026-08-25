@@ -20,6 +20,7 @@ import {
   splitGalSegments,
   buildExternalSrcDoc,
   JGF_CHOICE_HELPER_SNIPPET,
+  ST_COMPAT_SNIPPET,
 } from '../src/htmlCore.ts';
 
 let passed = 0;
@@ -126,6 +127,16 @@ check('安全代理 shim 先于卡脚本', srcDoc.indexOf(PARENT_PROXY_SNIPPET) 
 check('存储 shim 存在', srcDoc.includes(STORAGE_SHIM_SNIPPET));
 check('测高存在且后于卡脚本', srcDoc.indexOf(AUTO_HEIGHT_SNIPPET) > srcDoc.indexOf('console.log'));
 check('卡 body 内容完整', srcDoc.includes('<div>HUD</div>'));
+
+console.log('\n== ST 兼容 shim：rpc 往返 / isGenerating / 会话数据回填 ==');
+const shim = ST_COMPAT_SNIPPET;
+check('shim 含 rpc 回复消费：message 监听 + pendingRpc', shim.includes('pendingRpc') && shim.includes("addEventListener('message'") && shim.includes('d.__jgfh !== \'rpc\''));
+check('shim 含 rpcCall 封装（超时 reject）', shim.includes('function rpcCall') && shim.includes('timeoutMs'));
+check('shim 的 generateQuietPrompt 走 rpcCall ai.generate 并回填文本', shim.includes("rpcCall('ai', 'generate'") && shim.includes('.then(function(r){ return (r && typeof r.text === \'string\') ? r.text : \'\'; })'));
+check('shim 暴露 isGenerating（往返期 truthy，WuWa 轮询）', shim.includes('quietGen') && shim.includes('get isGenerating(){ return quietGen'));
+check('shim 首次 getContext 拉 session.getContext', shim.includes('fetchSessionCtx') && shim.includes("rpcCall('session', 'getContext'"));
+check('shim 的 getContext 用 live getter 读会话缓存（旧 ctx 也能读到回填）', shim.includes('sessionCtx') && shim.includes('get name1(){ return (sessionCtx') && shim.includes('get chat(){ return (sessionCtx'));
+check('shim 不再出现 window.parent 字面', !/window\.parent/.test(shim));
 
 console.log('\n== 真实卡数据：MVU 状态栏 160KB（走 iframe 需脚本放行）==');
 const rules = JSON.parse(readFileSync(resolve(process.cwd(), 'data', 'regex-rules.json'), 'utf-8'));

@@ -262,8 +262,9 @@ window.__jgfhRpc = function(ns, op, payload){
  * 宿主无 ST 运行时。此 shim 在 iframe 内模拟 ST 常见调用，翻译成 __jgfh 消息回传宿主：
  *  - toastr（info/success/warning/error）→ console 占位（宿主暂无 UI toast 通道）
  *  - 脚本向 #send_textarea 填值 / 触发 input（酒馆"注入输入框"习惯）→ __jgfh draft → 宿主真实输入框
- *  - SillyTavern.getContext().generateQuietPrompt(prompt)（AI 补全）→ __jgfh rpc ai.generate → 宿主后端生成
- *  - SillyTavern.getContext() 其余字段（extensionSettings/name1/chat…）→ 只读安全空实现，保证探测/初始化不崩
+ *  - SillyTavern.getContext().generateQuietPrompt(prompt)（AI 补全）→ __jgfh rpc ai.generate → 宿主后端静默生成，消费 reply 回真实文本
+ *  - SillyTavern.getContext().isGenerating（无声生成进行中）→ 往返期 truthy（WuWa 类卡轮询等待）
+ *  - SillyTavern.getContext() 其余字段（name1/name2/character/chat…）→ 起步拉一次 __jgfh rpc session.getContext 回填真实会话数据，未取到用安全默认
  * 需在 PARENT_PROXY 之后、AUTO_HEIGHT 之前注入；并经 PARENT_PROXY 白名单让 ST_WIN=window.parent 能取到 shim。 */
 export const ST_COMPAT_SNIPPET = `<script>(function(){
   function sendHost(msg){
@@ -274,6 +275,27 @@ export const ST_COMPAT_SNIPPET = `<script>(function(){
     try { parent.postMessage(msg, '*'); } catch (e) {}
   }
   function draftToHost(t){ sendHost({ __jgfh: 'draft', text: String(t) }); }
+
+  // ── __jgfh rpc 往返：宿主 reply（经 __jgPost 定向回 iframe）→ 按 id 兑现 pending promise ──
+  var __jgRpcSeq = (window.__jgRpcSeq || 0);
+  var pendingRpc = {}; // id -> { resolve, reject, timer }
+  window.addEventListener('message', function(ev){
+    var d = ev && ev.data;
+    if (!d || typeof d !== 'object' || d.__jgfh !== 'rpc') return;
+    var h = pendingRpc[d.id];
+    if (!h) return;
+    clearTimeout(h.timer); delete pendingRpc[d.id];
+    if (d.ok) h.resolve(d.result); else h.reject(new Error(d.error || ('rpc ' + (d.ns || '') + ' 失败')));
+  });
+  function rpcCall(ns, op, payload, timeoutMs){
+    var id = ++__jgRpcSeq;
+    return new Promise(function(resolve, reject){
+      var h = { resolve: resolve, reject: reject, timer: 0 };
+      h.timer = setTimeout(function(){ delete pendingRpc[id]; reject(new Error('rpc ' + ns + '.' + op + ' 超时')); }, timeoutMs || 15000);
+      pendingRpc[id] = h;
+      sendHost({ __jgfh: 'rpc', id: id, ns: ns, op: op, payload: payload || {} });
+    });
+  }
 
   // ── toastr 兼容 ──
   if (typeof window.toastr === 'undefined') {
@@ -303,26 +325,49 @@ export const ST_COMPAT_SNIPPET = `<script>(function(){
   })();
 
   // ── SillyTavern.getContext() 兼容 ──
-  window.__jgRpcSeq = window.__jgRpcSeq || 0;
+  // 会话数据（name1/name2/character/chat）按需经 __jgfh rpc session.getContext 回填；未取到保持安全默认
+  var sessionCtx = null; // { name1, name2, character, chat }
+  var ctxFetched = false;
+  function fetchSessionCtx(){
+    ctxFetched = true;
+    rpcCall('session', 'getContext', {}, 8000).then(function(r){
+      if (r && typeof r === 'object') sessionCtx = r;
+    }).catch(function(){ /* 无会话/超时：保持安全默认，不影响初始化 */ });
+  }
+  var quietGen = false; // generateQuietPrompt 往返期 truthy（WuWa 类卡轮询 isGenerating 等待）
+  // 注意：getContext() 返回的对象须用 getter 实时读模块级 sessionCtx/quietGen ——
+  // 卡脚本常见「先 const ctx=getContext() 再轮询 ctx.isGenerating / 读 ctx.name1」，
+  // 若在对象创建时拷贝值，会话数据异步回填后旧 ctx 永远读不到 → WuWa 轮询卡死。
   function stContextLike(){
     var mod = { current: null };
     return {
       generateQuietPrompt: function(prompt){
-        sendHost({ __jgfh: 'rpc', id: (++window.__jgRpcSeq), ns: 'ai', op: 'generate', payload: { prompt: String(prompt) } });
-        return Promise.resolve(''); // 详细结果经宿主 reply（__jgfh:host rpc）回填可再接入，此处保证不 hang
+        var text = String((prompt && prompt.quietPrompt) || prompt || '');
+        quietGen = true;
+        return rpcCall('ai', 'generate', { prompt: text }, 30000)
+          .then(function(r){ return (r && typeof r.text === 'string') ? r.text : ''; })
+          .catch(function(e){ try { console.warn('[jiuguan·quiet] ' + e.message); } catch (_) {} return ''; })
+          .finally(function(){ quietGen = false; });
       },
       extensionSettings: {}, setExtensionPrompt: function(){},
       executeSlashCommands: function(){ return ''; },
-      name1: '', name2: '', character: null, chat: [],
-      getCharacters: function(){ return {}; },
-      getMessageById: function(){ return null; },
+      get isGenerating(){ return quietGen; },
+      get name1(){ return (sessionCtx && sessionCtx.name1) || ''; },
+      get name2(){ return (sessionCtx && sessionCtx.name2) || ''; },
+      get character(){ return (sessionCtx && sessionCtx.character) || null; },
+      get chat(){ return (sessionCtx && sessionCtx.chat) || []; },
+      getCharacters: function(){ var c = sessionCtx && sessionCtx.character; return c ? { [c.name]: c } : {}; },
+      getMessageById: function(id){ var c = (sessionCtx && sessionCtx.chat) || []; return c.find(function(m){ return String(m.id) === String(id); }) || null; },
       addOneMessage: function(){}, addMessages: function(){},
       on: function(){ return mod; }, off: function(){}, emit: function(){},
       eventSource: { on: function(){}, emit: function(){}, once: function(){} }
     };
   }
   window.SillyTavern = {
-    getContext: function(){ return stContextLike(); },
+    getContext: function(){
+      if (!ctxFetched) fetchSessionCtx(); // 首次访问起步拉会话数据（幂等，失败静默）
+      return stContextLike();
+    },
     getMacros: function(){ return {}; },
     saveMacros: function(){},
     getApiUrl: function(){ return ''; }

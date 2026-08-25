@@ -1500,6 +1500,38 @@ ${context}`;
     return { ...parsed, round, fromCache: false };
   }
 
+  /** 静默生成（ST 生态前端 generateQuietPrompt → 宿主 rpc ai.generate）
+   * 语义同 generateStoryIndex 但更轻：近窗转写 + 卡设定 → client.complete 一次性补全，
+   * 不写 chat_log、不跑工具 DAG、不改记忆。返回纯文本（失败抛错，由端点降级 reply）。 */
+  async quietGenerate(prompt: string, opts: { round?: number; mode?: 'nsfw' | 'nsf' } = {}): Promise<string> {
+    const text = String(prompt ?? '').trim();
+    if (!text) throw new Error('生成提示为空');
+    const round = Number.isInteger(opts.round) && (opts.round ?? 0) >= 0 ? (opts.round ?? 0) : this.round;
+    const windowInfo = this.buildChatWindow(round - 1);
+    const windowText = windowInfo.messages.length
+      ? windowInfo.messages.map((m) => `${m.role === 'user' ? '玩家' : '角色'}: ${m.content}`).join('\n')
+      : '（暂无对话窗口）';
+    const longterm = this.getLongTermBlock();
+    const system = `角色卡：${this.cardName}\n${this.cardDesc.slice(0, 400)}\n\n<设定纪律>\n世界书/角色档案未记载的具体细节（外貌细节、能力名号与数值、未登场事件）严禁自行捏造；如剧情确需，向对方或世界意志询问，或以「（设定未记载）」留白。\n</设定纪律>`;
+    const user = `${longterm ? `${longterm}\n\n` : ''}<对话窗口>\n${windowText}\n</对话窗口>\n\n<补全任务>\n${text}\n</补全任务>\n\n请基于以上剧情与设定，直接输出补全结果正文（自然叙述，≤800 字），不要输出 XML/标签，不要解释。`;
+    let res: import('../../packages/proxy/src/client.ts').ChatResponse;
+    try {
+      res = await this.client.complete({
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: user },
+        ],
+        temperature: 0.7,
+        max_tokens: 1200,
+      });
+    } catch (e) {
+      throw new Error(`静默生成失败: ${(e as Error).message.slice(0, 120)}`);
+    }
+    let out = (res.content ?? '').trim();
+    if (out.length > 2000) out = out.slice(0, 2000);
+    return out;
+  }
+
   // ── 导演模式（对话内选区 → 复用本会话真实上下文跑分镜管线；结果落 memory_state 可检索）──
 
   async directorRun(

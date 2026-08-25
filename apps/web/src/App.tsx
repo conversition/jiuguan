@@ -15,6 +15,8 @@ import { setGalRuntime } from './gal/rt.ts';
 import type { GalRuntime } from './gal/rt.ts';
 import { applyDisplayRules } from '../../../packages/core/src/regex.ts';
 import type { RegexRule } from '../../../packages/core/src/regex.ts';
+import { resolveGalUrl } from '../../../packages/assets/src/resolve.ts';
+import type { AssetKind, AssetEntry } from '../../../packages/assets/src/asset-types.ts';
 import { useMessageRefs, toMessageKey } from './hooks/useMessageRefs.ts';
 import { useScrollToMessage } from './hooks/useScrollToMessage.ts';
 import { useScrollSpy } from './hooks/useScrollSpy.ts';
@@ -683,8 +685,57 @@ export function App() {
     }
     if (d.ns === 'theme' && d.op === 'get') return reply({ theme });
     if (d.ns === 'viewport' && d.op === 'get') return reply({ w: window.innerWidth, h: window.innerHeight });
-    if (d.ns === 'asset' && d.op === 'resolve') return reply({ status: 'miss' }); // 资源解析在资产模块落地后填充
-    if (d.ns === 'ai' && d.op === 'generate') return reply(undefined, 'ai.generate 暂未接入（宿主无静默生成端点）');
+    // ai.generate：ST 前端 generateQuietPrompt → 宿主 /quiet 静默生成（不落 chat_log），回真实文本
+    if (d.ns === 'ai' && d.op === 'generate') {
+      const p = (d.payload ?? {}) as { prompt?: string };
+      const prompt = String(p.prompt ?? '').trim();
+      if (!prompt) return reply(undefined, '生成提示为空');
+      if (!sessionId) return reply(undefined, '无活动会话');
+      (async () => {
+        try {
+          const r = await api<{ text: string }>(`/api/session/${sessionId}/quiet`, {
+            method: 'POST',
+            body: JSON.stringify({ prompt, content_mode: contentMode }),
+          });
+          reply({ text: r.text });
+        } catch (err) { reply(undefined, (err as Error).message.slice(0, 120)); }
+      })();
+      return;
+    }
+    // session.getContext：ST 卡回填 name1/name2/character/chat（会话真实数据快照）
+    if (d.ns === 'session' && d.op === 'getContext') {
+      (async () => {
+        let cardName = '';
+        try {
+          const cfg = await api<{ config: { card: string } }>(`/api/session/${sessionId}/config`);
+          cardName = cfg.config?.card ?? '';
+        } catch { /* 无会话：空卡名 */ }
+        reply({
+          name1: '',
+          name2: cardName,
+          character: cardName ? { name: cardName } : null,
+          chat: messages.map((m) => ({ id: m.id, round: m.round, role: m.role, content: m.content })),
+        });
+      })();
+      return;
+    }
+    // asset.resolve：拉资产索引 → resolveGalUrl 解析（真源覆盖→清单→命名规律→miss），回本地代理 URL
+    if (d.ns === 'asset' && d.op === 'resolve') {
+      const p = (d.payload ?? {}) as { kind?: string; name?: string };
+      const kind = String(p.kind ?? '').trim() as AssetKind;
+      const name = String(p.name ?? '').trim();
+      if (!kind || !name) return reply({ status: 'miss', kind: p.kind, name: p.name });
+      (async () => {
+        try {
+          const st = await api<{ entries?: AssetEntry[]; overrides?: Record<string, string> }>('/api/assets/status');
+          const r = resolveGalUrl(kind, name, st.entries ?? [], st.overrides);
+          if (!('url' in r)) return reply({ status: 'miss', kind: p.kind, name: p.name });
+          const local = `${API}/api/assets/img?url=${encodeURIComponent(r.url)}`;
+          reply({ status: 'ok', url: local, constructed: r.constructed, cached: r.cached });
+        } catch { reply({ status: 'miss', kind: p.kind, name: p.name }); }
+      })();
+      return;
+    }
     return reply(undefined, `未知 rpc ${d.ns}.${d.op}`);
   };
   const frameMsgHandlerRef = useRef({ sendText, applyBranch, handleRpc: handleRpcMessage });

@@ -338,6 +338,25 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // 静默生成（ST 生态前端 generateQuietPrompt → rpc ai.generate 的宿主端点）
+    // 非 SSE（client.complete 一次性）：复用会话真实窗口+卡设定补全，不落 chat_log/不改记忆
+    if (method === 'POST' && p.startsWith('/api/session/') && p.endsWith('/quiet')) {
+      const id = p.split('/')[3];
+      const session = sessions.get(id);
+      if (!session) return json(res, { error: '会话不存在' }, 404);
+      const body = await readBody(req);
+      const prompt = String(body.prompt ?? '').trim();
+      if (!prompt) return json(res, { error: '生成提示为空' }, 400);
+      try {
+        const round = Number(body.round) || 0;
+        const mode = body.content_mode === 'nsf' ? 'nsf' : 'nsfw';
+        const text = await session.quietGenerate(prompt, { round, mode: mode as 'nsfw' | 'nsf' });
+        return json(res, { text });
+      } catch (e) {
+        return json(res, { error: (e as Error).message.slice(0, 200) }, 400);
+      }
+    }
+
     // 重新生成 AI 回复（回滚该轮状态 + 重放，SSE 流式同 /api/turn；req 断开 → 中止上游）
     if (method === 'POST' && p.startsWith('/api/session/') && p.endsWith('/regenerate')) {
       const id = p.split('/')[3];
