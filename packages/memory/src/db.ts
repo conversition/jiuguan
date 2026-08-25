@@ -63,6 +63,37 @@ const MIGRATIONS: { version: number; apply: (db: DatabaseSync) => void }[] = [
       }
     },
   },
+  {
+    version: 5,
+    apply: (db) => {
+      // AQL 信号底座：回合遥测 + 纪要段（幂等：SCHEMA_V3 已含同样 DDL，旧库经此补齐）
+      db.exec(
+        `CREATE TABLE IF NOT EXISTS turn_ledger (
+           id INTEGER PRIMARY KEY,
+           session_id TEXT,
+           round INTEGER,
+           attempt INTEGER DEFAULT 0,
+           retry_index INTEGER DEFAULT 0,
+           clicked_regenerate INTEGER DEFAULT 0,
+           outcome TEXT,
+           token_cost INTEGER DEFAULT 0,
+           context_fingerprint TEXT,
+           reward TEXT,
+           prev_prose_md5 TEXT,
+           created_at TEXT
+         );
+         CREATE TABLE IF NOT EXISTS summary_segment (
+           id INTEGER PRIMARY KEY,
+           seg_type TEXT,
+           text TEXT,
+           round INTEGER,
+           created_at TEXT
+         );
+         CREATE INDEX IF NOT EXISTS idx_turnledger_round ON turn_ledger(round);
+         CREATE INDEX IF NOT EXISTS idx_turnledger_session ON turn_ledger(session_id);`
+      );
+    },
+  },
 ];
 
 export class MemoryDb {

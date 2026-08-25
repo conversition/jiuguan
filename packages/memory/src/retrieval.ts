@@ -200,6 +200,13 @@ export class RetrievalEngine {
     this.pgStore = store;
   }
 
+  /** 自适应覆盖（AQL 循环A/RAG）：boostIds 强制保留（即便天然分未过门）、RRF 权重/丢弃阈值覆盖。
+   *  由数据/adaptive-config.json 的 retrieval 块热读注入；可整体 reset（清空回 env 默认）。 */
+  private adaptive: { boostIds?: number[]; weights?: Partial<typeof DEFAULT_WEIGHTS>; dropThreshold?: number } = {};
+  setAdaptive(opts: { boostIds?: number[]; weights?: Partial<typeof DEFAULT_WEIGHTS>; dropThreshold?: number }): void {
+    this.adaptive = opts;
+  }
+
   /** 异步混合检索：通道 B 使用真实 embedding（bge），其余通道与 recall 一致 */
   async recallAsync(q: RecallQuery): Promise<RecallResult> {
     const t0 = Date.now();
@@ -304,8 +311,9 @@ export class RetrievalEngine {
   /** 主入口：混合检索 */
   recall(q: RecallQuery): RecallResult {
     const t0 = Date.now();
-    const weights = { ...DEFAULT_WEIGHTS, ...q.weights };
-    const drop = q.dropThreshold ?? DEFAULT_DROP_THRESHOLD;
+    // 权重/阈值优先级：query 显式 > adaptive 覆盖 > env/默认（DEFAULT_WEIGHTS 此前是死常量，AQL 循环A 复权）
+    const weights = { ...DEFAULT_WEIGHTS, ...this.adaptive.weights, ...q.weights };
+    const drop = q.dropThreshold ?? this.adaptive.dropThreshold ?? DEFAULT_DROP_THRESHOLD;
     const channels = q.channels ?? { bm25: true, vec: true, entity: true, am: true };
     const round = q.round ?? 0;
     const hits = new Map<number, RecallHit>(); // rowId -> hit
@@ -387,13 +395,14 @@ export class RetrievalEngine {
       }
     }
 
-    // RRF 融合
+    // RRF 融合（w_i/(60+rank)：权重真正参与融合 —— DEFAULT_WEIGHTS 复权，adaptive 可覆盖）
+    const W = { bm25: weights.wBm25, vec: weights.wVec, recency: weights.wRecency, am: weights.wAmPriority };
     const fused: RecallHit[] = [];
     for (const h of hits.values()) {
       let rrf = 0;
-      for (const rankMap of Object.values(rankMaps)) {
+      for (const [ch, rankMap] of Object.entries(rankMaps) as [keyof typeof W, Map<number, number>][]) {
         const rank = rankMap.get(h.rowId);
-        if (rank !== undefined) rrf += 1 / (60 + rank);
+        if (rank !== undefined) rrf += (W[ch] ?? 0) / (60 + rank);
       }
       h.score = rrf;
       fused.push(h);
@@ -413,6 +422,21 @@ export class RetrievalEngine {
     for (const h of kept) {
       h.confidence = h.score >= drop + 0.15 ? 'high' : 'low';
       h.source = h.source || 'rrf';
+    }
+    // AQL 循环A：boostIds 强制保留——天然分未过门也抬到 high 置信；完全未召回则按 lore 直查补入
+    if (this.adaptive.boostIds && this.adaptive.boostIds.length > 0) {
+      const ids = new Set(this.adaptive.boostIds);
+      const known = new Set(fused.map((h) => h.rowId));
+      for (const id of ids) {
+        let h = fused.find((x) => x.rowId === id);
+        if (!h && !known.has(id)) h = this.hitFromRowId(id, 'lore');
+        if (!h) continue;
+        h.score = Math.max(h.score, drop + 0.16);
+        h.confidence = 'high';
+        h.source = h.source || 'boost';
+        if (!kept.includes(h)) kept.push(h);
+      }
+      kept.sort((a, b) => b.score - a.score);
     }
 
     // Token 预算截断（粗估：1 汉字 ≈ 1.5 token）

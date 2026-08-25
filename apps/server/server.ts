@@ -38,6 +38,8 @@ import {
   mimeForUrl,
 } from '../../packages/assets/src/downloader.ts';
 import { buildAssetIndex, countByKind, classifyAsset, entryName, assetId } from '../../packages/assets/src/build-index.ts';
+import { analyzeQuality, scanSessionDbs } from '../../tools/cli/quality.ts';
+import { readAdaptiveConfig, writeAdaptiveConfig } from '../../packages/prompt/src/adaptive.ts';
 
 const PORT = Number(process.env.JG_WEB_PORT ?? 17800);
 const HOST = '127.0.0.1';
@@ -377,7 +379,11 @@ const server = createServer(async (req, res) => {
           sseSend(res, { type: 'delta', text: chunk });
         }, ac.signal);
         if (!streamStarted) sseSend(res, { type: 'status', stage: 'streaming' });
-        sseSend(res, { type: 'done', prose: r.prose, assistantMsgId: r.assistantMsgId, round: r.round });
+        sseSend(res, {
+          type: 'done', prose: r.prose, assistantMsgId: r.assistantMsgId, round: r.round,
+          // AQL 循环C：重试 ≥ replanK 时附带重写方向建议（前端「建议卡」；不进对话）
+          replanSuggestion: r.replanSuggestion ?? undefined,
+        });
       } catch (e) {
         if (!ac.signal.aborted) sseSend(res, { type: 'error', message: (e as Error).message.slice(0, 200) });
       }
@@ -1257,6 +1263,43 @@ const server = createServer(async (req, res) => {
       }
       res.end();
       return;
+    }
+
+    // AQL 质量报表（半自动闭环：遥测归因 + 改进建议；只读）
+    if (method === 'GET' && p === '/api/quality/report') {
+      const files = scanSessionDbs(DATA_DIR);
+      const reports = files
+        .map((f) => {
+          try { return analyzeQuality(f); } catch { return null; }
+        })
+        .filter((r): r is NonNullable<typeof r> => r !== null && r.rounds > 0);
+      return json(res, { reports, minSample: Number(process.env.JG_QUALITY_MIN_SAMPLE ?? 5) });
+    }
+
+    // AQL 自适应覆盖：读 / 写 adaptive-config（半自动；POST 后对全部活动会话 refreshAdaptive 即时生效，可回滚）
+    if (p === '/api/quality/overrides') {
+      if (method === 'GET') return json(res, { config: readAdaptiveConfig() });
+      if (method === 'POST') {
+        const body = await readBody(req) as Record<string, unknown>;
+        if (body.reset === true) {
+          writeAdaptiveConfig({});
+        } else {
+          const cfg = readAdaptiveConfig();
+          const patch = (body.patch && typeof body.patch === 'object' ? body.patch : {}) as Record<string, unknown>;
+          const next: Parameters<typeof writeAdaptiveConfig>[0] = {
+            retrieval: { ...(cfg.retrieval ?? {}), ...(patch.retrieval as object | undefined) },
+            archive: { ...(cfg.archive ?? {}), ...(patch.archive as object | undefined) },
+            summary: { ...(cfg.summary ?? {}), ...(patch.summary as object | undefined) },
+            replan: { ...(cfg.replan ?? {}), ...(patch.replan as object | undefined) },
+            meta: { ...(cfg.meta ?? {}), updatedAt: new Date().toISOString(), note: 'overrides API 更新' },
+          };
+          writeAdaptiveConfig(next);
+        }
+        for (const s of sessions.values()) {
+          try { s.refreshAdaptive(); } catch { /* 会话异常忽略 */ }
+        }
+        return json(res, { ok: true, config: readAdaptiveConfig() });
+      }
     }
 
     // 健康检查

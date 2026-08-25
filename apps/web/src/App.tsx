@@ -6,6 +6,7 @@ import { PluginsPanel } from './PluginsPanel.tsx';
 import { SessionSetup } from './SessionSetup.tsx';
 import { EditorPanel } from './EditorPanel.tsx';
 import { SkillsPanel } from './SkillsPanel.tsx';
+import { QualityPanel } from './QualityPanel.tsx';
 import { MarkdownMessage, StreamText } from './MarkdownMessage.tsx';
 import { HtmlMessage, splitGalSegments } from './HtmlMessage.tsx';
 import { GalSegment } from './gal/GalSegment.tsx';
@@ -220,8 +221,10 @@ export function App() {
   const [streamCompleted, setStreamCompleted] = useState(false);
   const [initStage, setInitStage] = useState('');
   const [contentMode, setContentMode] = useState<'nsfw' | 'nsf'>('nsfw');
-  const [tab, setTab] = useState<'setup' | 'chat' | 'memory' | 'provider' | 'assets' | 'editor' | 'plugins' | 'skills'>('setup');
+  const [tab, setTab] = useState<'setup' | 'chat' | 'memory' | 'provider' | 'assets' | 'editor' | 'plugins' | 'skills' | 'quality'>('setup');
   const [error, setError] = useState('');
+  // AQL：重规划建议卡（override 建议方向；不进对话，仅在重发 ≥replanK 后本会话内展示，可手动关闭）
+  const [replanSuggestion, setReplanSuggestion] = useState('');
   const [adultOk, setAdultOk] = useState<boolean>(() => localStorage.getItem('jg-adult-ok') === '1');
   const bottomRef = useRef<HTMLDivElement>(null);
   // v0.6.0 消息锚点 + 楼层刻度 + 生成完成定位：滚动视口 ref / 锚点注册表 / 3 个定位 hook
@@ -587,6 +590,7 @@ export function App() {
   const send = async () => {
     if (!input.trim()) return;
     setInput('');
+    setReplanSuggestion(''); // 新对话开始时清掉旧建议卡
     await sendText(input);
   };
 
@@ -594,6 +598,7 @@ export function App() {
   const regenerateMessage = async (msg: Message) => {
     if (!sessionId || busy) return;
     logger.info('turn', '重新生成回复', { session: sessionId, round: msg.round });
+    setReplanSuggestion('');
     setBusy(true);
     setStreamCompleted(false);
     setError('');
@@ -615,6 +620,10 @@ export function App() {
           stopStream();
           const prose = ev.prose;
           setMessages((m) => m.map((x) => (x.round === msg.round && x.role === 'assistant' ? { ...x, content: prose } : x)));
+          // AQL：重规划建议卡（后端在重试 ≥ replanK 时附带）
+          if (typeof ev.replanSuggestion === 'string' && ev.replanSuggestion.length > 0) {
+            setReplanSuggestion(ev.replanSuggestion);
+          }
         }
         if (ev.type === 'error') {
           logger.error('turn', '重新生成 SSE error', { message: ev.message });
@@ -873,6 +882,7 @@ export function App() {
           <button className={tab === 'editor' ? 'tab-active' : ''} onClick={() => setTab('editor')}>编辑</button>
           <button className={tab === 'skills' ? 'tab-active' : ''} onClick={() => setTab('skills')}>技能</button>
           <button className={tab === 'plugins' ? 'tab-active' : ''} onClick={() => setTab('plugins')}>插件</button>
+          <button className={tab === 'quality' ? 'tab-active' : ''} onClick={() => setTab('quality')}>质量</button>
         </div>
         {error && <p className="error">{error}</p>}
       </aside>
@@ -898,6 +908,8 @@ export function App() {
           <SkillsPanel />
         ) : tab === 'plugins' ? (
           <PluginsPanel />
+        ) : tab === 'quality' ? (
+          <QualityPanel sessionId={sessionId} />
         ) : (
           <>
             <div className="messages" ref={scrollRef}>
@@ -948,6 +960,13 @@ export function App() {
               >
                 查看新回复 ↓
               </button>
+            )}
+            {replanSuggestion && (
+              <div className="replan-card">
+                <strong>🎬 重写方向建议</strong>
+                <span>{replanSuggestion}</span>
+                <button className="op-btn" onClick={() => setReplanSuggestion('')}>收起</button>
+              </div>
             )}
             <div className="inputbar">
               <label className="edit-check" title="显示原始文本（含 <think>/<UpdateVariable> 等标记）">

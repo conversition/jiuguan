@@ -13,6 +13,7 @@
  */
 import { readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname, resolve, basename } from 'node:path';
+import { createHash } from 'node:crypto';
 import { createInterface } from 'node:readline';
 import { parseCharaCard, extractCharaFromPng, pngPayloadToJson } from '../../packages/core/src/chara.ts';
 import { cardBookToLorebookRows, parseWorldBook, entryToLorebookRow } from '../../packages/core/src/worldbook.ts';
@@ -28,6 +29,12 @@ import { MemoryDb } from '../../packages/memory/src/db.ts';
 import { WriteLoop } from '../../packages/memory/src/writer.ts';
 import type { WriteResult } from '../../packages/memory/src/writer.ts';
 import { RetrievalEngine, readableLoreContent, renderRecallBlock } from '../../packages/memory/src/retrieval.ts';
+import { TelemetryRecorder } from '../../packages/memory/src/telemetry.ts';
+import type { ContextFingerprint } from '../../packages/memory/src/telemetry.ts';
+import { shapeTurnOutcome, planStructureScore } from '../../packages/prompt/src/reward.ts';
+import {
+  adaptiveRetrieval, adaptiveAliasAdditions, adaptiveSummaryDeltas, adaptiveReplanThresholds,
+} from '../../packages/prompt/src/adaptive.ts';
 import { Vectorizer } from '../../packages/memory/src/vectorize.ts';
 import { createEmbeddingProvider, HashEmbeddingProvider } from '../../packages/memory/src/embedding.ts';
 import { getPgVectorStore } from '../../packages/memory/src/pg-vector.ts';
@@ -225,6 +232,29 @@ export class ChatSession {
   private varRules: VariableManifestRule[] = [];
   /** 上轮规则执行变化集（紧凑注入：只注入变化的变量；首轮为空则全量紧凑兜底） */
   private lastVarEffects: RuleEffect[] = [];
+  /** AQL 信号底座：回合遥测（只追加写，不回滚路径读取） */
+  private telemetry: TelemetryRecorder;
+  /** 每个 round 的用户重发计数（0=首次生成；regenerate 递增，delete/回滚清理） */
+  private retryCounters = new Map<number, number>();
+  /** 本回合上下文指纹（装配后填充，终局遥测落库用） */
+  private lastFingerprint: ContextFingerprint | null = null;
+  /** 本回合近似 token 成本（上下文估算；cost 塑形用） */
+  private lastTokenCost = 0;
+  /** 本回合遥测上下文（runTurnCore 由 turn/regenerate 入参透传） */
+  private telemetryCtx: { retryIndex: number; clickedRegenerate: boolean; prevProseMd5?: string; narrow?: boolean } =
+    { retryIndex: 0, clickedRegenerate: false };
+  /** 本回合是否收窄上下文（AQL 循环C：重试 ≥ narrowK 生效，重定向近况/档案） */
+  private narrowMode = false;
+  /** 已生成重规划建议的 round（每 round 仅一次，避免重复额外 LLM 开销） */
+  private replanGenerated = new Map<number, boolean>();
+  /** 本回合塑形奖励（终局落库；aborted/failed 为 0 分） */
+  private lastReward: Record<string, number> | null = null;
+  /** 自适应参数 Δ（AQL：data/adaptive-config.json 热读；有效值 = 基线 + Δ） */
+  private summaryRoundsDelta = 0;
+  private longtermTokensDelta = 0;
+  private windowTokensDelta = 0;
+  private narrowK = 2;
+  private replanK = 3;
 
   /** 内容模式模块加载（WP14：可编辑文件 data/content-modes.json） */
   private loadContentModes(): void {
@@ -432,11 +462,13 @@ export class ChatSession {
     this.dbPath = args.db ?? resolve('data', 'session.db');
     if (!existsSync(dirname(this.dbPath))) mkdirSync(dirname(this.dbPath), { recursive: true });
     this.mem = new MemoryDb({ path: this.dbPath });
+    this.telemetry = new TelemetryRecorder(this.mem.db, this.sessionLabel());
     this.writer = new WriteLoop(this.mem);
     this.ret = new RetrievalEngine(this.mem);
     this.scanner = new LorebookScanner(this.mem);
     this.client = new OpenAICompatibleClient(this.cfg);
     this.round = this.loadRound();
+    this.refreshAdaptive();
     this.loadContentModes();
     // 插件宿主（04 §4.1：data/plugins 注册表，启用的服务端插件在 init 时沙箱加载）
     this.plugins = new PluginHost(new PluginRegistry(resolve('data', 'plugins')));
@@ -501,7 +533,19 @@ export class ChatSession {
     } catch {
       this.entityRoster = new Map();
     }
+    this.mergeAdaptiveAliases();
     return this.entityRoster;
+  }
+
+  /** 别名补齐（AQL 循环A）：把 adaptive-config 的 aliasAdditions 并入名册（2 字段称谓 miss 的确定性兜底） */
+  private mergeAdaptiveAliases(): void {
+    if (!this.entityRoster) return;
+    for (const a of adaptiveAliasAdditions()) {
+      if (!a.alias || !a.entityName) continue;
+      if (!this.entityRoster.has(a.alias)) {
+        this.entityRoster.set(a.alias, { entityName: a.entityName, entryIds: [], explicit: true });
+      }
+    }
   }
 
   /** 角色档案恒定层：名册实体（entityName/别名，含「会长→桐月樱佳」职位简写）命中本轮回话线索 →
@@ -566,6 +610,18 @@ export class ChatSession {
       if (!entry.entityName || anchors.includes(entry.entityName)) continue;
       if (input.includes(entry.entityName) || input.includes(alias)) anchors.push(entry.entityName);
       if (anchors.length >= 6) break;
+    }
+    // AQL 循环A：boosted 词条名并入 query 锚点（低召回词的显式查询头；自适应热读）
+    const boost = adaptiveRetrieval();
+    if (boost.boostIds.length > 0) {
+      const placeholders = boost.boostIds.map(() => '?').join(',');
+      const names = this.mem.db.prepare(
+        `SELECT comment FROM lorebook_entry WHERE active = 1 AND id IN (${placeholders})`
+      ).all(...boost.boostIds) as { comment: string }[];
+      for (const n of names.slice(0, 4)) {
+        const nm = String(n.comment ?? '').trim();
+        if (nm && !anchors.includes(nm)) anchors.push(nm);
+      }
     }
     const parts = [
       lt,
@@ -868,6 +924,70 @@ export class ChatSession {
       .run(round, role, content, new Date().toISOString()).lastInsertRowid as number;
   }
 
+  /** 遥测会话标识 = 会话 DB 基名（与 PG 命名空间同源） */
+  private sessionLabel(): string {
+    return basename(this.dbPath).replace(/\.db$/i, '');
+  }
+
+  /** 本回合上下文指纹（M3 归因聚合字段字典；装配后填充 this.lastFingerprint） */
+  private buildContextFingerprint(window: ReturnType<ChatSession['buildChatWindow']>, budgetDropped: string[]): ContextFingerprint {
+    const recall = this.turnInput.recall;
+    const scan = this.turnInput.scan;
+    const summaryRound = (this.mem.db.prepare('SELECT summary_round FROM memory_meta WHERE id = 1').get() as { summary_round: number } | undefined)?.summary_round ?? 0;
+    return {
+      recallHitIds: recall?.hits?.map((h) => h.rowId) ?? [],
+      recallCodes: recall?.codes ?? [],
+      scanEntryIds: scan?.activated?.map((e) => e.id) ?? [],
+      windowCount: window.messages.length,
+      windowTokens: window.tokens,
+      windowTruncated: window.truncated,
+      distanceToSummary: this.round - summaryRound,
+      longtermTokens: estimateTokens(this.getLongTermBlock()),
+      archiveIds: [...this.archiveIds],
+      budgetDropped,
+      model: this.cfg.model || '',
+      bars: this.turnInput.bars,
+      retryIndex: this.telemetryCtx.retryIndex,
+    };
+  }
+
+  /** 终局遥测落库（append-only；失败旁路不打断主链路）；attempt=模型尝试次数 */
+  private recordTurn(outcome: 'ok' | 'aborted' | 'failed', attempt: number): void {
+    this.telemetry.record({
+      sessionId: this.sessionLabel(),
+      round: this.round,
+      attempt,
+      retryIndex: this.telemetryCtx.retryIndex,
+      clickedRegenerate: this.telemetryCtx.clickedRegenerate,
+      outcome,
+      tokenCost: this.lastTokenCost,
+      contextFingerprint: this.lastFingerprint ?? undefined,
+      reward: this.lastReward ?? undefined,
+      prevProseMd5: this.telemetryCtx.prevProseMd5,
+    });
+  }
+
+  /** 热读 adaptive-config 并应用到检索器/会话参数（半自动闭环：overrides 写入后调用）
+   *  全部可回滚：reset 配置后行为回落 env/默认 */
+  refreshAdaptive(): void {
+    const R = adaptiveRetrieval();
+    this.ret.setAdaptive({ boostIds: R.boostIds, dropThreshold: R.dropThreshold, weights: R.weights });
+    const S = adaptiveSummaryDeltas();
+    this.summaryRoundsDelta = S.roundsDelta;
+    this.longtermTokensDelta = S.longtermTokensDelta;
+    this.windowTokensDelta = S.windowTokensDelta;
+    const T = adaptiveReplanThresholds();
+    this.narrowK = T.narrowK;
+    this.replanK = T.replanK;
+    // 别名补齐可能变化 → 下次 buildEntityRoster 重建
+    this.entityRoster = null;
+  }
+
+  /** 有效纪要参数（基线 + 自适应 Δ；下限保护防窗口/摘要塌陷） */
+  private effectiveSummaryRounds(): number { return Math.max(1, this.summaryRounds + this.summaryRoundsDelta); }
+  private effectiveLongtermTokens(): number { return Math.max(200, this.longtermTokens + this.longtermTokensDelta); }
+  private effectiveWindowTokens(): number { return Math.max(500, this.windowTokens + this.windowTokensDelta); }
+
   /** 单轮对话
    *  @param contentMode 内容分支（缺省用会话配置）
    *  @param onProse     真流式回调：模型生成正文时逐字/逐块回调（prose 增量；未传入则完整返回时一次性给）
@@ -933,14 +1053,24 @@ export class ChatSession {
   private async runTurnCore(
     round: number, userInput: string, mode: 'nsfw' | 'nsf',
     onProse: ((chunk: string) => void) | undefined,
-    opts: { logUser: boolean },
+    opts: { logUser: boolean; telemetry?: { retryIndex?: number; clickedRegenerate?: boolean; prevProseMd5?: string } },
     signal?: AbortSignal,
   ): Promise<string> {
     this.round = round;
+    this.telemetryCtx = opts.telemetry ? {
+      retryIndex: opts.telemetry.retryIndex ?? 0,
+      clickedRegenerate: opts.telemetry.clickedRegenerate ?? false,
+      prevProseMd5: opts.telemetry.prevProseMd5,
+      narrow: opts.telemetry.narrow,
+    } : { retryIndex: 0, clickedRegenerate: false };
+    this.narrowMode = this.telemetryCtx.narrow ?? false;
+    this.lastReward = null;
+    this.lastFingerprint = null;
     const emit = onProse ?? (() => {});
     // 0. 回合账本：写环前快照（重新生成/删除可精确回滚）+ 滑动窗口 + 滚动摘要
     const pre = this.snapshotPre();
-    const windowInfo = this.buildChatWindow(round - 1);
+    // AQL 循环C 收窄模式：重试 ≥ narrowK 时削减滑窗轮数（聚焦近期 + 档案），零额外 LLM 开销
+    const windowInfo = this.buildChatWindow(round - 1, this.narrowMode ? { maxTurns: Math.max(2, Math.ceil(this.windowN / 2)) } : {});
     await this.maybeRollingSummarize(round, windowInfo);
 
     // ① 平台预计算 → 工具 DAG（0.5.0 C：平台步骤声明化为工具，自动拓扑并行 + 结果进 tool_results）
@@ -998,11 +1128,15 @@ export class ChatSession {
       variableValues,
       nsfwModule: this.nsfwModuleFor(mode),
     });
+    // AQL 遥测指纹 + 成本估算（装配后；M3 归因聚合字段来源）
+    this.lastFingerprint = this.buildContextFingerprint(windowInfo, ctx.dropped);
+    this.lastTokenCost = windowInfo.tokens + estimateTokens(userContent) + estimateTokens(ctx.longTermBlock);
     if (opts.logUser) this.logChat('user', userInput, round);
 
     // ③ 模型调用（真流式）+ 校验 + 错误召回重试（统一：最多 2 次尝试，每次均过 归一化→校验；重试消息用首轮 tool_call 注入错误）
     // sentProse：已流式发出的正文累积（用户停止生成时保留该部分落库）
     let sentProse = '';
+    let modelAttempts = 1;
     const attemptTurn = async (messages: import('../../packages/proxy/src/client.ts').ChatMessage[]):
       Promise<{ turn: GameTurn | null; tc: import('../../packages/proxy/src/client.ts').ToolCall | null; aborted?: boolean; issues?: string[]; details?: string[] }> => {
       const extractor = createProseStreamExtractor();
@@ -1044,7 +1178,7 @@ export class ChatSession {
     };
 
     const first = await attemptTurn(assembled.messages);
-    if (first.aborted) return this.finalizeAborted(round, sentProse, pre);
+    if (first.aborted) { this.recordTurn('aborted', modelAttempts); return this.finalizeAborted(round, sentProse, pre); }
     let turn = first.turn;
     if (!turn && first.tc) {
       // 错误召回：把具体 zod issues + 实际值注入 tool result，模型才能自纠（否则复现同一错误）
@@ -1054,8 +1188,9 @@ export class ChatSession {
       console.log('  ⚠ 首轮失败，错误召回重试一次...');
       // 非法工具参数才回填 {}（safeParse 已失败=参数坏）；可解析参数保留原文供模型自查
       const retryTc = isValidToolArgs(first.tc.arguments) ? first.tc : { ...first.tc, arguments: '{}' };
+      modelAttempts = 2;
       const retry = await attemptTurn(toolLoopMessages(assembled.messages, retryTc, diag));
-      if (retry.aborted) return this.finalizeAborted(round, sentProse, pre);
+      if (retry.aborted) { this.recordTurn('aborted', modelAttempts); return this.finalizeAborted(round, sentProse, pre); }
       turn = retry.turn;
     }
 
@@ -1064,6 +1199,8 @@ export class ChatSession {
       this.logChat('assistant', msg, round);
       // 失败轮也记账本（created 空），后续删除该轮不崩
       this.writeLedger(round, pre, { mainCode: '', eventCodes: [], eventIds: [] }, 0, 0);
+      this.lastReward = shapeTurnOutcome({ retryIndex: this.telemetryCtx.retryIndex, failed: true });
+      this.recordTurn('failed', modelAttempts);
       return msg;
     }
 
@@ -1110,6 +1247,14 @@ export class ChatSession {
       summaryId: wr.summaryId, mainCode: wr.insertedCodes[0] ?? '', arcId: wr.arcId,
       eventCodes: wr.insertedCodes.slice(1), eventIds: wr.eventIds,
     }, userMsgId?.id ?? 0, assistMsgId?.id ?? 0);
+    // AQL 终局遥测：ok + 塑形奖励（契约已绿：planOk=true；结构完整度来自 plan 字段）
+    this.lastReward = shapeTurnOutcome({
+      retryIndex: this.telemetryCtx.retryIndex,
+      tokenCost: this.lastTokenCost,
+      planOk: true,
+      planStructureScore: planStructureScore(turn.plan),
+    });
+    this.recordTurn('ok', modelAttempts);
     return turn.prose;
   }
 
@@ -1118,35 +1263,62 @@ export class ChatSession {
   /** 重新生成第 round 轮 AI 回复：回滚该轮状态（保留用户行）→ 用存储的用户输入重放
    *  @param signal 外部中止信号（同 turn：中止时保留已生成正文落库）
    *  模型异常（非中止）：原正文已被回滚，写占位 assistant 防孤儿 user 行，再抛出让上层报错 */
-  async regenerate(round: number, onProse?: (chunk: string) => void, signal?: AbortSignal): Promise<{ prose: string; round: number; assistantMsgId: number | null }> {
+  async regenerate(round: number, onProse?: (chunk: string) => void, signal?: AbortSignal): Promise<{ prose: string; round: number; assistantMsgId: number | null; replanSuggestion?: string | null }> {
     const userRow = this.mem.db.prepare('SELECT content FROM chat_log WHERE round = ? AND role = ? ORDER BY id DESC LIMIT 1')
       .get(round, 'user') as { content: string } | undefined;
     if (!userRow) throw new Error(`round ${round} 无用户消息，无法重新生成`);
+    // AQL 信号：重发计数（第 n 次重发）+ 旧正文 md5（旧正文将破坏性删除，hash 供差分/回看）
+    const retryIndex = (this.retryCounters.get(round) ?? 0) + 1;
+    this.retryCounters.set(round, retryIndex);
+    const prevAssist = this.mem.db.prepare("SELECT content FROM chat_log WHERE round = ? AND role = 'assistant' ORDER BY id DESC LIMIT 1")
+      .get(round) as { content: string } | undefined;
+    const prevProseMd5 = prevAssist ? createHash('md5').update(prevAssist.content).digest('hex') : undefined;
+    // AQL 循环C：重试 ≥ narrowK → 收窄上下文（零 LLM，聚焦近期/档案）；= replanK → 生成一次重规划建议（不进 chat_log）
+    const narrow = retryIndex >= this.narrowK;
     this.rollbackStateOnly(round);
     let prose: string;
     try {
-      prose = await this.runTurnCore(round, userRow.content, this.args.contentMode ?? 'nsfw', onProse, { logUser: false }, signal);
+      prose = await this.runTurnCore(round, userRow.content, this.args.contentMode ?? 'nsfw', onProse,
+        { logUser: false, telemetry: { retryIndex, clickedRegenerate: true, prevProseMd5, narrow } }, signal);
     } catch (e) {
       // 回滚已删原 assistant，此处补占位（与 runTurnCore !turn 分支一致），保证该轮成对
       this.logChat('assistant', '（本轮回合生成失败，请重试）', round);
       this.writeLedger(round, this.snapshotPre(), { mainCode: '', eventCodes: [], eventIds: [] }, 0, 0);
+      this.lastReward = shapeTurnOutcome({ retryIndex, failed: true });
+      this.recordTurn('failed', 1);
       throw e;
     }
     const aid = this.mem.db.prepare("SELECT id FROM chat_log WHERE round = ? AND role = 'assistant' ORDER BY id DESC LIMIT 1")
       .get(round) as { id: number } | undefined;
-    return { prose, round, assistantMsgId: aid?.id ?? null };
+    let replanSuggestion: string | null = null;
+    if (retryIndex >= this.replanK && !this.replanGenerated.get(round)) {
+      this.replanGenerated.set(round, true);
+      replanSuggestion = await this.planRepairSuggestion(round);
+    }
+    return { prose, round, assistantMsgId: aid?.id ?? null, replanSuggestion };
   }
 
-  /** 删除消息（round=整轮 user+assistant+状态回滚；fromHere=从该轮到末尾全删） */
+  /** 删除消息（round=整轮 user+assistant+状态回滚；fromHere=从该轮到末尾全删）。
+   *  同步写 delete 遥测（AQL 隐式负反馈）并清理该轮重发计数。 */
   deleteMessages(round: number, mode: 'round' | 'fromHere'): { ok: boolean; round: number } {
     if (round < 1) throw new Error('round 0（开场白）不可删除');
+    const removed: number[] = [];
     if (mode === 'fromHere') {
       const max = this.loadRound();
-      for (let r = max; r >= round; r--) this.rollbackRound(r);
+      for (let r = max; r >= round; r--) { this.rollbackRound(r); removed.push(r); }
     } else {
       this.rollbackRound(round);
+      removed.push(round);
     }
     this.round = (this.mem.db.prepare('SELECT COALESCE(MAX(round), 0) AS m FROM chat_log').get() as { m: number }).m;
+    for (const r of removed) {
+      const retryIndex = this.retryCounters.get(r) ?? 0;
+      this.retryCounters.delete(r);
+      this.telemetry.record({
+        sessionId: this.sessionLabel(), round: r, attempt: 1, retryIndex, clickedRegenerate: false,
+        outcome: 'deleted', tokenCost: 0, reward: { score: 0, acc: 0, cost: 0, step: 0 },
+      });
+    }
     return { ok: true, round };
   }
 
@@ -1222,6 +1394,13 @@ export class ChatSession {
     }
     const userRow = this.mem.db.prepare('SELECT id FROM chat_log WHERE round = ? AND role = ?').get(round, 'user') as { id: number } | undefined;
     if (!userRow) return { round, kept: false, waited };
+    // AQL 遥测：超时兜底补记 aborted（runTurnCore 已被中止返回时已记录，此路径幂等覆盖）
+    this.telemetry.record({
+      sessionId: this.sessionLabel(), round, attempt: 1, retryIndex: this.retryCounters.get(round) ?? 0,
+      clickedRegenerate: false, outcome: 'aborted', tokenCost: this.lastTokenCost,
+      contextFingerprint: this.lastFingerprint ?? undefined,
+      reward: { score: 0, acc: 0, cost: 0, step: 0 },
+    });
     const pre = this.snapshotPre();
     this.finalizeAborted(round, '', pre);
     return { round, kept: true, waited };
@@ -1246,6 +1425,15 @@ export class ChatSession {
     if (this.round >= round) this.round = round - 1;
     // 删除孤儿 user 行
     this.mem.db.prepare("DELETE FROM chat_log WHERE round = ? AND role = 'user'").run(round);
+    // AQL 遥测：网络层失败轮（runTurnCore 抛出未落库）记 failed + 清理重发计数
+    const retryIndex = this.retryCounters.get(round) ?? 0;
+    this.retryCounters.delete(round);
+    this.telemetry.record({
+      sessionId: this.sessionLabel(), round, attempt: 1, retryIndex, clickedRegenerate: false,
+      outcome: 'failed', tokenCost: this.lastTokenCost,
+      contextFingerprint: this.lastFingerprint ?? undefined,
+      reward: { score: 0, acc: 0, cost: 0, step: 0 },
+    });
     console.log(`[兜底] 清理失败轮 round ${round} 孤儿 user 行（轮次回退 ${round - 1}）`);
     return { round, cleaned: true };
   }
@@ -1322,7 +1510,8 @@ export class ChatSession {
 
   /** 近期对话窗口：从新往旧累积，token/条数预算内保持正序；prompt 层正则清洗内部标记
    *  双保险：跳过孤儿轮（有 user 无 assistant，历史遗留或失败残留），避免带入装配上下文致记忆断裂 */
-  private buildChatWindow(maxRound: number): { messages: { role: string; content: string }[]; truncated: boolean; tokens: number; startRound: number } {
+  private buildChatWindow(maxRound: number, opts: { maxTurns?: number } = {}): { messages: { role: string; content: string }[]; truncated: boolean; tokens: number; startRound: number } {
+    const windowN = opts.maxTurns ?? this.windowN;
     const rows = this.mem.db.prepare('SELECT round, role, content FROM chat_log WHERE round <= ? ORDER BY id ASC').all(maxRound) as {
       round: number; role: string; content: string;
     }[];
@@ -1339,13 +1528,13 @@ export class ChatSession {
     let truncated = false;
     for (let i = rows.length - 1; i >= 0; i--) {
       const r = rows[i];
-      if (kept.length >= this.windowN) { truncated = true; break; }
+      if (kept.length >= windowN) { truncated = true; break; }
       if (orphanRounds.has(r.round)) continue;
       const clean = applyRegexRules(r.content, this.regexLib.list(), 'prompt').text;
       const t = estimateTokens(clean);
       // 预算裁剪：最新一条（kept 为空时）强制保留，避免「单条超预算 → 窗口塌陷只剩 1 条」；
       // 从第二条起严格按 windowTokens 预算从新往旧累积；被裁旧文靠滚动摘要 + 检索 query 头召回
-      if (kept.length > 0 && tokens + t > this.windowTokens) { truncated = true; break; }
+      if (kept.length > 0 && tokens + t > this.effectiveWindowTokens()) { truncated = true; break; }
       kept.push({ round: r.round, role: r.role, content: clean });
       tokens += t;
     }
@@ -1357,22 +1546,22 @@ export class ChatSession {
     };
   }
 
-  /** 只读长期摘要（memory_meta.longterm），按 longtermTokens 预算截断 */
+  /** 只读长期摘要（memory_meta.longterm），按 longtermTokens 预算截断（自适应 Δ 生效） */
   private getLongTermBlock(): string {
     const row = this.mem.db.prepare('SELECT longterm FROM memory_meta WHERE id = 1').get() as { longterm: string } | undefined;
     const lt = (row?.longterm ?? '').trim();
     if (!lt) return '';
     let out = lt;
-    while (estimateTokens(out) > this.longtermTokens && out.length > 80) out = out.slice(0, Math.floor(out.length * 0.8));
+    while (estimateTokens(out) > this.effectiveLongtermTokens() && out.length > 80) out = out.slice(0, Math.floor(out.length * 0.8));
     return `<长期摘要>\n${out}${out !== lt ? '…' : ''}\n</长期摘要>`;
   }
 
-  /** 滚动摘要触发：窗口真实截断 & 距上次摘要 ≥ SUMMARY_ROUNDS */
+  /** 滚动摘要触发：窗口真实截断 & 距上次摘要 ≥ SUMMARY_ROUNDS（自适应 Δ 生效） */
   private async maybeRollingSummarize(round: number, window: { truncated: boolean; startRound: number }): Promise<void> {
     if (!window.truncated) return;
     const meta = this.mem.db.prepare('SELECT summary_round FROM memory_meta WHERE id = 1').get() as { summary_round: number } | undefined;
     const last = meta?.summary_round ?? 0;
-    if (round - last < this.summaryRounds) return;
+    if (round - last < this.effectiveSummaryRounds()) return;
     await this.rollingSummarize(round, window.startRound);
   }
 
@@ -1411,7 +1600,7 @@ export class ChatSession {
     }
     if (!summary) return;
     let kept = summary.replace(/<[^>]{0,40}>/g, '');
-    while (estimateTokens(kept) > this.longtermTokens && kept.length > 80) kept = kept.slice(0, Math.floor(kept.length * 0.8));
+    while (estimateTokens(kept) > this.effectiveLongtermTokens() && kept.length > 80) kept = kept.slice(0, Math.floor(kept.length * 0.8));
     this.mem.db.prepare('UPDATE memory_meta SET longterm = ?, summary_round = ? WHERE id = 1').run(kept, round);
     console.log(`[摘要] 滚动压缩 ${lines.length} 条旧文 → ${kept.length} 字（第 ${round} 轮触发）`);
   }
@@ -1498,6 +1687,50 @@ ${context}`;
     const parsed = parseStoryIndex(content);
     console.log(`[剧情索引] round ${round} AI 生成 ${parsed.branches.length} 个分支`);
     return { ...parsed, round, fromCache: false };
+  }
+
+  /** 导演式重规划建议（AQL 循环C：retry_index ≥ replanK 时触发，每 round 一次）
+   *  复用对话真实上下文（用户输入/窗口/长摘/上轮规划）做一次 LLM 诊断 →
+   *  产出"重写方向"纯文本（≤200 字）。纪律：不进 chat_log、不进正文，仅作为前端"建议卡"；
+   *  解析失败回退 null，绝不抛错打断 regenerate。 */
+  async planRepairSuggestion(round: number): Promise<string | null> {
+    const userRow = this.mem.db.prepare('SELECT content FROM chat_log WHERE round = ? AND role = ? ORDER BY id DESC LIMIT 1')
+      .get(round, 'user') as { content: string } | undefined;
+    if (!userRow) return null;
+    try {
+      const windowInfo = this.buildChatWindow(round - 1);
+      const recent = windowInfo.messages.slice(-3).map((m) => `${m.role === 'user' ? '玩家' : '角色'}: ${m.content.slice(0, 200)}`).join('\n');
+      const longterm = this.getLongTermBlock() || '（无）';
+      const meta = this.getMeta();
+      const bars = meta ? JSON.parse(meta.bars ?? '{}') as Record<string, number> : {};
+      let lastPlan = '';
+      try {
+        const last = this.lastTurn ? JSON.parse(this.lastTurn) as { next_plan?: string; scene?: string } : undefined;
+        lastPlan = last?.next_plan ?? '';
+      } catch { /* 忽略坏 JSON */ }
+      const prompt = [
+        `本轮玩家输入：\n${userRow.content.slice(0, 300)}`,
+        `最近对话：\n${recent || '（无）'}`,
+        `推进槽：${JSON.stringify(bars)}`,
+        `长期摘要：\n${longterm}`,
+        lastPlan ? `上轮规划的下轮焦点：${lastPlan}` : '',
+      ].filter(Boolean).join('\n\n');
+      const res = await this.client.complete({
+        messages: [
+          { role: 'system', content: '你是剧本导演。玩家对某一轮回复不满意而重发，请诊断卡点并给出精炼的"重写方向"。规则：只给方向（应聚焦的角色/场景细节、卡点原因、下一步推进），不得捏造世界书未记载内容；输出 ≤200 字纯文本，不要解释，不用 XML。' },
+          { role: 'user', content: `=== 当前剧情上下文 ===\n${prompt}` },
+        ],
+        temperature: 0.6,
+        max_tokens: 300,
+      });
+      const text = (res.content ?? '').trim();
+      if (!text) return null;
+      console.log(`[重规划] round ${round} 生成重写方向 ${text.length} 字`);
+      return text.slice(0, 300);
+    } catch (e) {
+      console.warn(`[重规划] 建议生成失败: ${(e as Error).message.slice(0, 80)}`);
+      return null;
+    }
   }
 
   /** 静默生成（ST 生态前端 generateQuietPrompt → 宿主 rpc ai.generate）

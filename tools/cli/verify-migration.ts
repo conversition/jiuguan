@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { MemoryDb } from '../../packages/memory/src/db.ts';
+import { SCHEMA_VERSION } from '../../packages/memory/src/schema.ts';
 
 let failures = 0;
 const check = (name: string, cond: boolean, extra = '') => {
@@ -49,7 +50,7 @@ function main() {
   const mem = new MemoryDb({ path: file });
 
   // 1. 版本号已升级到当前
-  check('user_version 升级到当前 (4)', mem.userVersion() === 4, `v=${mem.userVersion()}`);
+  check(`user_version 升级到当前 (${SCHEMA_VERSION})`, mem.userVersion() === SCHEMA_VERSION, `v=${mem.userVersion()}`);
 
   // 2. 旧库数据不丢
   const meta = mem.db.prepare('SELECT plot_round FROM memory_meta WHERE id=1').get() as { plot_round: number };
@@ -87,10 +88,20 @@ function main() {
     mem.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='story_index'").get() !== undefined
   );
 
+  // 4b. 迁移 v5：回合遥测 + 纪要段表补齐
+  check(
+    '补表 turn_ledger',
+    mem.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='turn_ledger'").get() !== undefined
+  );
+  check(
+    '补表 summary_segment',
+    mem.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='summary_segment'").get() !== undefined
+  );
+
   // 5. 新库（空缓存库）打开正常且版本正确
   const freshFile = join(dir, 'fresh.db');
   const fresh = new MemoryDb({ path: freshFile });
-  check('新库 user_version = 4', fresh.userVersion() === 4, `v=${fresh.userVersion()}`);
+  check(`新库 user_version = ${SCHEMA_VERSION}`, fresh.userVersion() === SCHEMA_VERSION, `v=${fresh.userVersion()}`);
   fresh.close();
 
   mem.checkpoint();

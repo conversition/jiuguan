@@ -117,6 +117,34 @@ CREATE TABLE IF NOT EXISTS story_index (
   content TEXT, created_at TEXT
 );
 
+-- 回合遥测（AQL 信号底座：隐式反馈 reward + 上下文指纹）
+-- 纪律：只追加写（INSERT），回滚/删除历史不读不删本表 → verify-rollback/abort/fallback 不回归。
+CREATE TABLE IF NOT EXISTS turn_ledger (
+  id INTEGER PRIMARY KEY,
+  session_id TEXT,
+  round INTEGER,
+  attempt INTEGER DEFAULT 0,
+  retry_index INTEGER DEFAULT 0,
+  clicked_regenerate INTEGER DEFAULT 0,
+  outcome TEXT,
+  token_cost INTEGER DEFAULT 0,
+  context_fingerprint TEXT,
+  reward TEXT,
+  prev_prose_md5 TEXT,
+  created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_turnledger_round ON turn_ledger(round);
+CREATE INDEX IF NOT EXISTS idx_turnledger_session ON turn_ledger(session_id);
+
+-- 纪要段（AQL 纪要可检索化：longterm 按主题段化落库，query 命中主题时可独立召回而非整块长摘）
+CREATE TABLE IF NOT EXISTS summary_segment (
+  id INTEGER PRIMARY KEY,
+  seg_type TEXT,
+  text TEXT,
+  round INTEGER,
+  created_at TEXT
+);
+
 -- ── FTS5 外部内容表：memory_arc ──
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_arc USING fts5(
   content, category,
@@ -209,8 +237,8 @@ CREATE TRIGGER IF NOT EXISTS lore_au AFTER UPDATE ON lorebook_entry BEGIN
 END;
 `;
 
-/** 当前 schema 版本号（0.5.0：与 PRAGMA user_version 同步，供增量迁移使用；v4：记忆衰减列） */
-export const SCHEMA_VERSION = 4;
+/** 当前 schema 版本号（0.5.0：与 PRAGMA user_version 同步，供增量迁移使用；v4：记忆衰减列；v5：回合遥测+纪要段） */
+export const SCHEMA_VERSION = 5;
 
 /** 记忆衰减（Ebbinghaus 遗忘曲线）+ 访问提升 默认参数（均可用 env / RecallQuery 覆盖） */
 export const DECAY_LAMBDA_DEFAULT = 0.1;  // 每天衰减系数：7 天≈50% 残留（exp(-0.7)≈0.497）
