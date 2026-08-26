@@ -122,8 +122,19 @@ export class DshPluginHost {
 
     const entryPath = join(dir, pkg.main);
     if (!existsSync(entryPath)) throw new Error(`DSH 插件入口不存在: ${entryPath}`);
-    // 动态 import 编译后的 JS（whale-widget 的 lib/index.js 是纯 ESM，无需构建）
-    const mod = (await import(pathToFileURL(entryPath).href)) as Partial<DshPluginExports>;
+    // 动态 import 编译后的 JS（whale-widget 的 lib/index.js 是纯 ESM，无需构建）。
+    // 依赖第三方包（package.json 有 dependencies）的插件会因无 node_modules 失败——
+    // 转译为可懂提示（jiuguan 不跑 pnpm install，插件需自带产物/零依赖，与 DSH bundle 同约束）。
+    let mod: Partial<DshPluginExports>;
+    try {
+      mod = (await import(pathToFileURL(entryPath).href)) as Partial<DshPluginExports>;
+    } catch (e) {
+      const msg = (e as Error).message ?? '';
+      if (/Cannot find package|ERR_MODULE_NOT_FOUND/.test(msg)) {
+        throw new Error(`插件依赖未安装（Cannot find package）：${msg.slice(0, 160)}。jiuguan 不执行依赖安装；该插件需要自带构建产物或零第三方依赖才能加载`);
+      }
+      throw e;
+    }
     if (typeof mod.apply !== 'function') throw new Error(`DSH 插件缺少 export apply(): ${record.id}`);
 
     const inst: LoadedDshPlugin = {
