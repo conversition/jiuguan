@@ -89,10 +89,27 @@ try {
   const miss = host.dispatch(mockReq('/api/cards'), r as unknown as ServerResponse, '/api/cards');
   check('平台路径不被拦截', !miss);
 
-  console.log('▶ S4 会话事件广播（无监听异常即通过）');
-  host.emitSessionEvent({ id: 's1' }, { type: 'turn/end', data: {} });
+  console.log('▶ S4 会话事件广播（官方三事件 + jiuguan usage 桥接）');
+  let gotAssistant = null as Record<string, unknown> | null;
+  let gotTurnEnd = false;
+  // 直接向宿主注册监听（模拟 whale-widget 的 ctx.on('session/event')）
+  const hostAny = host as unknown as { sessionListeners?: Map<string, Set<(...a: unknown[]) => void>> };
+  hostAny.sessionListeners!.set('session/event', new Set([(_s: unknown, ev: { type: string; data: Record<string, unknown> }) => {
+    if (ev.type === 'assistant/message') gotAssistant = ev.data;
+    if (ev.type === 'turn/end') gotTurnEnd = true;
+  }]));
+  host.emitJiuguanTurn({
+    sessionId: 's1', card: 'test', round: 3, model: 'deepseek-v4-flash',
+    promptTokens: 1000, completionTokens: 200, cacheReadTokens: 600,
+  });
+  const a = gotAssistant as { turn: number; message: { source: { model: string } }; usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number } } | null;
+  check('assistant/message 映射 input=prompt-cache=400', a?.usage.inputTokens === 400, JSON.stringify(a));
+  check('cacheReadTokens 透传', a?.usage.cacheReadTokens === 600);
+  check('message.source.model 透传', a?.message.source.model === 'deepseek-v4-flash');
+  check('turn/end 随后发出', gotTurnEnd);
+  host.emitSessionCreated({ id: 's1' });
   host.emitSessionDisposed({ id: 's1' });
-  check('turn/end + disposed 广播不抛错', true);
+  check('created/disposed 广播不抛错', true);
 
   console.log('▶ S5 启停/卸载生命周期');
   registry.setEnabled(rec.id, false);

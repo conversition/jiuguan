@@ -31,9 +31,11 @@ export interface DshRouteDef {
   handler: (req: IncomingMessage, res: ServerResponse) => void;
 }
 
-/** DSH 凭据解析结果 */
+/** DSH 凭据解析结果（对齐官方 ResolvedCredential：value + source 层名） */
 export interface DshCredential {
   value: string;
+  /** 来源层描述（'env' / 'provider.json' / 自定义） */
+  source?: string;
 }
 
 /** DSH 插件 apply(ctx) 收到的宿主上下文 */
@@ -65,10 +67,23 @@ interface LoadedDshPlugin {
   disposers: (() => void)[];
 }
 
-/** session 事件载荷（server 桥接用） */
+/** DSH 会话事件载荷（对齐官方 core/session Events：session/event(session, event) / session/disposed(session) / session/created(session)） */
 export interface DshSessionEventPayload {
   session: { id: string; card?: string; round?: number };
   event: { type: string; data: Record<string, unknown> };
+}
+
+/** DSH assistant/message 事件 data 形状（whale-widget 消费的字段；对齐官方 SessionEventMap） */
+export interface DshAssistantMessageData {
+  turn: number;
+  message: { source?: { model?: string } };
+  usage: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+    reasoningTokens?: number;
+  };
 }
 
 const CREDENTIAL_NAMES = ['DEEPSEEK_API_KEY', 'DEEPSEEK_PLATFORM_TOKEN', 'JG_API_KEY'];
@@ -221,7 +236,7 @@ export class DshPluginHost {
     return out;
   }
 
-  /** 广播会话事件（server 在回合完成/会话删除时调用） */
+  /** 广播会话事件（server 在回合内/完成时调用；对齐官方 session/event 签名 (session, event)） */
   emitSessionEvent(session: DshSessionEventPayload['session'], event: DshSessionEventPayload['event']): void {
     for (const cb of this.sessionListeners.get('session/event') ?? []) {
       try { cb(session, event); } catch { /* 监听器异常不阻断 */ }
@@ -232,6 +247,41 @@ export class DshPluginHost {
     for (const cb of this.sessionListeners.get('session/disposed') ?? []) {
       try { cb(session); } catch { /* 监听器异常不阻断 */ }
     }
+  }
+
+  emitSessionCreated(session: DshSessionEventPayload['session']): void {
+    for (const cb of this.sessionListeners.get('session/created') ?? []) {
+      try { cb(session); } catch { /* 监听器异常不阻断 */ }
+    }
+  }
+
+  /**
+   * 桥接辅助：把 jiuguan 回合的 usage 映射为 DSH assistant/message + turn/end 两连发。
+   * jiuguan 的 OpenAI usage(prompt_tokens/completion_tokens) → DSH TokenUsage；
+   * DeepSeek 的 prompt_cache_hit_tokens/prompt_cache_miss_tokens 若在 raw 中则映射缓存档。
+   */
+  emitJiuguanTurn(opts: {
+    sessionId: string; card?: string; round: number; model: string;
+    promptTokens: number; completionTokens: number;
+    cacheReadTokens?: number;
+  }): void {
+    const input = Math.max(0, opts.promptTokens - (opts.cacheReadTokens ?? 0));
+    this.emitSessionEvent(
+      { id: opts.sessionId, card: opts.card, round: opts.round },
+      {
+        type: 'assistant/message',
+        data: {
+          turn: opts.round,
+          message: { source: { model: opts.model } },
+          usage: {
+            inputTokens: input,
+            outputTokens: opts.completionTokens,
+            ...(opts.cacheReadTokens !== undefined ? { cacheReadTokens: opts.cacheReadTokens } : {}),
+          },
+        },
+      },
+    );
+    this.emitSessionEvent({ id: opts.sessionId, card: opts.card, round: opts.round }, { type: 'turn/end', data: { turn: opts.round } });
   }
 
   /** 重载全部启用插件（启动时调用；单插件失败仅告警不阻断其余） */

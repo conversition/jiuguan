@@ -240,6 +240,8 @@ export class ChatSession {
   private lastFingerprint: ContextFingerprint | null = null;
   /** 本回合近似 token 成本（上下文估算；cost 塑形用） */
   private lastTokenCost = 0;
+  /** 最近一次成功模型调用的真实 usage（DSH 插件会话事件桥接；attemptTurn 成功后填充） */
+  private lastUsage: { promptTokens: number; completionTokens: number } | null = null;
   /** 本回合遥测上下文（runTurnCore 由 turn/regenerate 入参透传） */
   private telemetryCtx: { retryIndex: number; clickedRegenerate: boolean; prevProseMd5?: string; narrow?: boolean } =
     { retryIndex: 0, clickedRegenerate: false };
@@ -289,6 +291,16 @@ export class ChatSession {
   }
   getMemory(): { mem: MemoryDb; round: number } {
     return { mem: this.mem, round: this.round };
+  }
+
+  /** 最近一次成功模型调用的真实 usage（DSH 插件会话事件桥接用；无记录返回 null） */
+  getLastUsage(): { promptTokens: number; completionTokens: number } | null {
+    return this.lastUsage;
+  }
+
+  /** 当前 provider 模型名（DSH 插件事件桥接的 message.source.model 字段） */
+  getModelName(): string {
+    return this.cfg.model || '';
   }
 
   /** 关闭会话（释放 DB 文件句柄；服务端删除会话用） */
@@ -1161,6 +1173,10 @@ export class ChatSession {
       if (!tc) {
         console.log(`  ⚠ 未返回 game_turn（finish=${res.finishReason}）`);
         return { turn: null, tc: null };
+      }
+      // 真实 usage 记录（DSH 插件会话事件桥接；多步重试取最后一次成功调用）
+      if (res.usage) {
+        this.lastUsage = { promptTokens: res.usage.prompt_tokens ?? 0, completionTokens: res.usage.completion_tokens ?? 0 };
       }
       let turn = safeParseTurn(tc.arguments);
       if (!turn) return { turn: null, tc };
