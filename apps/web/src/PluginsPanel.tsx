@@ -14,6 +14,8 @@ interface PluginInfo {
   includes: string[];
   server?: string;
   hooks: string[];
+  /** 插件标准：st = ST 风格沙箱钩子；dsh = DSH bundle 宿主直跑（package.json+main） */
+  kind?: 'st' | 'dsh';
   enabled: boolean;
   source: string;
   installedAt: string;
@@ -64,12 +66,12 @@ export function PluginsPanel() {
 
   return (
     <div className="console">
-      <h2>插件市场 <small>（参考 SillyTavern git 插件接口：manifest.json + git 安装）</small></h2>
+      <h2>插件市场 <small>（ST 风格 manifest.json 沙箱钩子 + DSH 标准包 package.json 宿主直跑）</small></h2>
       <div className="row">
         <input
           value={url}
           onChange={(e) => setUrl(e.target.value)}
-          placeholder="git URL 或本地路径，如 https://github.com/user/my-plugin"
+          placeholder="git URL / 本地路径 / .zip（自动识别 ST 风格与 DSH 标准包）"
           style={{ flex: 1 }}
         />
         <button onClick={install} disabled={busy || !url.trim()}>安装</button>
@@ -80,11 +82,11 @@ export function PluginsPanel() {
       {plugins === null ? (
         <p className="hint">加载中…</p>
       ) : plugins.length === 0 ? (
-        <p className="hint">尚未安装插件。粘贴插件仓库 git URL（含 manifest.json + server.js）安装。</p>
+        <p className="hint">尚未安装插件。粘贴插件仓库 git URL 安装（ST 风格：manifest.json + server.js；DSH 标准包：package.json + main 入口）。</p>
       ) : (
         <table className="table">
           <thead>
-            <tr><th>插件</th><th>版本</th><th>钩子</th><th>来源</th><th>状态</th><th>操作</th></tr>
+            <tr><th>插件</th><th>版本</th><th>类型</th><th>钩子</th><th>来源</th><th>状态</th><th>操作</th></tr>
           </thead>
           <tbody>
             {plugins.map((p) => (
@@ -95,6 +97,9 @@ export function PluginsPanel() {
                   <div className="muted">{p.author}{p.license ? ` · ${p.license}` : ''}</div>
                 </td>
                 <td>{p.version}</td>
+                <td title={p.kind === 'dsh' ? 'DSH 标准包：宿主直跑，可注册 HTTP 路由' : 'ST 风格：node:vm 沙箱钩子'}>
+                  {p.kind === 'dsh' ? '🐋 DSH' : '🧩 ST'}
+                </td>
                 <td className="muted">{(p.hooks ?? []).join(', ') || '—'}</td>
                 <td className="muted" title={p.source}>{p.source.slice(0, 30)}…</td>
                 <td>{p.enabled ? '✅ 启用' : '⏸ 停用'}</td>
@@ -110,7 +115,7 @@ export function PluginsPanel() {
           </tbody>
         </table>
       )}
-      <p className="hint">插件 = git 仓库（manifest.json 声明 + 可选 server.js 服务端钩子）。服务端钩子在 node:vm 沙箱执行，支持 onMessageSend / onProsePostProcess / onSessionStart / onSessionEnd 等钩子与 per-plugin storage。</p>
+      <p className="hint">ST 风格插件 = git 仓库（manifest.json 声明 + 可选 server.js 服务端钩子），在 node:vm 沙箱执行（onMessageSend / onProsePostProcess 等钩子 + per-plugin storage）。DSH 标准包 = package.json + main ESM 入口（export name/inject/apply），宿主直跑，可注册 HTTP 路由、读凭据、订阅会话事件。</p>
     </div>
   );
 }

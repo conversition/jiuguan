@@ -15,6 +15,7 @@ import { resolve } from 'node:path';
 import { ChatSession } from '../../tools/cli/session.ts';
 import { MemoryDb } from '../../packages/memory/src/db.ts';
 import { PluginRegistry } from '../../packages/plugin/src/registry.ts';
+import { DshPluginHost } from '../../packages/plugin/src/dsh-host.ts';
 import { listAssets, readAsset, saveUserAsset, deleteUserAsset, deleteUserCard, listCards, resolveCard, readCardText, saveAssetBuffer } from '../../packages/core/src/asset-paths.ts';
 import { parseWorldBook } from '../../packages/core/src/worldbook.ts';
 import { parsePreset } from '../../packages/core/src/preset.ts';
@@ -70,6 +71,14 @@ function stripSensitive(value: unknown): unknown {
 const sessions = new Map<string, ChatSession>();
 /** 插件注册表（插件市场：git URL 安装 / 启停 / 卸载 / 更新，数据在 data/plugins） */
 const pluginRegistry = new PluginRegistry(resolve('data', 'plugins'));
+/**
+ * DSH 标准插件宿主（deepseek-harness bundle 接口：package.json+main → ESM {name,inject,apply}）。
+ * 宿主直跑模型（真 fs/网络），路由在 /api 之前分发，凭据走环境变量。
+ */
+const dshHost = new DshPluginHost(async (name) => {
+  const v = process.env[name];
+  return v ? { value: v } : null;
+});
 /** 正则库（前端屏蔽隐藏 + 用户维护，数据在 data/regex-rules.json） */
 const regexLibrary = new RegexLibrary();
 
@@ -190,6 +199,9 @@ const server = createServer(async (req, res) => {
     const p = url.pathname;
     const method = req.method ?? 'GET';
 
+    // DSH 插件路由优先分发（插件可注册任意路径；命中即响应，不落平台路由）
+    if (dshHost.count() > 0 && dshHost.dispatch(req, res, p)) return;
+
     // 角色卡列表
     if (method === 'GET' && p === '/api/cards') {
       return json(res, { cards: listCards().map((c) => ({ id: c.file, name: c.name, format: c.format, source: c.source })) });
@@ -237,6 +249,7 @@ const server = createServer(async (req, res) => {
       if (!url) return json(res, { error: '缺少插件来源（git URL / 本地路径 / .zip）' }, 400);
       try {
         const rec = await pluginRegistry.install(url);
+        if (rec.kind === 'dsh') await reloadDshPlugin(rec.id);
         return json(res, { plugin: rec });
       } catch (e) {
         return json(res, { error: (e as Error).message.slice(0, 200) }, 400);
@@ -246,15 +259,27 @@ const server = createServer(async (req, res) => {
       const id = p.split('/')[3];
       const action = p.split('/')[4] ?? '';
       if (action === 'enable' || action === 'disable') {
-        try { return json(res, { plugin: pluginRegistry.setEnabled(id, action === 'enable') }); }
+        try {
+          const rec = pluginRegistry.setEnabled(id, action === 'enable');
+          if (rec.kind === 'dsh') await reloadDshPlugin(id);
+          return json(res, { plugin: rec });
+        }
         catch (e) { return json(res, { error: (e as Error).message }, 404); }
       }
       if (action === 'uninstall') {
-        try { pluginRegistry.uninstall(id); return json(res, { ok: true }); }
+        try {
+          dshHost.unload(id);
+          pluginRegistry.uninstall(id);
+          return json(res, { ok: true });
+        }
         catch (e) { return json(res, { error: (e as Error).message }, 404); }
       }
       if (action === 'update') {
-        try { return json(res, { plugin: await pluginRegistry.update(id) }); }
+        try {
+          const rec = await pluginRegistry.update(id);
+          if (rec.kind === 'dsh') await reloadDshPlugin(id);
+          return json(res, { plugin: rec });
+        }
         catch (e) { return json(res, { error: (e as Error).message.slice(0, 200) }, 400); }
       }
     }
@@ -329,6 +354,8 @@ const server = createServer(async (req, res) => {
         }, ac.signal);
         if (!streamStarted) sseSend(res, { type: 'status', stage: 'streaming' });
         sseSend(res, { type: 'done', prose });
+        // DSH 插件会话事件：turn/end（whale-widget 结算本轮消耗泡泡）
+        dshHost.emitSessionEvent({ id: body.session, card: session.getCardName() }, { type: 'turn/end', data: {} });
       } catch (e) {
         // 非中止失败：清理本轮孤儿 user 行（模型异常下 runTurnCore 已写 user、无 assistant，会致记忆断裂）
         if (!ac.signal.aborted) {
@@ -385,6 +412,8 @@ const server = createServer(async (req, res) => {
           // AQL 循环C：重试 ≥ replanK 时附带重写方向建议（前端「建议卡」；不进对话）
           replanSuggestion: r.replanSuggestion ?? undefined,
         });
+        // DSH 插件会话事件：turn/end（重发路径同样结算）
+        dshHost.emitSessionEvent({ id, card: session.getCardName() }, { type: 'turn/end', data: {} });
       } catch (e) {
         if (!ac.signal.aborted) sseSend(res, { type: 'error', message: (e as Error).message.slice(0, 200) });
       }
@@ -448,6 +477,8 @@ const server = createServer(async (req, res) => {
       const session = sessions.get(id);
       if (session) { try { session.close(); } catch { /* 忽略 */ } }
       sessions.delete(id);
+      // DSH 插件会话销毁事件（whale-widget 清理每轮消耗聚合桶）
+      dshHost.emitSessionDisposed({ id, card: session?.getCardName() });
       const dbPath = resolve(DATA_DIR, `${id}.db`);
       let removed = false;
       try {
@@ -1317,4 +1348,18 @@ const server = createServer(async (req, res) => {
 server.listen(PORT, HOST, () => {
   console.log(`[web-api] http://${HOST}:${PORT}`);
   console.log(`[web-api] GET /api/cards | POST /api/session/new(SSE) | POST /api/turn(SSE)`);
+  // DSH 标准插件加载（宿主直跑；单插件失败仅告警）
+  void dshHost.loadAll(pluginRegistry.list(), (rec) => resolve('data', 'plugins', rec.name));
 });
+
+/** DSH 插件生命周期联动：安装/启停/更新/卸载后重载对应实例（先卸旧再装新，幂等） */
+async function reloadDshPlugin(id: string): Promise<void> {
+  const rec = pluginRegistry.get(id);
+  dshHost.unload(id);
+  if (!rec || !rec.enabled || rec.kind !== 'dsh') return;
+  try {
+    await dshHost.load(rec, resolve('data', 'plugins', rec.name));
+  } catch (e) {
+    console.warn(`[dsh-插件] ${id} 重载失败: ${(e as Error).message.slice(0, 160)}`);
+  }
+}
