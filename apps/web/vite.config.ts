@@ -10,6 +10,8 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': `http://127.0.0.1:${webPort}`,
+      // DSH 插件路由（如 /dsh-whale/*）：同源转发到后端，widget.js 相对路径 fetch 才能命中
+      '/dsh-whale': `http://127.0.0.1:${webPort}`,
     },
   },
   build: {

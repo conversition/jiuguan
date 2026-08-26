@@ -3,6 +3,7 @@ import { MemoryConsole } from './MemoryConsole.tsx';
 import { ProviderPanel } from './ProviderPanel.tsx';
 import { AssetsPanel } from './AssetsPanel.tsx';
 import { PluginsPanel } from './PluginsPanel.tsx';
+import { DshWidgetLoader } from './DshWidgetLoader.tsx';
 import { SessionSetup } from './SessionSetup.tsx';
 import { EditorPanel } from './EditorPanel.tsx';
 import { SkillsPanel } from './SkillsPanel.tsx';
@@ -773,6 +774,8 @@ export function App() {
 
   return (
     <div className="layout">
+      {/* DSH 插件可视化加载器：发现的启用 DSH UI 插件自动注入其 widget.js（常驻，不随 tab 切换卸载） */}
+      <DshWidgetLoader />
       {!adultOk && (
         <div className="adult-overlay">
           <div className="adult-box">

@@ -25,6 +25,7 @@ import { StoryboardOrchestrator, StoryboardRegistry, DEFAULT_WORKFLOW } from '..
 import type { StoryboardResult } from '../../tools/cli/storyboard-orchestrator.ts';
 import { renderDirectorMarkdown } from '../../packages/prompt/src/storyboard.ts';
 import { OpenAICompatibleClient } from '../../packages/proxy/src/client.ts';
+import { loadProviderConfig } from '../../packages/proxy/src/config.ts';
 import { RetrievalEngine } from '../../packages/memory/src/retrieval.ts';
 import { HashEmbeddingProvider, createEmbeddingProvider } from '../../packages/memory/src/embedding.ts';
 import { LorebookScanner } from '../../packages/core/src/scanner.ts';
@@ -73,11 +74,20 @@ const sessions = new Map<string, ChatSession>();
 const pluginRegistry = new PluginRegistry(resolve('data', 'plugins'));
 /**
  * DSH 标准插件宿主（deepseek-harness bundle 接口：package.json+main → ESM {name,inject,apply}）。
- * 宿主直跑模型（真 fs/网络），路由在 /api 之前分发，凭据走环境变量。
+ * 宿主直跑模型（真 fs/网络），路由在 /api 之前分发。
+ * 凭据解析对齐官方 credentials.resolve（每次调用即席解析，不缓存）：
+ *   环境变量优先 → data/provider.json apiKey 兜底（DEEPSEEK_API_KEY / JG_API_KEY 等价复用平台已配 key）。
  */
 const dshHost = new DshPluginHost(async (name) => {
-  const v = process.env[name];
-  return v ? { value: v } : null;
+  const env = process.env[name];
+  if (env) return { value: env, source: 'env' };
+  if (name === 'DEEPSEEK_API_KEY' || name === 'JG_API_KEY') {
+    try {
+      const cfg = loadProviderConfig();
+      if (cfg.apiKey) return { value: cfg.apiKey, source: 'provider.json' };
+    } catch { /* provider.json 缺失/损坏按未配置处理 */ }
+  }
+  return null;
 });
 /** 正则库（前端屏蔽隐藏 + 用户维护，数据在 data/regex-rules.json） */
 const regexLibrary = new RegexLibrary();
@@ -310,6 +320,8 @@ const server = createServer(async (req, res) => {
       await session.init((stage) => sseSend(res, { type: 'stage', stage }));
       const id = dbName.replace(/\.db$/, '');
       sessions.set(id, session);
+      // DSH 插件会话事件：session/created（对齐官方 core/session Events）
+      dshHost.emitSessionCreated({ id, card: session.getCardName(), round: 0 });
       sseSend(res, { type: 'ready', id, greeting: session.getGreeting(), card: session.getCardName(), db: dbName, contentMode: mode, config: session.getSessionConfig() });
       res.end();
       return;
@@ -354,8 +366,16 @@ const server = createServer(async (req, res) => {
         }, ac.signal);
         if (!streamStarted) sseSend(res, { type: 'status', stage: 'streaming' });
         sseSend(res, { type: 'done', prose });
-        // DSH 插件会话事件：turn/end（whale-widget 结算本轮消耗泡泡）
-        dshHost.emitSessionEvent({ id: body.session, card: session.getCardName() }, { type: 'turn/end', data: {} });
+        // DSH 插件会话事件：assistant/message(真实 usage) + turn/end（whale-widget 结算本轮消耗泡泡）
+        const usage = session.getLastUsage();
+        if (usage) {
+          dshHost.emitJiuguanTurn({
+            sessionId: body.session, card: session.getCardName(), round: session.getMemory().round,
+            model: session.getModelName(), promptTokens: usage.promptTokens, completionTokens: usage.completionTokens,
+          });
+        } else {
+          dshHost.emitSessionEvent({ id: body.session, card: session.getCardName() }, { type: 'turn/end', data: {} });
+        }
       } catch (e) {
         // 非中止失败：清理本轮孤儿 user 行（模型异常下 runTurnCore 已写 user、无 assistant，会致记忆断裂）
         if (!ac.signal.aborted) {
@@ -412,8 +432,16 @@ const server = createServer(async (req, res) => {
           // AQL 循环C：重试 ≥ replanK 时附带重写方向建议（前端「建议卡」；不进对话）
           replanSuggestion: r.replanSuggestion ?? undefined,
         });
-        // DSH 插件会话事件：turn/end（重发路径同样结算）
-        dshHost.emitSessionEvent({ id, card: session.getCardName() }, { type: 'turn/end', data: {} });
+        // DSH 插件会话事件：assistant/message + turn/end（重发路径同样结算真实 usage）
+        const regenUsage = session.getLastUsage();
+        if (regenUsage) {
+          dshHost.emitJiuguanTurn({
+            sessionId: id, card: session.getCardName(), round: r.round,
+            model: session.getModelName(), promptTokens: regenUsage.promptTokens, completionTokens: regenUsage.completionTokens,
+          });
+        } else {
+          dshHost.emitSessionEvent({ id, card: session.getCardName() }, { type: 'turn/end', data: {} });
+        }
       } catch (e) {
         if (!ac.signal.aborted) sseSend(res, { type: 'error', message: (e as Error).message.slice(0, 200) });
       }
