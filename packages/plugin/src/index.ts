@@ -6,3 +6,7 @@ export { PluginRegistry } from './registry.ts';
 export type { PluginRecord } from './registry.ts';
 export { PluginHost } from './runtime.ts';
 export type { PluginCtx, HookResult } from './runtime.ts';
+export { DshPluginHost, createEnvCredentialResolver, CREDENTIAL_NAMES } from './dsh-host.ts';
+export type {
+  DshRouteDef, DshCredential, DshPluginCtx, DshPluginExports, DshSessionEventPayload,
+} from './dsh-host.ts';

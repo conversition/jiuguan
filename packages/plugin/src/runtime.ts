@@ -52,6 +52,8 @@ export class PluginHost {
     let ok = 0;
     for (const rec of this.registry.list()) {
       if (!rec.enabled || !rec.server) continue;
+      // DSH 标准包由 DshPluginHost 宿主直跑（server.ts 接线），沙箱不处理
+      if (rec.kind === 'dsh') continue;
       const src = this.registry.serverSource(rec.id);
       if (!src) { console.warn(`[插件] ${rec.id} 服务端入口缺失: ${rec.server}`); continue; }
       // 0.5.0 沙箱强化：静态扫描逃逸特征，命中拒载（不执行不可信代码）

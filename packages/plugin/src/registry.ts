@@ -6,6 +6,7 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { installFromSource } from './installer.ts';
+import { DshPluginHost } from './dsh-host.ts';
 import type { PluginManifest } from './manifest.ts';
 
 export interface PluginRecord {
@@ -22,6 +23,8 @@ export interface PluginRecord {
   hooks: string[];
   /** 权限声明（0.5.0 沙箱强化；未声明 = 最小） */
   permissions: { network?: boolean; fs?: boolean; runtime?: boolean };
+  /** 插件标准：st = ST 风格沙箱钩子（manifest.json）；dsh = DSH bundle 宿主直跑（package.json+main） */
+  kind: 'st' | 'dsh';
   enabled: boolean;
   /** 安装来源（git URL / 本地路径 / zip），update 复用 */
   source: string;
@@ -52,11 +55,14 @@ export class PluginRegistry {
   async install(source: string): Promise<PluginRecord> {
     const r = await installFromSource(this.pluginsDir, source);
     const now = new Date().toISOString();
+    // DSH 包：server 字段存的是 package.json 的 main；ST 包：是钩子入口
+    const kind: PluginRecord['kind'] = DshPluginHost.isDshPackage(join(this.pluginsDir, r.manifest.name)) ? 'dsh' : 'st';
     const rec: PluginRecord = {
       id: r.id, name: r.manifest.name, displayName: r.manifest.display_name || r.manifest.name,
       version: r.manifest.version, description: r.manifest.description, author: r.manifest.author,
       homepage: r.manifest.homepage, license: r.manifest.license, includes: r.manifest.includes,
-      server: r.manifest.server, hooks: r.manifest.hooks ?? [], permissions: r.manifest.permissions ?? {}, enabled: true, source,
+      server: r.manifest.server, hooks: r.manifest.hooks ?? [], permissions: r.manifest.permissions ?? {}, kind,
+      enabled: true, source,
       installedAt: now, updatedAt: now,
     };
     this.records.set(rec.id, rec);
@@ -75,6 +81,7 @@ export class PluginRegistry {
     rec.includes = r.manifest.includes;
     rec.server = r.manifest.server;
     rec.hooks = r.manifest.hooks ?? [];
+    rec.kind = DshPluginHost.isDshPackage(join(this.pluginsDir, r.manifest.name)) ? 'dsh' : 'st';
     rec.updatedAt = new Date().toISOString();
     this.save();
     return rec;
@@ -109,7 +116,13 @@ export class PluginRegistry {
     if (!existsSync(this.file)) return;
     try {
       const raw = JSON.parse(readFileSync(this.file, 'utf8')) as { plugins?: PluginRecord[] };
-      for (const r of raw.plugins ?? []) this.records.set(r.id, r);
+      for (const r of raw.plugins ?? []) {
+        // 旧 registry.json 无 kind 字段 → 按目录实际形态归一（兼容升级）
+        if (r.kind !== 'st' && r.kind !== 'dsh') {
+          r.kind = DshPluginHost.isDshPackage(join(this.pluginsDir, r.name)) ? 'dsh' : 'st';
+        }
+        this.records.set(r.id, r);
+      }
     } catch { /* 损坏则空表（重新安装） */ }
   }
 

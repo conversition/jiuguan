@@ -11,6 +11,8 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, copyFileSync, rmSync,
 import { join } from 'node:path';
 import { PluginManifestSchema } from './manifest.ts';
 import type { PluginManifest } from './manifest.ts';
+import { DshPluginHost } from './dsh-host.ts';
+import type { PluginRecord } from './registry.ts';
 
 export interface InstallResult {
   id: string;
@@ -65,12 +67,32 @@ export async function installFromSource(pluginsDir: string, source: string, opts
       throw new Error(`不支持的插件来源: ${source}（支持 git URL / 本地目录 / .zip）`);
     }
 
-    // 校验 manifest（根目录；build_dir 兼容取构建产物）
-    const manifestPath = join(tmp, 'manifest.json');
-    if (!existsSync(manifestPath)) throw new Error('插件缺少 manifest.json（参考 SillyTavern 插件仓库结构）');
-    const parsed = PluginManifestSchema.safeParse(JSON.parse(readFileSync(manifestPath, 'utf8')));
-    if (!parsed.success) throw new Error(`manifest 校验失败: ${parsed.error.issues[0]?.message ?? '未知'}`);
-    const manifest = parsed.data;
+    // 校验 manifest：两套标准并存（04 §4.1 ST 风格 / DSH bundle 风格）
+    //  1) DSH 标准包：package.json（name+main）+ ESM apply 入口 → 归一化为 manifest
+    //  2) ST 风格：manifest.json（zod 校验）
+    let manifest: PluginManifest;
+    if (DshPluginHost.isDshPackage(tmp)) {
+      const pkg = JSON.parse(readFileSync(join(tmp, 'package.json'), 'utf8')) as {
+        name?: string; version?: string; description?: string; author?: string; homepage?: string; license?: string; main?: string;
+      };
+      manifest = PluginManifestSchema.parse({
+        name: pkg.name,
+        display_name: pkg.name,
+        version: pkg.version ?? '0.1.0',
+        description: pkg.description ?? '',
+        author: pkg.author ?? '',
+        homepage: pkg.homepage,
+        license: pkg.license,
+        includes: [],
+        server: pkg.main,   // DSH main 复用 server 字段记录入口路径
+      });
+    } else {
+      const manifestPath = join(tmp, 'manifest.json');
+      if (!existsSync(manifestPath)) throw new Error('插件缺少 manifest.json 或 package.json+main（支持 ST 风格与 DSH 标准包）');
+      const parsed = PluginManifestSchema.safeParse(JSON.parse(readFileSync(manifestPath, 'utf8')));
+      if (!parsed.success) throw new Error(`manifest 校验失败: ${parsed.error.issues[0]?.message ?? '未知'}`);
+      manifest = parsed.data;
+    }
 
     // 定位插件根（build_dir 存在则用构建产物目录）
     let srcRoot = tmp;
