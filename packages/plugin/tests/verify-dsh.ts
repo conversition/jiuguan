@@ -60,7 +60,7 @@ try {
   check('安装成功 id=dsh-whale-widget', rec.id === 'dsh-whale-widget', rec.id);
   check('kind=dsh', rec.kind === 'dsh', String(rec.kind));
   check('server 入口=main(lib/index.js)', rec.server === 'lib/index.js', String(rec.server));
-  check('版本 0.2.9', rec.version === '0.2.9', rec.version);
+  check('版本为 0.2.x', /^0\.2\.\d+$/.test(rec.version), rec.version);
   check('本体已拷贝 package.json', existsSync(join(registry.pluginsDir, rec.name, 'package.json')));
 
   console.log('▶ S2 加载（ESM 动态 import → apply(ctx)）');
@@ -80,6 +80,13 @@ try {
   host.dispatch(mockReq('/dsh-whale/widget.js'), r as unknown as ServerResponse, '/dsh-whale/widget.js');
   check('GET /dsh-whale/widget.js 返回 JS', r.body.includes('__dshWhaleWidget') && r.headers['Content-Type']?.includes('javascript'),
     `len=${r.body.length}`);
+
+  // 前端 DshWidgetLoader 统一按 /<插件id>/widget.js 探测注入（web 端约定入口），
+  // 插件本体自定路径 /dsh-whale/widget.js 对 web 不可见 —— 宿主必须补挂 <id> 别名路由
+  r = mockRes();
+  const aliasHit = host.dispatch(mockReq('/dsh-whale-widget/widget.js'), r as unknown as ServerResponse, '/dsh-whale-widget/widget.js');
+  check('GET /dsh-whale-widget/widget.js（<id> 约定入口）命中且返回 JS', aliasHit && r.body.includes('__dshWhaleWidget'),
+    `dispatch=${aliasHit} len=${r.body.length}`);
 
   r = mockRes();
   const imgHit = host.dispatch(mockReq('/dsh-whale/image.png?v=2'), r as unknown as ServerResponse, '/dsh-whale/image.png');

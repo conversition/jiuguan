@@ -187,6 +187,18 @@ export class DshPluginHost {
     };
 
     await inst.exports.apply(ctx);
+
+    // web 端可视化加载器统一按 /<插件id>/widget.js 探测注入（web 约定入口），
+    // 而 DSH 插件的 UI 路由路径由插件自定（whale-widget 注册在 /dsh-whale/widget.js），
+    // 二者不一致时 web 永远探测不到 → 挂件静默消失。
+    // 宿主补挂 <id> 别名路由兜底：任何带 */widget.js 的 DSH 插件都天然满足 web 约定；卸载随实例整体移除。
+    const ALIAS_SUFFIX = '/widget.js';
+    const aliasPath = `/${record.id}${ALIAS_SUFFIX}`;
+    for (const r of [...inst.routes]) {
+      if (r.kind !== 'exact' || !r.path.endsWith(ALIAS_SUFFIX) || r.path === aliasPath) continue;
+      inst.routes.push({ kind: 'exact', path: aliasPath, handler: r.handler });
+    }
+
     this.loaded.set(record.id, inst);
   }
 
