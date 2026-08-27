@@ -3,7 +3,7 @@
  * 覆盖：用户层优先于源 / listAssets 合并标记 / 保存回读 round-trip（parseWorldBook/parsePreset）
  *      / 删除用户副本回落源 / 文件名校验
  */
-import { rmSync, mkdirSync, existsSync } from 'node:fs';
+import { rmSync, mkdirSync, existsSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 process.env.JG_USER_DATA_DIR = resolve('data', 'test-user-assets');
@@ -11,8 +11,8 @@ rmSync(process.env.JG_USER_DATA_DIR, { recursive: true, force: true });
 mkdirSync(process.env.JG_USER_DATA_DIR, { recursive: true });
 
 const {
-  resolveAsset, listAssets, readAsset, saveUserAsset, deleteUserAsset, deleteUserCard, saveAssetBuffer, resolveCard,
-  USER_PRESET_DIR, USER_WORLDBOOK_DIR, USER_CARD_DIR,
+  resolveAsset, listAssets, readAsset, saveUserAsset, deleteUserAsset, deleteWorldbookFile, deleteUserCard, saveAssetBuffer, resolveCard,
+  USER_PRESET_DIR, USER_WORLDBOOK_DIR, USER_CARD_DIR, ASSET_WORLDBOOK_DIR,
 } = await import('../src/asset-paths.ts');
 const { parseWorldBook } = await import('../src/worldbook.ts');
 const { parsePreset } = await import('../src/preset.ts');
@@ -79,6 +79,34 @@ console.log('\n== 文件名校验（防路径穿越）==');
 let traversalRejected = false;
 try { saveUserAsset('preset', '../../evil.json', '{}'); } catch { traversalRejected = true; }
 check('路径穿越被拒', traversalRejected);
+check('deleteUserAsset 路径穿越被拒', deleteUserAsset('worldbook', '../../evil.json') === false);
+
+console.log('\n== deleteWorldbookFile 两层兜底删除（源层临时书自清理）==');
+// 临时书写入真实源资产目录，测毕清理（源目录为本机资产库，非 git 管控）
+const tmpSourceOnly = '__verify_tmp_仅源层.json';
+const tmpBoth = '__verify_tmp_两层同名.json';
+const tmpJson = JSON.stringify({ name: 'tmp', entries: [] });
+writeFileSync(resolve(ASSET_WORLDBOOK_DIR, tmpSourceOnly), tmpJson);
+writeFileSync(resolve(ASSET_WORLDBOOK_DIR, tmpBoth), tmpJson);
+try {
+  const r1 = deleteWorldbookFile(tmpSourceOnly);
+  check('仅源层 → 删除源层文件', r1.removed === true && r1.layer === 'asset');
+  check('源层文件已删', !existsSync(resolve(ASSET_WORLDBOOK_DIR, tmpSourceOnly)));
+  saveUserAsset('worldbook', tmpBoth, tmpJson);
+  const r2 = deleteWorldbookFile(tmpBoth);
+  check('两层同名 → 优先删用户层', r2.removed === true && r2.layer === 'user');
+  check('用户层已删、源层保留', !existsSync(resolve(USER_WORLDBOOK_DIR, tmpBoth)) && existsSync(resolve(ASSET_WORLDBOOK_DIR, tmpBoth)));
+  const r3 = deleteWorldbookFile('不存在书.json');
+  check('两层都不存在 → removed=false', r3.removed === false && r3.layer === null);
+  const r4 = deleteWorldbookFile('..\\evil.json');
+  check('路径穿越被拒', r4.removed === false && r4.layer === null && !existsSync(resolve('..', 'evil.json')));
+  const r5 = deleteWorldbookFile('a.txt');
+  check('非 .json 被拒', r5.removed === false);
+} finally {
+  rmSync(resolve(ASSET_WORLDBOOK_DIR, tmpSourceOnly), { force: true });
+  rmSync(resolve(ASSET_WORLDBOOK_DIR, tmpBoth), { force: true });
+  rmSync(resolve(USER_WORLDBOOK_DIR, tmpBoth), { force: true });
+}
 
 rmSync(process.env.JG_USER_DATA_DIR, { recursive: true, force: true });
 console.log(`\n结果: ${passed} passed, ${failed} failed`);

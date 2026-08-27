@@ -74,10 +74,30 @@ export function saveUserAsset(kind: AssetKind, file: string, json: string): stri
 
 /** 删除用户层副本（恢复源资产）；无用户层副本返回 false */
 export function deleteUserAsset(kind: AssetKind, file: string): boolean {
+  if (basename(file) !== file) return false; // 防路径穿越（与 saveUserAsset 同规则）
   const user = resolve(assetDir(kind, true), file);
   if (!existsSync(user)) return false;
   rmSync(user, { force: true });
   return true;
+}
+
+/** 删除世界书（两层兜底）：优先删用户层副本，无用户层副本时删源层文件。
+ *  历史导入曾把用户书直接落在源资产目录（剧本方案/世界书），source 被标为 asset，
+ *  前端按 source==='user' 显示删除按钮导致按钮没有全覆盖；现按钮全覆盖，此处两层都可删。
+ *  仅接受裸文件名（防路径穿越）；调用方须已做两步确认。 */
+export function deleteWorldbookFile(file: string): { removed: boolean; layer: 'user' | 'asset' | null } {
+  if (basename(file) !== file || !/^[^\\/]+\.json$/i.test(file)) return { removed: false, layer: null };
+  const user = resolve(assetDir('worldbook', true), file);
+  if (existsSync(user)) {
+    rmSync(user, { force: true });
+    return { removed: true, layer: 'user' };
+  }
+  const src = resolve(assetDir('worldbook', false), file);
+  if (existsSync(src)) {
+    rmSync(src, { force: true });
+    return { removed: true, layer: 'asset' };
+  }
+  return { removed: false, layer: null };
 }
 
 /** 删除角色卡用户层副本（PNG 卡导入会同时落 .json + .png，须同基名一并删除；源资产只读不删） */

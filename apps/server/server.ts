@@ -16,7 +16,7 @@ import { ChatSession } from '../../tools/cli/session.ts';
 import { MemoryDb } from '../../packages/memory/src/db.ts';
 import { PluginRegistry } from '../../packages/plugin/src/registry.ts';
 import { DshPluginHost } from '../../packages/plugin/src/dsh-host.ts';
-import { listAssets, readAsset, saveUserAsset, deleteUserAsset, deleteUserCard, listCards, resolveCard, readCardText, saveAssetBuffer } from '../../packages/core/src/asset-paths.ts';
+import { listAssets, readAsset, saveUserAsset, deleteUserAsset, deleteWorldbookFile, deleteUserCard, listCards, resolveCard, readCardText, saveAssetBuffer } from '../../packages/core/src/asset-paths.ts';
 import { parseWorldBook } from '../../packages/core/src/worldbook.ts';
 import { parsePreset } from '../../packages/core/src/preset.ts';
 import { parseCharaCard, extractCharaFromPng, pngPayloadToJson, buildCharaPng } from '../../packages/core/src/chara.ts';
@@ -1173,8 +1173,11 @@ const server = createServer(async (req, res) => {
     if (method === 'POST' && p === '/api/worldbook/delete') {
       const body = await readBody(req);
       const file = (body.file ?? '').trim();
-      const removed = file ? deleteUserAsset('worldbook', file) : false;
-      return json(res, { ok: true, removed, file });
+      // force=新建会话列表的全量删除（两层兜底）；不带 force=EditorPanel「恢复源文件」，只删用户层副本
+      const result = body.force === true
+        ? deleteWorldbookFile(file)
+        : { removed: file ? deleteUserAsset('worldbook', file) : false, layer: 'user' as const };
+      return json(res, { ok: true, removed: result.removed, layer: result.layer, file });
     }
 
     // 会话内世界书条目浏览（lorebook_entry）

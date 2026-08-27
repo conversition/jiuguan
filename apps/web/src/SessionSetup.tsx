@@ -231,7 +231,7 @@ export function SessionSetup({ onCreated, onCardsChanged }: {
     setBusy(false);
   };
 
-  /** 删除世界书（仅用户导入；两步确认 → 刷新列表，移除已勾选） */
+  /** 删除世界书（按钮全覆盖；force 两层兜底删除；两步确认 → 刷新列表，移除已勾选） */
   const deleteWorldbook = async (w: WorldbookInfo) => {
     if (confirmDel?.kind !== 'worldbook' || confirmDel.id !== w.id) { setConfirmDel({ kind: 'worldbook', id: w.id }); return; }
     setConfirmDel(null);
@@ -240,7 +240,7 @@ export function SessionSetup({ onCreated, onCardsChanged }: {
     try {
       const r = await fetch(`${API}/api/worldbook/delete`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ file: w.id }),
+        body: JSON.stringify({ file: w.id, force: true }),
       });
       const d = await r.json();
       if (!r.ok) throw new Error(d.error ?? `HTTP ${r.status}`);
@@ -396,16 +396,16 @@ export function SessionSetup({ onCreated, onCardsChanged }: {
                       {w.name}
                     </label>
                     <button className="mini-btn" title="导出" onClick={() => exportWorldbook(w.id)}>⇩</button>
-                    {w.source === 'user' && (
-                      <button
-                        className={`mini-btn${confirmDel?.kind === 'worldbook' && confirmDel.id === w.id ? ' mini-btn-danger' : ''}`}
-                        title={confirmDel?.kind === 'worldbook' && confirmDel.id === w.id ? '再次点击确认删除（用户导入世界书）' : '删除世界书（用户导入）'}
-                        disabled={busy}
-                        onClick={() => deleteWorldbook(w)}
-                      >
-                        {confirmDel?.kind === 'worldbook' && confirmDel.id === w.id ? '✕' : '🗑'}
-                      </button>
-                    )}
+                    <button
+                      className={`mini-btn${confirmDel?.kind === 'worldbook' && confirmDel.id === w.id ? ' mini-btn-danger' : ''}`}
+                      title={confirmDel?.kind === 'worldbook' && confirmDel.id === w.id
+                        ? '再次点击确认删除'
+                        : w.source === 'user' ? '删除世界书（用户导入）' : '删除世界书（源资产层，删除后不可恢复）'}
+                      disabled={busy}
+                      onClick={() => deleteWorldbook(w)}
+                    >
+                      {confirmDel?.kind === 'worldbook' && confirmDel.id === w.id ? '✕' : '🗑'}
+                    </button>
                   </div>
                 ))}
               </div>
