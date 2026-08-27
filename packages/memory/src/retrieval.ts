@@ -143,18 +143,36 @@ function collectFtsTokens(query: string): string[] {
   return query.split(/[\s,，、;；]+/).filter((t) => t.length >= 3 && t.length <= 6);
 }
 
-/** 提取 LIKE 兜底查询：<3 字词元 + 长句（≥7 字）的 4 字全覆盖窗口（步长 1，保证包含任意 4 字连续子串） */
+/** 提取 LIKE 兜底查询：<3 字词元 + 长句（≥7 字）的 4 字全覆盖窗口（步长 1，保证包含任意 4 字连续子串）。
+ *  多词元轮转取样（每词元每轮取 1 窗口直到上限）：避免超长首词元（如 150 字压缩摘要）独占全部名额、
+ *  把真正重要的用户输入挤出 LIKE 匹配。 */
 function collectLikeQueries(query: string): string[] {
-  const out: string[] = [];
+  const windows: string[][] = [];
   for (const t of query.split(/[\s,，、;；]+/)) {
     if (!t) continue;
     if (t.length < 3) {
-      out.push(t);
+      windows.push([t]);
     } else if (t.length >= 7) {
-      for (let i = 0; i + 4 <= t.length; i++) out.push(t.slice(i, i + 4));
+      const w: string[] = [];
+      for (let i = 0; i + 4 <= t.length; i++) w.push(t.slice(i, i + 4));
+      windows.push(w);
     }
+    // 3-6 字词元走 FTS trigram，不进 LIKE
   }
-  return out.slice(0, 16);
+  const out: string[] = [];
+  const max = 32;
+  for (let round = 0; out.length < max; round++) {
+    let took = false;
+    for (const w of windows) {
+      if (out.length >= max) break;
+      if (round < w.length) {
+        out.push(w[round]);
+        took = true;
+      }
+    }
+    if (!took) break;
+  }
+  return out;
 }
 
 /**
@@ -449,6 +467,7 @@ export class RetrievalEngine {
       used += cost;
       final.push(h);
     }
+    const budgetDropped = kept.length - final.length;
 
     // 访问计数回写（仅「实际注入」的命中，供遗忘曲线 access boost 累积）
     if (q.trackAccess !== false) this.bumpAccess(final);
@@ -464,6 +483,7 @@ export class RetrievalEngine {
         entity: rankMaps.entity?.size ?? 0,
         am: rankMaps.am.size,
         total: final.length,
+        budgetDropped,
         decayBoosted: final.filter((h) => (h.decayFactor ?? 1) < 1 || (h.accessCount ?? 0) > 0).length,
       },
     };

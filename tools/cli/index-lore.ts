@@ -17,10 +17,10 @@
 import { readFileSync } from 'node:fs';
 import { basename } from 'node:path';
 import { MemoryDb } from '../../packages/memory/src/db.ts';
-import { parseLoreEntries, parseLoreEntry, buildAliasIndex } from '../../packages/core/src/lore-parse.ts';
-import { chunkLoreEntry } from '../../packages/core/src/lore-chunk.ts';
+import { parseLoreEntry, parseLoreEntries } from '../../packages/core/src/lore-parse.ts';
 import { createEmbeddingProvider } from '../../packages/memory/src/embedding.ts';
-import { getPgVectorStore, PG_VECTOR_DIMS } from '../../packages/memory/src/pg-vector.ts';
+import { getPgVectorStore } from '../../packages/memory/src/pg-vector.ts';
+import { indexLoreEntries } from './lore-index-task.ts';
 
 interface Options {
   db?: string;
@@ -95,55 +95,16 @@ async function main(): Promise<void> {
     console.log(`[索引] embedding=${embedProvider!.name} dims=${embedProvider!.dims}`);
   }
 
-  // 4) 逐条切分 + 向量化 + 入库（分批，进度可见）
-  const writeBatch: Parameters<typeof pg.upsertLore>[0][] = [];
-  const dims = embedProvider?.dims ?? 0;
-  let chunked = 0;
-  let written = 0;
-  for (const p of unique) {
-    if (p.settingText.replace(/\s/g, '').length < 5) continue; // 空设定不索引
-    const chunks = chunkLoreEntry(p, { maxLen: o.maxLen, overlap: o.overlap });
-    chunked += chunks.length;
-    // 向量化窗口（分批）
-    let vecs: number[][] = [];
-    if (embedProvider && dims > 0) {
-      for (let i = 0; i < chunks.length; i += o.batchSize) {
-        const batch = chunks.slice(i, i + o.batchSize);
-        vecs.push(...(await embedProvider.embedBatch(batch.map((c) => c.text))));
-      }
-    }
-    writeBatch.push({
-      namespace, id: p.id, book: p.meta.book, settingText: p.settingText, aliases: p.aliases,
-      chunks: chunks.map((c, i) => ({ seq: c.seq, text: c.text, vec: vecs[i] ?? new Array(0) })),
-    });
-    if (writeBatch.length >= o.batchSize) {
-      for (const w of writeBatch) await pg.upsertLore(w);
-      written += writeBatch.length;
-      writeBatch.length = 0;
-      console.log(`[索引] 已写 ${written}/${unique.length} 条…`);
-    }
-  }
-  for (const w of writeBatch) await pg.upsertLore(w);
-  written += writeBatch.length;
-
-  // 4.5) 废弃条目（active=0）残留清理：旧 chunk/text 不再索引但仍在 PG，显式 DELETE
-  if (mem) {
-    const inactive = mem.db.prepare('SELECT id FROM lorebook_entry WHERE active = 0').all() as { id: number }[];
-    if (inactive.length > 0) {
-      await pg.purgeLore(namespace, inactive.map((r) => r.id));
-      console.log(`[索引] 清理废弃条目 ${inactive.length} 条的 PG 残留`);
-    }
-  }
-
-  // 5) 别名/职位简写写入 lore_alias（`会长→桐月樱佳` 确定性检索，解决 2 字词 FTS 失效）
-  //    resetAliases 先清空该命名空间旧别名（含废弃实体推导），再写入当前启用条目别名，避免残留
-  await pg.resetAliases(namespace);
-  const aliasIndex = buildAliasIndex(unique);
-  const aliasRows: { alias: string; entityName: string; explicit: boolean }[] = [];
-  for (const [alias, entry] of aliasIndex) {
-    aliasRows.push({ alias, entityName: entry.entityName || alias, explicit: entry.explicit });
-  }
-  await pg.upsertAlias(namespace, aliasRows);
+  // 4~5) 切分 + 向量化 + 入库 + 废弃清理 + 别名（共享任务：与会话自动索引同一实现）
+  const result = await indexLoreEntries({
+    pg, namespace, parsed: unique,
+    provider: o.noEmbed ? null : embedProvider,
+    inactiveIds: mem ? (mem.db.prepare('SELECT id FROM lorebook_entry WHERE active = 0').all() as { id: number }[]).map((r) => r.id) : [],
+    batchSize: o.batchSize, maxLen: o.maxLen, overlap: o.overlap,
+    log: (m) => console.log(m),
+  });
+  const written = result?.entries ?? 0;
+  const chunked = result?.chunks ?? 0;
 
   const n = await pg.chunkCount();
   const na = await pg.aliasCount();

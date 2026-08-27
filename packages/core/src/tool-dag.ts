@@ -155,6 +155,8 @@ export class ToolDag<Ctx extends ToolContext = ToolContext> {
       const res = await def.execute(toolCtx, raw);
       if (res) self.resultsStore.set(name, res);
     } catch (e) {
+      // 失败必须留痕：静默吞掉会让上游把 {ok:false,data:{}} 读成「0 命中」，与真空结果无法区分
+      console.warn(`[DAG] 工具 ${name} 失败: ${(e as Error).message}`);
       self.resultsStore.set(name, { ok: false, data: {}, cost: 0, error: (e as Error).message });
     }
   }

@@ -32,11 +32,11 @@ export interface ScheduleResult {
 }
 
 /** 全局上下文总闸（环境可覆盖）。
- *  默认 20000：适配 128k–200k 窗口模型。
+ *  默认 30000：适配 128k–200k 窗口模型（检索/世界书口袋扩容后 四块 cost 上限合计约 21.5k + 窗口 ~3.5k）。
  *  智能分配：窗口(~8k) + 卡/系统/预设(~2k) 直接进 prompt 基座（不经调度器），
- *  调度预算专供 记忆+长摘+世界书+世界状态 四块（cost 上限合计约 15.5k），并为模型输出预留 ≥10%。
- *  1M 窗口可经 JG_CONTEXT_BUDGET_TOKENS 上调到 30k–50k；越小窗口则相应调低。 */
-export const CONTEXT_BUDGET_TOKENS = Number(process.env.JG_CONTEXT_BUDGET_TOKENS ?? 20000);
+ *  调度预算专供 记忆+长摘+世界书+世界状态 四块，并为模型输出预留 ≥10%。
+ *  1M 窗口可经 JG_CONTEXT_BUDGET_TOKENS 上调到 50k；越小窗口则相应调低。 */
+export const CONTEXT_BUDGET_TOKENS = Number(process.env.JG_CONTEXT_BUDGET_TOKENS ?? 30000);
 
 /** 块 token 估算：中文 1 字≈1.5，其余 1 字≈0.4（与 assembly.estimateTokens 同口径） */
 export function blockTokens(fragment: string): number {

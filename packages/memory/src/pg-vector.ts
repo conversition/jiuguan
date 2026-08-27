@@ -225,17 +225,21 @@ export class PgVectorStore {
     }
   }
 
-  /** 别名表总数（健康检查/日志） */
-  async aliasCount(): Promise<number> {
+  /** 别名表总数（健康检查/日志）；带 namespace 时只统计该命名空间（空库检测） */
+  async aliasCount(namespace?: string): Promise<number> {
     if (!this.ready || !this.pool) return 0;
-    const r = await this.pool.query<{ n: string }>('SELECT COUNT(*) AS n FROM lore_alias');
+    const r = namespace
+      ? await this.pool.query<{ n: string }>('SELECT COUNT(*) AS n FROM lore_alias WHERE namespace = $1', [namespace])
+      : await this.pool.query<{ n: string }>('SELECT COUNT(*) AS n FROM lore_alias');
     return Number(r.rows[0]?.n ?? 0);
   }
 
-  /** 统计窗口数（健康检查/日志） */
-  async chunkCount(): Promise<number> {
+  /** 统计窗口数（健康检查/日志）；带 namespace 时只统计该命名空间（空库检测/自动索引触发条件） */
+  async chunkCount(namespace?: string): Promise<number> {
     if (!this.ready || !this.pool) return 0;
-    const r = await this.pool.query<{ n: string }>('SELECT COUNT(*) AS n FROM lore_chunk');
+    const r = namespace
+      ? await this.pool.query<{ n: string }>('SELECT COUNT(*) AS n FROM lore_chunk WHERE namespace = $1', [namespace])
+      : await this.pool.query<{ n: string }>('SELECT COUNT(*) AS n FROM lore_chunk');
     return Number(r.rows[0]?.n ?? 0);
   }
 }

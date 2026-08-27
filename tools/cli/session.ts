@@ -63,6 +63,7 @@ import { resolveAsset, listAssets } from '../../packages/core/src/asset-paths.ts
 import type { AssetKind } from '../../packages/core/src/asset-paths.ts';
 import { StoryboardOrchestrator } from './storyboard-orchestrator.ts';
 import type { StoryboardResult } from './storyboard-orchestrator.ts';
+import { indexSessionLore } from './lore-index-task.ts';
 
 /** 资产解析（用户层 data/{presets,worldbooks} 优先于 剧本方案 源目录，编辑器 P2） */
 function resolveAssetFile(kind: AssetKind, file: string): string | null {
@@ -494,13 +495,14 @@ export class ChatSession {
    *  build 读取 this.turnInput 预计算源（回合前由 runTurnCore 汇入），产注入片段。 */
   private initContextProviders(): void {
     // cost 默认适配 128k–200k 窗口；均可经 JG_COST_* 环境变量按量上调/下调
-    this.regProvider('memory', Number(process.env.JG_COST_MEMORY ?? 3000), 75, {
+    this.regProvider('memory', Number(process.env.JG_COST_MEMORY ?? 5000), 75, {
       build: () => this.turnInput.recall?.injectedBlock ?? '',
     });
     this.regProvider('longterm', Number(process.env.JG_COST_LONGTERM ?? 1500), 70, {
       build: () => this.getLongTermBlock(),
     });
-    this.regProvider('worldbook', Number(process.env.JG_COST_WORLDBOOK ?? 8000), 60, {
+    // worldbook cost 须 ≥ JG_WB_BUDGET_TOKENS（5000t 内容 + 门控渲染标签开销），否则 over-cost 整块丢（宁丢勿裁）
+    this.regProvider('worldbook', Number(process.env.JG_COST_WORLDBOOK ?? 12000), 60, {
       build: (focus) => this.gatedWorldbookBlock(focus),
     });
     // worldstate：变量段可降级（reducible），cost 默认 3000（核心段必留，变量段由 worldStateBlock 内部收缩到 JG_WORLDSTATE_VAR_TOKENS）
@@ -529,6 +531,19 @@ export class ChatSession {
   /** 在场实体：输入去标点分词（2-8 字连续段），限 6 个 */
   private presentEntities(input: string): string[] {
     return input.split(/[，。！？、,.!?\s]+/).filter((s) => s.length >= 2 && s.length <= 8).slice(0, 6);
+  }
+
+  /** 世界书扫描面扩展：最近 n 条历史原文（跳 user 孤儿轮 + prompt 正则清洗），供关键词/正则命中。
+   *  语义激活仍只用本轮输入（向量聚焦当前话题，不稀释召回重心）。 */
+  private recentScanHistory(maxRound: number, n = 6): string[] {
+    const rows = this.mem.db.prepare(
+      `SELECT r.content AS content
+       FROM chat_log r
+       WHERE r.round <= ? AND r.role IN ('user', 'assistant')
+         AND EXISTS (SELECT 1 FROM chat_log a WHERE a.round = r.round AND a.role = 'assistant')
+       ORDER BY r.id DESC LIMIT ?`,
+    ).all(maxRound, n) as { content: string }[];
+    return rows.map((r) => applyRegexRules(r.content, this.regexLib.list(), 'prompt').text).reverse();
   }
 
   /** 实体名册（惰性构建一次）：世界书启用条目 → buildAliasIndex「实体名→所属条目」。
@@ -671,12 +686,17 @@ export class ChatSession {
   }
 
   /** 世界书条件化门控：按在场实体/场景过滤已扫描条目（只注入相关条目；恒常条目保留）。
-   *  语义融合条目已由融合公式确认相关性：high 整条保留；medium 注入标题+摘要提示可展开（LLM 决定是否展开）。 */
+   *  语义融合条目已由融合公式确认相关性：high 整条保留；medium 注入标题+摘要提示可展开（LLM 决定是否展开）。
+   *  在场实体为空时不过滤（presentEntities 依赖标点分词，无标点长句会得到空 present，
+   *  若此时仍一票否决会误杀确定性激活条目 → 模型看不到世界书）；扫描器已按本轮输入激活，相关性有底。 */
   private gatedWorldbookBlock(focus: TurnFocus): string {
     const scan = this.turnInput.scan;
     if (!scan || !Array.isArray(scan.activated) || scan.activated.length === 0) return '';
+    const maxEntryChars = Number(process.env.JG_WB_ENTRY_MAX_CHARS ?? 1200);
+    const mediumChars = Number(process.env.JG_WB_MEDIUM_CHARS ?? 600);
     const relevant = scan.activated.filter((e) => {
       if (e.constant) return true;
+      if (focus.present.length === 0) return true;
       // 语义融合已确认相关性：high 语义条目标记（fusion 阈值高）直接保留；medium 仍需在场/场景佐证
       if (e.matchType === 'semantic') {
         return e.priority === 'high' || focus.present.some((p) => `${e.comment} ${e.content}`.includes(p));
@@ -691,10 +711,10 @@ export class ChatSession {
       // 统一用可读设定（剥 EJS/MVU/{{//}} 代码），模型读到设定正文而非代码噪音
       const readable = readableLoreContent(e.content);
       const content = e.matchType === 'semantic' && e.priority === 'medium'
-        ? `${readable.slice(0, 240)}…(可展开)`
+        ? `${readable.slice(0, mediumChars)}…(可展开)`
         : readable;
       const tag = e.constant ? '恒定' : e.matchType;
-      return `[${tag}] ${e.comment}: ${content.slice(0, 500)}`;
+      return `[${tag}] ${e.comment}: ${content.slice(0, maxEntryChars)}`;
     }).join('\n');
   }
 
@@ -839,12 +859,28 @@ export class ChatSession {
           console.warn(`[世界书·语义] 语义索引初始化失败，降级关键词: ${(e as Error).message.slice(0, 60)}`);
         }
       }
-      // PG pgvector 真向量/别名检索通道（同一 bge model）；缺连优雅回落 SQLite 检索
+      // PG pgvector 真向量/别名检索通道（同一 bge model）；缺连优雅回落 SQLite 检索。
+      // 计数按本会话命名空间统计：全库总数会掩盖「新会话命名空间为空 → 通道恒 0 命中」。
+      // 空库且有启用条目时后台自动补索引（复用 index-lore 共享实现，幂等，不阻塞会话启动）。
       try {
         const pg = await getPgVectorStore();
         if (pg.isReady) {
           this.ret.setPgStore(pg);
-          console.log(`[向量] PG pgvector 就绪（chunks=${await pg.chunkCount()} aliases=${await pg.aliasCount()}）`);
+          const ns = this.sessionLabel();
+          const nsChunks = await pg.chunkCount(ns);
+          const nsAliases = await pg.aliasCount(ns);
+          console.log(`[向量] PG pgvector 就绪（本会话 namespace=${ns}: chunks=${nsChunks} aliases=${nsAliases}；全库 ${await pg.chunkCount()}）`);
+          if (nsChunks === 0) {
+            const loreCount = (this.mem.db.prepare('SELECT COUNT(*) c FROM lorebook_entry WHERE active = 1').get() as { c: number }).c;
+            if (loreCount > 0) {
+              console.log(`[向量] 本会话 PG 命名空间为空，后台自动索引 ${loreCount} 条世界书（完成前别名/ANN 通道暂空）…`);
+              void indexSessionLore(this.mem, pg, ns, wbProvider, (m) => console.log(m))
+                .then((r) => {
+                  if (r) console.log(`[向量] PG 自动索引完成：${r.entries} 条 / ${r.chunks} 窗口 / ${r.aliases} 别名（namespace=${ns}）`);
+                })
+                .catch((e) => console.warn(`[向量] PG 自动索引失败（不影响对话，可手动跑 index-lore）: ${(e as Error).message.slice(0, 80)}`));
+            }
+          }
         } else {
           this.ret.setPgStore(null);
         }
@@ -1023,7 +1059,7 @@ export class ChatSession {
           const input = c.runtime.input as string;
           const bars = c.runtime.bars as Record<string, number>;
           const ns = basename(self.dbPath).replace(/\.db$/i, ''); // PG 命名空间 = 会话 DB 基名（隔离跨卡，同会话多世界书共享）
-          const hits = await c.runtime.ret!.recallAsync({ query: self.buildRecallQuery(input, bars), round, budgetTokens: 600, namespace: ns });
+          const hits = await c.runtime.ret!.recallAsync({ query: self.buildRecallQuery(input, bars), round, budgetTokens: Number(process.env.JG_RECALL_BUDGET_TOKENS ?? 3000), namespace: ns });
           // data 必须直接是完整 RecallResult（调用方据此读 injectedBlock/codes 进装配）；包一层 {hits,raw}
           // 会让 provider 的 turnInput.recall.injectedBlock 读到 undefined → 记忆块静默失活（0.5.0 回归）
           return { ok: true, data: hits, cost: hits.hits.length };
@@ -1034,7 +1070,9 @@ export class ChatSession {
         async execute(c, args) {
           const round = c.runtime.round as number;
           const input = c.runtime.input as string;
-          const scan = await c.runtime.scanner!.scanAsync({ text: input, seed: round, budgetTokens: 1200 });
+          // 扫描面扩展（ST scanDepth 等价）：关键词/正则命中含最近 6 条历史；语义激活仍只看本轮输入
+          const history = self.recentScanHistory(round - 1, 6);
+          const scan = await c.runtime.scanner!.scanAsync({ text: input, history, seed: round, budgetTokens: Number(process.env.JG_WB_BUDGET_TOKENS ?? 5000) });
           return { ok: true, data: scan, cost: scan.activated.length };
         },
       },
@@ -1100,7 +1138,9 @@ export class ChatSession {
     const vmsResult = toolResults.update_variable?.data as { values: Record<string, string | number | boolean> } | undefined;
     const skillBlock = renderSkillBlock(skillMatches);
     if (skillMatches.length > 0) console.log(`[Skill] 命中 ${skillMatches.map((m) => `${m.skill.name}(${m.score.toFixed(2)})`).join(', ')}`);
-    console.log(`[预计算] 检索 ${recall?.hits?.length ?? 0} 条 / 世界书 ${scan?.activated?.length ?? 0} 条 / 变量 ${Object.keys(vmsResult?.values ?? {}).length} 个 / 窗口 ${windowInfo.messages.length} 条 ${windowInfo.tokens}t${windowInfo.truncated ? '（截断）' : ''}`);
+    const scanStats = scan?.stats as { budgetDropped?: number } | undefined;
+    const recallStats = recall?.layerStats as { budgetDropped?: number } | undefined;
+    console.log(`[预计算] 检索 ${recall?.hits?.length ?? 0} 条${recallStats?.budgetDropped ? `(+预算砍${recallStats.budgetDropped})` : ''} / 世界书 ${scan?.activated?.length ?? 0} 条${scanStats?.budgetDropped ? `(+预算砍${scanStats.budgetDropped})` : ''} / 变量 ${Object.keys(vmsResult?.values ?? {}).length} 个 / 窗口 ${windowInfo.messages.length} 条 ${windowInfo.tokens}t${windowInfo.truncated ? '（截断）' : ''}`);
 
     // ② 装配（L1/L2：焦点 → 依赖激活 → 全局预算调度 → 各槽位片段）
     const variableValues = { ...(vmsResult?.values ?? {}), ...(this.bridge?.getFlat() ?? {}) };

@@ -68,6 +68,8 @@ export interface ScanResult {
     tokens: number;
     /** 语义补充激活条数（融合召回；0 表示未启用/降级） */
     semanticAdded?: number;
+    /** 激活但因预算装不下被跳过的条数（观测口袋够不够） */
+    budgetDropped?: number;
   };
 }
 
@@ -178,11 +180,11 @@ export class LorebookScanner {
     }
 
     const merged = [...base.activated, ...supplements];
-    const final = this.finalize(merged, opts.budgetTokens ?? 800);
+    const { final, budgetDropped } = this.finalize(merged, opts.budgetTokens ?? 800);
     return {
       activated: final,
       injectedBlock: this.renderBlock(final),
-      stats: { ...base.stats, semanticAdded: supplements.length, tokens: base.stats.tokens },
+      stats: { ...base.stats, semanticAdded: supplements.length, tokens: base.stats.tokens, budgetDropped },
     };
   }
 
@@ -238,16 +240,18 @@ export class LorebookScanner {
       });
     }
 
-    const final = this.finalize(activated, opts.budgetTokens ?? 800);
+    const { final, budgetDropped } = this.finalize(activated, opts.budgetTokens ?? 800);
     stats.tokens = final.reduce((acc, e) => acc + estimateTokens(e.content), 0);
+    stats.budgetDropped = budgetDropped;
     return { activated: final, injectedBlock: this.renderBlock(final), stats };
   }
 
-  /** 排序（常量/副词条优先 + 原始顺序）后预算截断 */
-  private finalize(activated: ActivatedEntry[], budget: number): ActivatedEntry[] {
+  /** 排序（常量/副词条优先 + 原始顺序）后预算截断；返回被预算跳过的条数（观测口袋够不够） */
+  private finalize(activated: ActivatedEntry[], budget: number): { final: ActivatedEntry[]; budgetDropped: number } {
     activated.sort((a, b) => a.order - b.order || a.id - b.id);
     const final: ActivatedEntry[] = [];
     let used = 0;
+    let budgetDropped = 0;
     for (const e of activated) {
       const cost = estimateTokens(e.content);
       if (used + cost > budget) {
@@ -256,6 +260,8 @@ export class LorebookScanner {
           const keep = Math.max(40, Math.floor((budget / Math.max(1, cost)) * e.content.length));
           final.push({ ...e, content: `${e.content.slice(0, keep)}…` });
           used = budget;
+        } else {
+          budgetDropped++;
         }
         // 后续超限条目：跳过本条，继续尝试后续更小条目（v1.1 融合世界书：避免大条目饿死小规则）
         continue;
@@ -263,7 +269,7 @@ export class LorebookScanner {
       used += cost;
       final.push(e);
     }
-    return final;
+    return { final, budgetDropped };
   }
 
   /** 在场实体（2-8 字连续段，去标点，限 6 个），用于语义融合实体重叠信号 */
@@ -271,12 +277,13 @@ export class LorebookScanner {
     return new Set(text.split(/[，。！？、,.!?\s]+/).filter((s) => s.length >= 2 && s.length <= 8).slice(0, 6));
   }
 
-  /** L1 注入块渲染 */
+  /** L1 注入块渲染（与 session.gatedWorldbookBlock 同口径：单条上限 JG_WB_ENTRY_MAX_CHARS） */
   private renderBlock(entries: ActivatedEntry[]): string {
     if (entries.length === 0) return '';
+    const maxChars = Number(process.env.JG_WB_ENTRY_MAX_CHARS ?? 1200);
     const lines = entries.map((e) => {
       const tag = e.constant ? '[恒定]' : `[${e.matchType}]`;
-      return `${tag} ${e.comment}: ${e.content.slice(0, 500)}`;
+      return `${tag} ${e.comment}: ${e.content.slice(0, maxChars)}`;
     });
     return lines.join('\n');
   }
