@@ -818,7 +818,6 @@ export class ChatSession {
     const books = this.args.worldbooks !== undefined
       ? this.args.worldbooks
       : defaultLabels.map((l) => WORLD_BOOK_LABELS[l] ?? l);
-    let vectorizable = false;
     for (const f of books) {
       const path = resolveAssetFile('worldbook', f);
       if (!path) { console.warn(`[世界书] 文件不存在: ${f}，跳过`); continue; }
@@ -830,68 +829,75 @@ export class ChatSession {
           insert.run(r.uid, r.book || f, r.key, r.comment, r.content, r.selective, r.depth, r.constant, r.use_regex, r.triggers, r.probability, r.useProbability, r.active);
         }
         console.log(`[世界书] ${f} ${parsed.stats.total} 条（mode=${mode}）`);
-        vectorizable = true;
       } catch (e) {
         console.warn(`[世界书] ${f} 解析失败，跳过: ${(e as Error).message.slice(0, 80)}`);
       }
     }
-    // 语义向量化（bge；失败回落 hash）+ PG 真向量检索（可选，缺连优雅回落）
-    if (vectorizable && this.args.useBge) {
-      onStage?.('vectorize');
-      // 注入 embedding provider 到检索器 + 世界书语义激活器（同一 bge 模型，不重复编码）
-      let wbProvider: import('../../packages/memory/src/embedding.ts').EmbeddingProvider | null = null;
-      try {
-        const provider = await createEmbeddingProvider(true);
-        this.ret.setEmbeddingProvider(provider);
-        wbProvider = provider;
-        const vr = await new Vectorizer(this.mem, provider).run({ sources: ['lore'], batchSize: 32, incremental: true });
-        console.log(`[向量] ${provider.name} 向量化 ${vr.vectorized} 条（语义激活）`);
-      } catch (e) {
-        this.ret.setEmbeddingProvider(new HashEmbeddingProvider());
-        console.warn(`[向量] 失败，回落 hash: ${(e as Error).message.slice(0, 60)}`);
-      }
-      // 世界书整条目语义激活：复用 Vectorizer 已落库的 vec_memory 整条目向量，不重复编码。
-      // 向量/编码缺失时扫描器自动降级为纯关键词/正则（基础功能不中断）。
-      if (wbProvider) {
-        try {
-          this.scanner.setEmbeddingProvider(wbProvider);
-          this.scanner.initSemantic(this.mem);
-          console.log(`[世界书·语义] 整条目语义索引就绪（${this.scanner.isSemanticReady() ? '开' : '降级'}）`);
-        } catch (e) {
-          console.warn(`[世界书·语义] 语义索引初始化失败，降级关键词: ${(e as Error).message.slice(0, 60)}`);
-        }
-      }
-      // PG pgvector 真向量/别名检索通道（同一 bge model）；缺连优雅回落 SQLite 检索。
-      // 计数按本会话命名空间统计：全库总数会掩盖「新会话命名空间为空 → 通道恒 0 命中」。
-      // 空库且有启用条目时后台自动补索引（复用 index-lore 共享实现，幂等，不阻塞会话启动）。
-      try {
-        const pg = await getPgVectorStore();
-        if (pg.isReady) {
-          this.ret.setPgStore(pg);
-          const ns = this.sessionLabel();
-          const nsChunks = await pg.chunkCount(ns);
-          const nsAliases = await pg.aliasCount(ns);
-          console.log(`[向量] PG pgvector 就绪（本会话 namespace=${ns}: chunks=${nsChunks} aliases=${nsAliases}；全库 ${await pg.chunkCount()}）`);
-          if (nsChunks === 0) {
-            const loreCount = (this.mem.db.prepare('SELECT COUNT(*) c FROM lorebook_entry WHERE active = 1').get() as { c: number }).c;
-            if (loreCount > 0) {
-              console.log(`[向量] 本会话 PG 命名空间为空，后台自动索引 ${loreCount} 条世界书（完成前别名/ANN 通道暂空）…`);
-              void indexSessionLore(this.mem, pg, ns, wbProvider, (m) => console.log(m))
-                .then((r) => {
-                  if (r) console.log(`[向量] PG 自动索引完成：${r.entries} 条 / ${r.chunks} 窗口 / ${r.aliases} 别名（namespace=${ns}）`);
-                })
-                .catch((e) => console.warn(`[向量] PG 自动索引失败（不影响对话，可手动跑 index-lore）: ${(e as Error).message.slice(0, 80)}`));
-            }
-          }
-        } else {
-          this.ret.setPgStore(null);
-        }
-      } catch (e) {
-        this.ret.setPgStore(null);
-        console.warn(`[向量] PG 不可用，回落 SQLite 检索: ${(e as Error).message.slice(0, 60)}`);
-      }
-    } else if (!vectorizable) {
+    // 检索渠道初始化不内联在本函数：resume 重建会话不传 card、不走卡片分支，
+    // 渠道必须独立恢复（见 initRetrievalChannels / init 末尾调用点）
+  }
+
+  /** 检索渠道初始化：bge 注入（检索器+语义激活器）+ PG pgvector 关联 + 空库自动索引。
+   *  独立于卡片导入路径——服务重启 resume 重建会话不传 card，此前渠道只在 loadWorldbooks（卡片分支内）
+   *  初始化 → 恢复会话通道0(别名)/通道B(bge ANN) 全灭、检索恒 0 条（世界书 SQLite 扫描不受影响）。
+   *  判据用 SQLite lorebook_entry 现状（resume 时已持久），不依赖本次是否重新导入世界书文件。 */
+  private async initRetrievalChannels(onStage?: (stage: string) => void): Promise<void> {
+    const loreCount = (this.mem.db.prepare('SELECT COUNT(*) c FROM lorebook_entry WHERE active = 1').get() as { c: number }).c;
+    // 无启用条目：hash 兜底（原 vectorizable=false 路径）；useBge=false 且有世界书：不设 provider（原行为）
+    if (loreCount === 0) {
       this.ret.setEmbeddingProvider(new HashEmbeddingProvider());
+      return;
+    }
+    if (!this.args.useBge) return;
+    onStage?.('vectorize');
+    // 注入 embedding provider 到检索器 + 世界书语义激活器（同一 bge 模型，不重复编码）
+    let wbProvider: import('../../packages/memory/src/embedding.ts').EmbeddingProvider | null = null;
+    try {
+      const provider = await createEmbeddingProvider(true);
+      this.ret.setEmbeddingProvider(provider);
+      wbProvider = provider;
+      const vr = await new Vectorizer(this.mem, provider).run({ sources: ['lore'], batchSize: 32, incremental: true });
+      console.log(`[向量] ${provider.name} 向量化 ${vr.vectorized} 条（语义激活）`);
+    } catch (e) {
+      this.ret.setEmbeddingProvider(new HashEmbeddingProvider());
+      console.warn(`[向量] 失败，回落 hash: ${(e as Error).message.slice(0, 60)}`);
+    }
+    // 世界书整条目语义激活：复用 Vectorizer 已落库的 vec_memory 整条目向量，不重复编码。
+    // 向量/编码缺失时扫描器自动降级为纯关键词/正则（基础功能不中断）。
+    if (wbProvider) {
+      try {
+        this.scanner.setEmbeddingProvider(wbProvider);
+        this.scanner.initSemantic(this.mem);
+        console.log(`[世界书·语义] 整条目语义索引就绪（${this.scanner.isSemanticReady() ? '开' : '降级'}）`);
+      } catch (e) {
+        console.warn(`[世界书·语义] 语义索引初始化失败，降级关键词: ${(e as Error).message.slice(0, 60)}`);
+      }
+    }
+    // PG pgvector 真向量/别名检索通道（同一 bge model）；缺连优雅回落 SQLite 检索。
+    // 计数按本会话命名空间统计：全库总数会掩盖「新会话命名空间为空 → 通道恒 0 命中」。
+    // 空库且有启用条目时后台自动补索引（复用 index-lore 共享实现，幂等，不阻塞会话启动）。
+    try {
+      const pg = await getPgVectorStore();
+      if (pg.isReady) {
+        this.ret.setPgStore(pg);
+        const ns = this.sessionLabel();
+        const nsChunks = await pg.chunkCount(ns);
+        const nsAliases = await pg.aliasCount(ns);
+        console.log(`[向量] PG pgvector 就绪（本会话 namespace=${ns}: chunks=${nsChunks} aliases=${nsAliases}；全库 ${await pg.chunkCount()}）`);
+        if (nsChunks === 0) {
+          console.log(`[向量] 本会话 PG 命名空间为空，后台自动索引 ${loreCount} 条世界书（完成前别名/ANN 通道暂空）…`);
+          void indexSessionLore(this.mem, pg, ns, wbProvider, (m) => console.log(m))
+            .then((r) => {
+              if (r) console.log(`[向量] PG 自动索引完成：${r.entries} 条 / ${r.chunks} 窗口 / ${r.aliases} 别名（namespace=${ns}）`);
+            })
+            .catch((e) => console.warn(`[向量] PG 自动索引失败（不影响对话，可手动跑 index-lore）: ${(e as Error).message.slice(0, 80)}`));
+        }
+      } else {
+        this.ret.setPgStore(null);
+      }
+    } catch (e) {
+      this.ret.setPgStore(null);
+      console.warn(`[向量] PG 不可用，回落 SQLite 检索: ${(e as Error).message.slice(0, 60)}`);
     }
   }
 
@@ -965,6 +971,9 @@ export class ChatSession {
       this.cardDesc = '';
       this.greeting = '';
     }
+    // 检索渠道（bge/语义激活/PG）恢复：resume 不传 card 也必须执行——原挂在卡片分支 loadWorldbooks
+    // 内，服务重启恢复会话后渠道全灭（检索恒 0 条根因）；新会话此处与世界书导入天然有序（导入先完成）
+    await this.initRetrievalChannels(onStage);
     // 插件加载（04 §4.1）：启用插件的服务端入口沙箱加载 + onSessionStart 钩子
     this.plugins.start({ card: this.cardName, resume: this.args.resume });
   }
