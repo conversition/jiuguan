@@ -252,6 +252,8 @@ export class ChatSession {
   private replanGenerated = new Map<number, boolean>();
   /** 本回合塑形奖励（终局落库；aborted/failed 为 0 分） */
   private lastReward: Record<string, number> | null = null;
+  /** 进行中回合的中止控制器（turn/regenerate 入口登记、finally 清槽；/turn/abort 显式中止 + 并发守卫） */
+  private activeAbort: AbortController | null = null;
   /** 自适应参数 Δ（AQL：data/adaptive-config.json 热读；有效值 = 基线 + Δ） */
   private summaryRoundsDelta = 0;
   private longtermTokensDelta = 0;
@@ -1043,8 +1045,38 @@ export class ChatSession {
    */
   async turn(userInput: string, contentMode?: 'nsfw' | 'nsf', onProse?: (chunk: string) => void, signal?: AbortSignal): Promise<string> {
     this.round++;
-    return this.runTurnCore(this.round, userInput, contentMode ?? this.args.contentMode ?? 'nsfw', onProse, { logUser: true }, signal);
+    return this.withActiveAbort(
+      (sig) => this.runTurnCore(this.round, userInput, contentMode ?? this.args.contentMode ?? 'nsfw', onProse, { logUser: true }, sig),
+      signal,
+    );
   }
+
+  /** 回合执行包装：并发守卫（同一会话同时只允许一个回合，防中止传播慢时新回合与幽灵回合交错写库）
+   *  + in-flight 登记（abortActiveTurn 供 /turn/abort 显式中止；finally 清槽保证不卡后续回合） */
+  private async withActiveAbort<T>(run: (signal: AbortSignal) => Promise<T>, external?: AbortSignal): Promise<T> {
+    if (this.activeAbort) throw new Error('上一回合仍在生成中，请先停止或等待完成');
+    const internal = new AbortController();
+    const forward = () => internal.abort();
+    external?.addEventListener('abort', forward, { once: true });
+    this.activeAbort = internal;
+    try {
+      return await run(internal.signal);
+    } finally {
+      this.activeAbort = null;
+      external?.removeEventListener('abort', forward);
+    }
+  }
+
+  /** 显式中止进行中的回合（Web /turn/abort 调用；res close 自动中止失效（经代理/断开检测丢事件）时的兜底）
+   *  @returns 是否确有进行中回合被中止 */
+  abortActiveTurn(): boolean {
+    if (!this.activeAbort) return false;
+    this.activeAbort.abort();
+    return true;
+  }
+
+  /** 是否有回合进行中（Web /api/turn、/regenerate 入口并发守卫：忙时快速拒绝并明确提示） */
+  isBusy(): boolean { return this.activeAbort !== null; }
 
   /** 平台预计算 → 工具 DAG（0.5.0 C：声明式工具，无依赖并行；执行全在平台，模型不参与选工具）
    *  工具：recall_memory(记忆检索) / worldbook_activate(世界书扫描) / update_variable(变量求值) / skill_match(Skill 匹配) */
@@ -1319,39 +1351,42 @@ export class ChatSession {
   /** 重新生成第 round 轮 AI 回复：回滚该轮状态（保留用户行）→ 用存储的用户输入重放
    *  @param signal 外部中止信号（同 turn：中止时保留已生成正文落库）
    *  模型异常（非中止）：原正文已被回滚，写占位 assistant 防孤儿 user 行，再抛出让上层报错 */
-  async regenerate(round: number, onProse?: (chunk: string) => void, signal?: AbortSignal): Promise<{ prose: string; round: number; assistantMsgId: number | null; replanSuggestion?: string | null }> {
-    const userRow = this.mem.db.prepare('SELECT content FROM chat_log WHERE round = ? AND role = ? ORDER BY id DESC LIMIT 1')
-      .get(round, 'user') as { content: string } | undefined;
-    if (!userRow) throw new Error(`round ${round} 无用户消息，无法重新生成`);
-    // AQL 信号：重发计数（第 n 次重发）+ 旧正文 md5（旧正文将破坏性删除，hash 供差分/回看）
-    const retryIndex = (this.retryCounters.get(round) ?? 0) + 1;
-    this.retryCounters.set(round, retryIndex);
-    const prevAssist = this.mem.db.prepare("SELECT content FROM chat_log WHERE round = ? AND role = 'assistant' ORDER BY id DESC LIMIT 1")
-      .get(round) as { content: string } | undefined;
-    const prevProseMd5 = prevAssist ? createHash('md5').update(prevAssist.content).digest('hex') : undefined;
-    // AQL 循环C：重试 ≥ narrowK → 收窄上下文（零 LLM，聚焦近期/档案）；= replanK → 生成一次重规划建议（不进 chat_log）
-    const narrow = retryIndex >= this.narrowK;
-    this.rollbackStateOnly(round);
-    let prose: string;
-    try {
-      prose = await this.runTurnCore(round, userRow.content, this.args.contentMode ?? 'nsfw', onProse,
-        { logUser: false, telemetry: { retryIndex, clickedRegenerate: true, prevProseMd5, narrow } }, signal);
-    } catch (e) {
-      // 回滚已删原 assistant，此处补占位（与 runTurnCore !turn 分支一致），保证该轮成对
-      this.logChat('assistant', '（本轮回合生成失败，请重试）', round);
-      this.writeLedger(round, this.snapshotPre(), { mainCode: '', eventCodes: [], eventIds: [] }, 0, 0);
-      this.lastReward = shapeTurnOutcome({ retryIndex, failed: true });
-      this.recordTurn('failed', 1);
-      throw e;
-    }
-    const aid = this.mem.db.prepare("SELECT id FROM chat_log WHERE round = ? AND role = 'assistant' ORDER BY id DESC LIMIT 1")
-      .get(round) as { id: number } | undefined;
-    let replanSuggestion: string | null = null;
-    if (retryIndex >= this.replanK && !this.replanGenerated.get(round)) {
-      this.replanGenerated.set(round, true);
-      replanSuggestion = await this.planRepairSuggestion(round);
-    }
-    return { prose, round, assistantMsgId: aid?.id ?? null, replanSuggestion };
+  regenerate(round: number, onProse?: (chunk: string) => void, signal?: AbortSignal): Promise<{ prose: string; round: number; assistantMsgId: number | null; replanSuggestion?: string | null }> {
+    return this.withActiveAbort(async (sig) => {
+      const userRow = this.mem.db.prepare('SELECT content FROM chat_log WHERE round = ? AND role = ? ORDER BY id DESC LIMIT 1')
+        .get(round, 'user') as { content: string } | undefined;
+      if (!userRow) throw new Error(`round ${round} 无用户消息，无法重新生成`);
+      // AQL 信号：重发计数（第 n 次重发）+ 旧正文 md5（旧正文将破坏性删除，hash 供差分/回看）
+      const retryIndex = (this.retryCounters.get(round) ?? 0) + 1;
+      this.retryCounters.set(round, retryIndex);
+      const prevAssist = this.mem.db.prepare("SELECT content FROM chat_log WHERE round = ? AND role = 'assistant' ORDER BY id DESC LIMIT 1")
+        .get(round) as { content: string } | undefined;
+      const prevProseMd5 = prevAssist ? createHash('md5').update(prevAssist.content).digest('hex') : undefined;
+      // AQL 循环C：重试 ≥ narrowK → 收窄上下文（零 LLM，聚焦近期/档案）；= replanK → 生成一次重规划建议（不进 chat_log）
+      const narrow = retryIndex >= this.narrowK;
+      this.rollbackStateOnly(round);
+      let prose: string;
+      try {
+        prose = await this.runTurnCore(round, userRow.content, this.args.contentMode ?? 'nsfw', onProse,
+          { logUser: false, telemetry: { retryIndex, clickedRegenerate: true, prevProseMd5, narrow } }, sig);
+      } catch (e) {
+        // 回滚已删原 assistant，此处补占位（与 runTurnCore !turn 分支一致），保证该轮成对
+        this.logChat('assistant', '（本轮回合生成失败，请重试）', round);
+        this.writeLedger(round, this.snapshotPre(), { mainCode: '', eventCodes: [], eventIds: [] }, 0, 0);
+        this.lastReward = shapeTurnOutcome({ retryIndex, failed: true });
+        this.recordTurn('failed', 1);
+        throw e;
+      }
+      const aid = this.mem.db.prepare("SELECT id FROM chat_log WHERE round = ? AND role = 'assistant' ORDER BY id DESC LIMIT 1")
+        .get(round) as { id: number } | undefined;
+      // 中止后不再追加重规划建议 LLM 调用（停止语义 = 立即收尾，不多花一次 token）
+      let replanSuggestion: string | null = null;
+      if (!sig.aborted && retryIndex >= this.replanK && !this.replanGenerated.get(round)) {
+        this.replanGenerated.set(round, true);
+        replanSuggestion = await this.planRepairSuggestion(round);
+      }
+      return { prose, round, assistantMsgId: aid?.id ?? null, replanSuggestion };
+    }, signal);
   }
 
   /** 删除消息（round=整轮 user+assistant+状态回滚；fromHere=从该轮到末尾全删）。
@@ -1434,9 +1469,18 @@ export class ChatSession {
   }
 
   /** 前端停止后兜底落库（Web /turn/abort）：幂等等待进行中的 turn 完成中止落库
-   *  若该轮 assistant 已落库（正常完成/已中止）则跳过；等待超时且 user 已入库 → 落库占位符，防孤儿 user 行 */
+   *  若该轮 assistant 已落库（正常完成/已中止）则跳过；等待超时且 user 已入库 → 落库占位符，防孤儿 user 行
+   *  先等 in-flight 回合终结：显式 abortActiveTurn 后 runTurnCore 毫秒级中止落库，此处等它完成再检查，
+   *  保证端点返回时落库已定局（前端随后 fetchHistory 必能拿到部分正文/占位符，不出现状态漂移） */
   async finalizeAbortedRound(round: number): Promise<{ round: number; kept: boolean; waited: boolean }> {
     const hasAssistant = () => Boolean(this.mem.db.prepare("SELECT id FROM chat_log WHERE round = ? AND role = 'assistant'").get(round));
+    // 等 in-flight 回合终结（中止传播通常毫秒级；上限 3s 兜底慢网关，超时后由下方占位符路径保底）
+    const ACTIVE_WAIT_MS = 3000;
+    const ACTIVE_POLL_MS = 100;
+    const activeDeadline = Date.now() + ACTIVE_WAIT_MS;
+    while (this.activeAbort && Date.now() < activeDeadline) {
+      await new Promise((r) => setTimeout(r, ACTIVE_POLL_MS));
+    }
     if (hasAssistant()) return { round, kept: false, waited: false };
     // 等待进行中的 turn 完成中止落库（最多 1s，每 100ms 检查一次；保证部分正文优先于占位符）
     const ABORT_WAIT_MS = 1000;

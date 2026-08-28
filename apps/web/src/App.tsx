@@ -500,7 +500,7 @@ export function App() {
 
   const resumeSession = async (sid: string) => {
     logger.info('session', '恢复会话', { session: sid });
-    setBusy(true);
+    // 不占用 busy：busy 语义 = 生成中（按钮变「停止」）。恢复期间 abortRef 为空，假 busy 会展示一个点了无效的停止键
     setError('');
     try {
       await api('/api/session/resume', { method: 'POST', body: JSON.stringify({ db: `${sid}.db` }) });
@@ -512,7 +512,6 @@ export function App() {
       logger.error('session', '恢复会话失败', { message: (e as Error).message });
       setError((e as Error).message);
     }
-    setBusy(false);
   };
 
   /** 公共发送路径：输入框 send 与前端卡 choice/draft 共用。

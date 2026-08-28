@@ -347,12 +347,21 @@ const server = createServer(async (req, res) => {
       if (!session) return json(res, { error: '会话不存在，请先创建或恢复' }, 404);
       const input = (body.input ?? '').trim();
       if (!input) return json(res, { error: '输入为空' }, 400);
+      // 并发守卫：同一会话回合互斥。幽灵回合未终结时新回合会交错写库（round/记忆错乱）；快速失败并明确提示
+      if (session.isBusy()) {
+        sse(res);
+        sseSend(res, { type: 'error', message: '上一回合仍在生成中，请先停止或等待完成' });
+        res.end();
+        return;
+      }
 
       sse(res);
       sseSend(res, { type: 'status', stage: 'thinking' });
       const ac = new AbortController();
-      const onClose = () => ac.abort();
-      req.on('close', onClose);
+      // 客户端断开检测必须挂 res 'close'：Node 16+ IncomingMessage(req) 的 'close' 语义变为「请求消息完成」，
+      // SSE 场景客户端断开时 req 'close' 不触发 → 停止按钮后端无感知、上游继续生成（历史回归根因）
+      const onClose = () => { if (!res.writableEnded) ac.abort(); };
+      res.on('close', onClose);
       try {
         const mode = body.content_mode === 'nsf' ? 'nsf' : 'nsfw';
         let streamStarted = false;
@@ -378,12 +387,13 @@ const server = createServer(async (req, res) => {
         }
       } catch (e) {
         // 非中止失败：清理本轮孤儿 user 行（模型异常下 runTurnCore 已写 user、无 assistant，会致记忆断裂）
+        // 并发被拒（会话忙）是请求级拒绝，绝不能触发孤儿清理——否则会误删在跑回合的 user 行
         if (!ac.signal.aborted) {
-          session.rollbackFailedTurn();
+          if (!session.isBusy()) session.rollbackFailedTurn();
           sseSend(res, { type: 'error', message: (e as Error).message.slice(0, 200) });
         }
       }
-      req.off('close', onClose);
+      res.off('close', onClose);
       res.end();
       return;
     }
@@ -415,11 +425,19 @@ const server = createServer(async (req, res) => {
       const body = await readBody(req);
       const round = Number(body.round ?? 0);
       if (!Number.isInteger(round) || round < 1) return json(res, { error: 'round 非法' }, 400);
+      // 并发守卫（同 /api/turn）：会话忙时快速拒绝
+      if (session.isBusy()) {
+        sse(res);
+        sseSend(res, { type: 'error', message: '上一回合仍在生成中，请先停止或等待完成' });
+        res.end();
+        return;
+      }
       sse(res);
       sseSend(res, { type: 'status', stage: 'thinking' });
       const ac = new AbortController();
-      const onClose = () => ac.abort();
-      req.on('close', onClose);
+      // 同 /api/turn：断开检测挂 res 'close'（req 'close' 在 Node 16+ 不反映客户端断开）
+      const onClose = () => { if (!res.writableEnded) ac.abort(); };
+      res.on('close', onClose);
       try {
         let streamStarted = false;
         const r = await session.regenerate(round, (chunk) => {
@@ -445,7 +463,7 @@ const server = createServer(async (req, res) => {
       } catch (e) {
         if (!ac.signal.aborted) sseSend(res, { type: 'error', message: (e as Error).message.slice(0, 200) });
       }
-      req.off('close', onClose);
+      res.off('close', onClose);
       res.end();
       return;
     }
@@ -459,8 +477,10 @@ const server = createServer(async (req, res) => {
       const round = Number(body.round ?? 0);
       if (!Number.isInteger(round) || round < 1) return json(res, { error: 'round 非法' }, 400);
       try {
-        const r = session.finalizeAbortedRound(round);
-        return json(res, { ok: true, ...r });
+        // 显式中止进行中回合（双保险：断开检测失效——经代理/事件丢失——时停止仍生效），再等待落库定局
+        const aborted = session.abortActiveTurn();
+        const r = await session.finalizeAbortedRound(round);
+        return json(res, { ok: true, aborted, ...r });
       } catch (e) {
         return json(res, { error: (e as Error).message.slice(0, 200) }, 400);
       }
