@@ -338,6 +338,7 @@ const server = createServer(async (req, res) => {
         worldbooks: Array.isArray(body.worldbooks) ? body.worldbooks.map(String) : undefined,
         preset: typeof body.preset === 'string' && body.preset ? body.preset : undefined,
         presetOverrides,
+        style: typeof body.style === 'string' && body.style ? body.style : undefined,
       });
       await session.init((stage) => sseSend(res, { type: 'stage', stage }));
       const id = dbName.replace(/\.db$/, '');
@@ -1267,6 +1268,16 @@ const server = createServer(async (req, res) => {
         return json(res, { ok: true, skill: { name: skill.name, description: skill.description, keywords: skill.keywords, enabled: skill.enabled } });
       } catch (e) {
         return json(res, { error: (e as Error).message }, 400);
+      }
+    }
+    if (method === 'POST' && p === '/api/skills/import-style') {
+      // 文风库 → 文风 skill（幂等；源内容不变则跳过）
+      const { importStyleBooks } = await import('../../tools/cli/import-style.ts');
+      try {
+        const r = importStyleBooks();
+        return json(res, { ok: true, created: r.created.length, updated: r.updated.length, unchanged: r.unchanged.length, total: r.total });
+      } catch (e) {
+        return json(res, { error: `文风库导入失败: ${(e as Error).message}` }, 400);
       }
     }
     if (method === 'POST' && p.startsWith('/api/skills/')) {

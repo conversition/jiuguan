@@ -28,6 +28,18 @@ export interface SkillInfo {
   enabled: boolean;
   /** SKILL.md 路径 */
   path: string;
+  /** 文风层(style) / 战术层(tactical)：区分文风指令与战术技能 */
+  role?: string;
+  /** 会话默认文风底座 */
+  default?: boolean;
+  /** 可作 nsfw 增强注入的文风 */
+  nsfw?: boolean;
+  /** 来源追踪：<file>#<uid>（文风库条目 uid / 世界书 entry id） */
+  source?: string;
+  /** 源内容 sha256，用于「源变化→重生成」判定 */
+  sourceHash?: string;
+  /** 文风库稳定 id（前端选择器回显） */
+  styleId?: string;
 }
 
 /** 解析 SKILL.md：frontmatter（--- 包裹的 key: value）+ 正文 */
@@ -45,9 +57,18 @@ export function parseSkillMd(content: string): { meta: Record<string, string>; b
   return { meta, body };
 }
 
-/** 序列化为 SKILL.md（frontmatter 规范化） */
-export function renderSkillMd(name: string, description: string, version: string, enabled: boolean, body: string, keywords: string[] = []): string {
-  return `---\nname: ${name}\ndescription: ${description}\nversion: ${version}\nenabled: ${enabled}${keywords.length ? `\nkeywords: ${keywords.join(',')}` : ''}\n---\n\n${body.trim()}\n`;
+/** 序列化为 SKILL.md（frontmatter 规范化）；extra 为扩展元数据（role/default/nsfw/source/sourceHash/styleId 等，向前兼容） */
+export function renderSkillMd(
+  name: string,
+  description: string,
+  version: string,
+  enabled: boolean,
+  body: string,
+  keywords: string[] = [],
+  extra: Record<string, string | boolean> = {},
+): string {
+  const extraLines = Object.entries(extra).map(([k, v]) => `${k}: ${typeof v === 'boolean' ? v : v}`);
+  return `---\nname: ${name}\ndescription: ${description}\nversion: ${version}\nenabled: ${enabled}${keywords.length ? `\nkeywords: ${keywords.join(',')}` : ''}${extraLines.length ? `\n${extraLines.join('\n')}` : ''}\n---\n\n${body.trim()}\n`;
 }
 
 /** 解析 keywords 字段（逗号分隔） */
@@ -56,6 +77,19 @@ function parseKeywords(meta: Record<string, string>): string[] {
     .split(/[,，]/)
     .map((s) => s.trim())
     .filter(Boolean);
+}
+
+/** 解析布尔 frontmatter 字段（缺省 undefined） */
+function parseBool(v: string | undefined): boolean | undefined {
+  return v === undefined ? undefined : v === 'true';
+}
+
+/** 从 frontmatter 提取扩展字段（供 setSkillEnabled 等重写时透传，避免丢失） */
+const EXTRA_KEYS = ['role', 'default', 'nsfw', 'source', 'sourceHash', 'styleId'] as const;
+function extraFromMeta(meta: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const k of EXTRA_KEYS) if (meta[k] !== undefined) out[k] = meta[k];
+  return out;
 }
 
 /** 扫描 data/skills 下的 skill 目录（各含 SKILL.md），返回全部 skill（按名称排序） */
@@ -75,6 +109,12 @@ export function listSkills(dir = DEFAULT_SKILLS_DIR): SkillInfo[] {
       version: meta.version ?? '1.0',
       enabled: meta.enabled !== 'false',
       path: mdPath,
+      role: meta.role,
+      default: parseBool(meta.default),
+      nsfw: parseBool(meta.nsfw),
+      source: meta.source,
+      sourceHash: meta.sourceHash,
+      styleId: meta.styleId,
     });
   }
   return out.sort((a, b) => a.name.localeCompare(b.name, 'zh'));
@@ -82,7 +122,10 @@ export function listSkills(dir = DEFAULT_SKILLS_DIR): SkillInfo[] {
 
 /** 新增 skill：写 data/skills/<name>/SKILL.md（目录已存在则更新） */
 export function addSkill(
-  input: { name: string; description: string; content: string; keywords?: string[]; version?: string; enabled?: boolean },
+  input: {
+    name: string; description: string; content: string; keywords?: string[]; version?: string; enabled?: boolean;
+    role?: string; default?: boolean; nsfw?: boolean; source?: string; sourceHash?: string; styleId?: string;
+  },
   dir = DEFAULT_SKILLS_DIR,
 ): SkillInfo {
   const name = input.name.trim();
@@ -95,8 +138,18 @@ export function addSkill(
   const body = input.content.trim();
   if (!body) throw new Error('技能指令正文不能为空');
   const keywords = (input.keywords ?? []).map((s) => s.trim()).filter(Boolean);
-  writeFileSync(mdPath, renderSkillMd(name, input.description.trim(), input.version ?? '1.0', input.enabled ?? true, body, keywords), 'utf8');
-  return { name, description: input.description.trim(), keywords, version: input.version ?? '1.0', enabled: input.enabled ?? true, path: mdPath };
+  const extra: Record<string, string | boolean> = {};
+  if (input.role) extra.role = input.role;
+  if (input.default !== undefined) extra.default = input.default;
+  if (input.nsfw !== undefined) extra.nsfw = input.nsfw;
+  if (input.source) extra.source = input.source;
+  if (input.sourceHash) extra.sourceHash = input.sourceHash;
+  if (input.styleId) extra.styleId = input.styleId;
+  writeFileSync(mdPath, renderSkillMd(name, input.description.trim(), input.version ?? '1.0', input.enabled ?? true, body, keywords, extra), 'utf8');
+  return {
+    name, description: input.description.trim(), keywords, version: input.version ?? '1.0', enabled: input.enabled ?? true, path: mdPath,
+    role: input.role, default: input.default, nsfw: input.nsfw, source: input.source, sourceHash: input.sourceHash, styleId: input.styleId,
+  };
 }
 
 /** 启停 */
@@ -104,7 +157,8 @@ export function setSkillEnabled(name: string, enabled: boolean, dir = DEFAULT_SK
   const skill = findSkill(name, dir);
   if (!skill) throw new Error(`技能不存在: ${name}`);
   const { meta, body } = parseSkillMd(readFileSync(skill.path, 'utf8'));
-  writeFileSync(skill.path, renderSkillMd(meta.name ?? name, meta.description ?? '', meta.version ?? '1.0', enabled, body, parseKeywords(meta)), 'utf8');
+  // 透传扩展元数据，避免启停重写时丢失 role/default/nsfw/source/sourceHash/styleId
+  writeFileSync(skill.path, renderSkillMd(meta.name ?? name, meta.description ?? '', meta.version ?? '1.0', enabled, body, parseKeywords(meta), extraFromMeta(meta)), 'utf8');
   return { ...skill, enabled };
 }
 
@@ -131,6 +185,12 @@ export function findSkill(name: string, dir = DEFAULT_SKILLS_DIR): (SkillInfo & 
         enabled: meta.enabled !== 'false',
         path: mdPath,
         dir: join(dir, entry.name),
+        role: meta.role,
+        default: parseBool(meta.default),
+        nsfw: parseBool(meta.nsfw),
+        source: meta.source,
+        sourceHash: meta.sourceHash,
+        styleId: meta.styleId,
       };
     }
   }
@@ -213,3 +273,56 @@ export function renderSkillBlock(matches: SkillMatch[], budgetChars = 2000): str
 
 /** 默认技能目录名（供 UI 展示） */
 export const skillDirName = (dir = DEFAULT_SKILLS_DIR) => basename(dir);
+
+/** 文风层 skill 目录名前缀（导入/生成时用于筛选；与角色:style 双保险） */
+export const DEFAULT_STYLE_ROLE = 'style';
+
+/** 列出文风层 skill（role=style；用于文风选择器 / 文风指令注入源） */
+export function listStyleSkills(dir = DEFAULT_SKILLS_DIR): SkillInfo[] {
+  return listSkills(dir).filter((s) => s.role === DEFAULT_STYLE_ROLE);
+}
+
+/** 会话默认文风底座（role=style 且 default=true；缺省返回 null） */
+export function getDefaultStyleSkill(dir = DEFAULT_SKILLS_DIR): SkillInfo | null {
+  return listStyleSkills(dir).find((s) => s.default) ?? null;
+}
+
+/** 文风 skill 规格（生成/同步用，与 import-style.ts、世界书词条提升共用） */
+export interface StyleSkillSpec {
+  name: string;
+  description: string;
+  body: string;
+  keywords?: string[];
+  version?: string;
+  enabled?: boolean;
+  role?: string;
+  default?: boolean;
+  nsfw?: boolean;
+  source?: string;
+  sourceHash?: string;
+  styleId?: string;
+}
+
+/** 依规格同步文风 skill 到磁盘：无 → 创建；有但 sourceHash 变 → 更新；hash 同 → 跳过。
+ *  实现「源变化→可更新／可增强」：调用方给同一 spec 反复跑，仅在源内容变化时真实重写。 */
+export function syncStylesFromSource(
+  specs: StyleSkillSpec[],
+  dir = DEFAULT_SKILLS_DIR,
+): { created: string[]; updated: string[]; unchanged: string[] } {
+  const created: string[] = [];
+  const updated: string[] = [];
+  const unchanged: string[] = [];
+  for (const spec of specs) {
+    const existing = findSkill(spec.name, dir);
+    if (!existing) {
+      addSkill({ ...spec, content: spec.body, enabled: spec.enabled ?? true }, dir);
+      created.push(spec.name);
+    } else if (spec.sourceHash !== undefined && existing.sourceHash === spec.sourceHash) {
+      unchanged.push(spec.name);
+    } else {
+      addSkill({ ...spec, content: spec.body, enabled: existing.enabled }, dir);
+      updated.push(spec.name);
+    }
+  }
+  return { created, updated, unchanged };
+}

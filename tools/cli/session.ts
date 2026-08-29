@@ -23,7 +23,10 @@ import { applyRegexRules } from '../../packages/core/src/regex.ts';
 import { LorebookScanner } from '../../packages/core/src/scanner.ts';
 import { parseLoreEntries, buildAliasIndex } from '../../packages/core/src/lore-parse.ts';
 import type { AliasEntry } from '../../packages/core/src/lore-parse.ts';
-import { matchSkills, renderSkillBlock, type SkillMatch } from '../../packages/core/src/skills.ts';
+import {
+  matchSkills, renderSkillBlock, readSkillBody, findSkill, getDefaultStyleSkill, syncStylesFromSource,
+  type SkillMatch, type StyleSkillSpec,
+} from '../../packages/core/src/skills.ts';
 import { ToolDag, type ToolContext, type ToolDefinition } from '../../packages/core/src/tool-dag.ts';
 import { MemoryDb } from '../../packages/memory/src/db.ts';
 import { WriteLoop } from '../../packages/memory/src/writer.ts';
@@ -63,6 +66,34 @@ import { resolveAsset, listAssets } from '../../packages/core/src/asset-paths.ts
 import type { AssetKind } from '../../packages/core/src/asset-paths.ts';
 import { StoryboardOrchestrator } from './storyboard-orchestrator.ts';
 import type { StoryboardResult } from './storyboard-orchestrator.ts';
+
+/** 默认文风底座 skill 名（恒定注入；缺省即此） */
+const DEFAULT_STYLE_NAME = '文风-底座-轻小说';
+/** NSFW 增强文风 skill 名（mode=nsfw 时追加） */
+const NSFW_STYLE_NAME = '文风-NSFW';
+
+/** sha256 十六进制（判定词条 skill 源变化） */
+function styleSha256(text: string): string {
+  return createHash('sha256').update(text, 'utf8').digest('hex');
+}
+
+/** 底座兜底：data/skills 未导入文风库时也能恒注入轻小说基调（不依赖文件存在） */
+const STYLE_BASELINE_FALLBACK = `## 文风基调
+这是一个轻小说风格的剧情引擎。正文以人物内心与日常细节为重心，节奏舒缓、描写细腻，不急于推进主线剧情。
+
+## 节奏与详略（强制）
+- 慢：单场景铺足细节，一个动作/一句对话可展开数句感官与心理描写；禁止摘要式跳进。
+- 详：每个场景交代环境（空间/光线/声音/温度）与人物（神态/动作/距离感/气味）至少各一个可感知细节。
+- 不赶：不快速切换场景、不略过情绪转折；让角色在细节里停留，感情在微小互动里渐近。
+- 对白含蓄、有信息量，靠肢体与沉默推进，而非直接陈述。
+
+## 去 AI 腔（禁止）
+- 禁"突然/一抹/弧度/不容置疑/不仅…而且…"等 AI 痕迹；禁数字式清单化；禁升华说教。`;
+
+/** 世界书文风触发词（命中 comment+content 即视为文风词条，注入 + 提升为词条 skill） */
+const STYLE_TRIGGER_TERMS = [
+  /文风/, /风格/, /笔调/, /节奏/, /文体/, /描写/, /叙事/, /写法/, /抒情/, /轻小说/, /暧昧/,
+];
 import { VideoPromptGenerator, DIALOGUE_SOURCE_MAX_CHARS } from './video-prompt-generator.ts';
 import type { VideoPromptResult } from './video-prompt-generator.ts';
 import type { Panel } from '../../packages/prompt/src/storyboard.ts';
@@ -94,6 +125,8 @@ export interface SessionArgs {
   preset?: string;
   /** 预设块勾选覆盖 {块索引: 启用?}（启动流程审查 P0：UI 勾选 → 会话入参） */
   presetOverrides?: Record<string, boolean>;
+  /** 会话文风（skill 名；缺省 = 默认底座 文风-底座-轻小说） */
+  style?: string;
 }
 
 /** 导演模式入参（POST /api/session/:id/director 请求体对齐：选区定位 + 分镜偏好） */
@@ -130,6 +163,7 @@ function parseArgs(argv: string[]): SessionArgs {
     worldbooks: get('--worldbook')?.split(',').map((s) => s.trim()).filter(Boolean),
     preset: get('--preset'),
     presetOverrides,
+    style: get('--style'),
   };
 }
 
@@ -204,6 +238,8 @@ export class ChatSession {
   private greeting = '';
   private dbPath: string;
   private args: SessionArgs;
+  /** 会话激活文风 skill 名（缺省 = 默认底座，见 resolveStyleSkill） */
+  private styleSkill = '';
   private lastTurn: string | undefined;
   private round = 0;
   private lastEventType = 'normal';
@@ -444,7 +480,7 @@ export class ChatSession {
   }
 
   /** 会话配置（启动流程审查：世界书/预设为会话入参，Web 可回显） */
-  getSessionConfig(): { card: string; mode: string; worldbooks: string[]; preset: string; presetBlocks: number; engine: boolean } {
+  getSessionConfig(): { card: string; mode: string; worldbooks: string[]; preset: string; presetBlocks: number; engine: boolean; style: string } {
     return {
       card: this.cardName,
       mode: this.args.contentMode ?? 'nsfw',
@@ -452,6 +488,7 @@ export class ChatSession {
       preset: this.args.preset ?? '',
       presetBlocks: this.presetBlocks.length,
       engine: this.bridge?.isReady() ?? false,
+      style: this.styleSkill,
     };
   }
 
@@ -475,6 +512,7 @@ export class ChatSession {
 
   constructor(args: SessionArgs) {
     this.args = args;
+    this.styleSkill = this.resolveStyleSkill(args.style);
     this.cfg = loadProviderConfig();
     assertProviderReady(this.cfg);
     this.dbPath = args.db ?? resolve('data', 'session.db');
@@ -1141,6 +1179,66 @@ export class ChatSession {
     return dag;
   }
 
+  /** 解析会话激活文风：pref 为合法 style skill 用之；否则退回默认底座 */
+  private resolveStyleSkill(pref?: string): string {
+    const want = (pref ?? '').trim();
+    if (want && findSkill(want)?.role === 'style') return want;
+    return DEFAULT_STYLE_NAME;
+  }
+
+  /** 读文风 skill 正文（全量、不截断；底座缺失时兜底常量基线） */
+  private readStyleBody(name: string): string {
+    const body = readSkillBody(name);
+    if (body) return body;
+    return name === DEFAULT_STYLE_NAME ? STYLE_BASELINE_FALLBACK : '';
+  }
+
+  /** Prong2：从会话绑定世界书的激活条目里筛文风词条 → 注入 + 按内容哈希提升为「文风-词条-*」skill。
+   *  稳定来源：绑定世界书条目在 db + 已向量化；命中即可提升。返回注入文本与本次新建/更新名。 */
+  private retrieveWorldbookStyleEntries(): { injected: string; promoted: string[] } {
+    const scan = this.turnInput.scan;
+    const activated = (scan?.activated ?? []) as { id: number; uid: string; comment: string; content: string; matchType: string }[];
+    if (activated.length === 0) return { injected: '', promoted: [] };
+    const hits = activated.filter((e) => STYLE_TRIGGER_TERMS.some((r) => r.test(`${e.comment} ${e.content}`)));
+    if (hits.length === 0) return { injected: '', promoted: [] };
+    const specs: StyleSkillSpec[] = hits.map((e) => ({
+      name: `文风-词条-${styleSha256(e.content).slice(0, 10)}`,
+      description: `世界书文风词条：${e.comment}`,
+      body: e.content,
+      keywords: [e.comment, ...STYLE_TRIGGER_TERMS.map((r) => r.source)].filter((s, i, a) => s && a.indexOf(s) === i),
+      role: 'style',
+      source: `worldbook#${e.uid ?? e.id}`,
+      sourceHash: styleSha256(e.content),
+      styleId: String(e.uid ?? e.id),
+    }));
+    const res = syncStylesFromSource(specs);
+    const injected = hits.slice(0, 3).map((e) => `[${e.matchType}] ${e.comment}: ${e.content.slice(0, 400)}`).join('\n');
+    if (res.created.length + res.updated.length > 0) {
+      const names = res.created.concat(res.updated).slice(0, 4).join(', ');
+      console.log(`[文风] 世界书词条提升 ${res.created.length} 新建/${res.updated.length} 更新 → ${names}`);
+    }
+    return { injected, promoted: res.created.concat(res.updated) };
+  }
+
+  /** 组装 <文风指令> 块：恒定底座 + 激活作者风格 + [NSFW] + [世界书风格词条]。
+   *  底座/激活风格在 session 级固定（稳定前缀）；nsfw/世界书词条随 turn 追加（哈希去重、仅变化时变）。 */
+  private buildStyleBlock(mode: 'nsfw' | 'nsf'): string {
+    const parts: string[] = [];
+    const chassis = this.readStyleBody(DEFAULT_STYLE_NAME);
+    if (chassis) parts.push(`<文风底座>\n${chassis}\n</文风底座>`);
+    if (this.styleSkill !== DEFAULT_STYLE_NAME) {
+      const active = this.readStyleBody(this.styleSkill);
+      if (active) parts.push(`<作者文风>\n${active}\n</作者文风>`);
+    }
+    if (mode === 'nsfw') {
+      const nsfw = this.readStyleBody(NSFW_STYLE_NAME);
+      if (nsfw) parts.push(`<NSFW文风>\n${nsfw}\n</NSFW文风>`);
+    }
+    const wb = this.retrieveWorldbookStyleEntries();
+    if (wb.injected) parts.push(`<世界书文风>\n${wb.injected}\n</世界书文风>`);
+    return parts.join('\n\n');
+  }
+
   /** 每轮核心（turn / regenerate 共用）：预计算→装配→模型→写环→引擎 tick→持久化→账本
    *  @param signal 外部中止信号：用户停止生成时，保留已流式生成的正文落库，不写记忆（07 铁律1）
    */
@@ -1217,6 +1315,7 @@ export class ChatSession {
       presetBlocks: this.presetBlocks,
       memoryBlock,
       longTermBlock: ctx.longTermBlock,
+      styleBlock: this.buildStyleBlock(mode),
       chatHistory: windowInfo.messages,
       lastTurn: this.lastTurn,
       userInput: userContent,

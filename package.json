@@ -24,7 +24,7 @@
     "test:storyboard": "node --experimental-strip-types --experimental-transform-types tools/cli/verify-storyboard.ts",
     "test:video-prompt": "node --experimental-strip-types --experimental-transform-types tools/cli/verify-video-prompt.ts",
     "test:archive": "node --experimental-strip-types --experimental-transform-types tools/cli/verify-archive.ts",
-    "test": "pnpm test:memory && pnpm test:core && pnpm test:proxy && pnpm test:prompt && pnpm test:variable && pnpm test:sandbox && pnpm test:plugin && pnpm test:storyboard && pnpm test:video-prompt && pnpm test:archive && pnpm test:rollback && pnpm test:abort && pnpm test:abort-e2e && pnpm test:fallback && pnpm test:context && pnpm test:ab && pnpm test:gal && pnpm test:assets && pnpm test:aql",
+    "test": "pnpm test:memory && pnpm test:core && pnpm test:proxy && pnpm test:prompt && pnpm test:variable && pnpm test:sandbox && pnpm test:plugin && pnpm test:storyboard && pnpm test:video-prompt && pnpm test:archive && pnpm test:rollback && pnpm test:abort && pnpm test:abort-e2e && pnpm test:fallback && pnpm test:context && pnpm test:ab && pnpm test:gal && pnpm test:assets && pnpm test:aql && pnpm test:style",
     "storyboard": "node --experimental-strip-types --experimental-transform-types tools/cli/storyboard.ts",
     "turn-loop": "node --experimental-strip-types --experimental-transform-types tools/cli/turn-loop.ts",
     "turn-runner": "node --experimental-strip-types --experimental-transform-types tools/cli/turn-runner.ts",
@@ -45,7 +45,9 @@
     "test:replan": "node --experimental-strip-types --experimental-transform-types tools/cli/verify-replan-gate.ts",
     "test:quality": "node --experimental-strip-types --experimental-transform-types tools/cli/verify-quality-analyzer.ts",
     "test:aql": "pnpm test:telemetry && pnpm test:reward && pnpm test:adaptive && pnpm test:replan && pnpm test:quality",
-    "analyze-quality": "node --experimental-strip-types --experimental-transform-types tools/cli/analyze-quality.ts"
+    "analyze-quality": "node --experimental-strip-types --experimental-transform-types tools/cli/analyze-quality.ts",
+    "style:import": "node --experimental-strip-types --experimental-transform-types tools/cli/import-style.ts",
+    "test:style": "node --experimental-strip-types --experimental-transform-types tools/cli/verify-style.ts"
   },
   "engines": {
     "node": ">=22.5.0"

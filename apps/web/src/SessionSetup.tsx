@@ -27,6 +27,7 @@ interface SetupSnapshot {
   worldbooks: string[];
   preset: string;
   overrides: Record<number, boolean>;
+  style: string;
 }
 
 /** 新建创作前置面板（创作模式三项并列：NSFW / NSF / 导演分镜；对话走会话入参，分镜走编排器） */
@@ -41,6 +42,8 @@ export function SessionSetup({ onCreated, onCardsChanged }: {
   const [mode, setMode] = useState<CreateMode>('nsfw');
   const [selectedBooks, setSelectedBooks] = useState<string[]>([]);
   const [preset, setPreset] = useState('');
+  const [style, setStyle] = useState('文风-底座-轻小说');
+  const [styleSkills, setStyleSkills] = useState<{ name: string; description: string; default?: boolean }[] | null>(null);
   const [blocks, setBlocks] = useState<PresetBlock[] | null>(null);
   const [overrides, setOverrides] = useState<Record<number, boolean>>({});
   const [busy, setBusy] = useState(false);
@@ -56,14 +59,17 @@ export function SessionSetup({ onCreated, onCardsChanged }: {
   React.useEffect(() => {
     const load = async () => {
       try {
-        const [c, w, p] = await Promise.all([
+        const [c, w, p, sk] = await Promise.all([
           fetch(`${API}/api/cards`).then((r) => r.json()),
           fetch(`${API}/api/worldbooks`).then((r) => r.json()),
           fetch(`${API}/api/presets`).then((r) => r.json()),
+          fetch(`${API}/api/skills`).then((r) => r.json()),
         ]);
         setCards(c.cards ?? []);
         setWorldbooks(w.worldbooks ?? []);
         setPresets(p.presets ?? []);
+        const styleOpts = (sk.skills ?? []).filter((s: { role?: string }) => s.role === 'style');
+        setStyleSkills(styleOpts);
         // 回填上次新建配置（存在快照时优先；仅缺失条目/已删预设按存活过滤）
         let snap: SetupSnapshot | null = null;
         try { snap = JSON.parse(localStorage.getItem(SETUP_KEY) ?? 'null'); } catch { snap = null; }
@@ -73,6 +79,7 @@ export function SessionSetup({ onCreated, onCardsChanged }: {
           if (snap.card && (c.cards ?? []).some((x: CardInfo) => x.id === snap.card)) setCard(snap.card);
           if (snap.mode === 'nsf' || snap.mode === 'director') setMode(snap.mode);
           setSelectedBooks(books);
+          if (snap.style && styleOpts.some((x: { name: string }) => x.name === snap.style)) setStyle(snap.style);
           if (snap.preset) {
             setPreset(snap.preset);
             const prompts = await fetchPresetPrompts(snap.preset);
@@ -101,9 +108,9 @@ export function SessionSetup({ onCreated, onCardsChanged }: {
   React.useEffect(() => {
     if (!loadedRef.current) return;
     if (preset && !blocks) return;
-    const snap: SetupSnapshot = { card, mode, worldbooks: selectedBooks, preset, overrides };
+    const snap: SetupSnapshot = { card, mode, worldbooks: selectedBooks, preset, overrides, style };
     try { localStorage.setItem(SETUP_KEY, JSON.stringify(snap)); } catch { /* localStorage 不可用则跳过 */ }
-  }, [card, mode, selectedBooks, preset, overrides, blocks]);
+  }, [card, mode, selectedBooks, preset, overrides, blocks, style]);
 
   /** 拉取预设块列表（失败返回 null，不抛错） */
   const fetchPresetPrompts = async (file: string): Promise<PresetBlock[] | null> => {
@@ -285,6 +292,7 @@ export function SessionSetup({ onCreated, onCardsChanged }: {
         worldbooks: selectedBooks.length > 0 ? selectedBooks : undefined,
         preset: preset || undefined,
         preset_overrides: Object.keys(overrides).length > 0 ? overrides : undefined,
+        style: style || undefined,
       };
       let sid = '';
       let greeting = '';
@@ -342,6 +350,22 @@ export function SessionSetup({ onCreated, onCardsChanged }: {
           <button className={`setup-item${mode === 'director' ? ' setup-active' : ''}`} onClick={() => setMode('director')}>导演分镜（分镜创作）</button>
         </div>
       </section>
+
+      {mode !== 'director' && (
+        <section className="console-section">
+          <h3>文风（默认轻小说；随会话稳定注入 &lt;文风指令&gt;，可从文风库切换作者风格）</h3>
+          <div className="console-bar">
+            <select value={style} onChange={(e) => setStyle(e.target.value)} style={{ maxWidth: 360 }}>
+              {styleSkills?.map((s) => (
+                <option key={s.name} value={s.name}>{s.default ? '★ 默认 · ' : ''}{s.description || s.name}</option>
+              )) || (
+                <option value={style}>{style}</option>
+              )}
+            </select>
+            <span className="muted">导入文风库可在 Skill 面板触发</span>
+          </div>
+        </section>
+      )}
 
       {mode === 'director' ? (
         <StoryboardPanel />

@@ -2,12 +2,14 @@ import React, { useEffect, useState } from 'react';
 
 const API = (import.meta as unknown as { env: Record<string, string> }).env?.VITE_API_BASE ?? '';
 
-interface SkillInfo { name: string; description: string; version: string; enabled: boolean; keywords?: string[] }
+interface SkillInfo { name: string; description: string; version: string; enabled: boolean; keywords?: string[]; role?: string; default?: boolean; nsfw?: boolean }
 interface SkillMatch { name: string; score: number; body?: string }
 
-/** Skill 面板：公共格式 data/skills/<name>/SKILL.md 列表 / 添加 / 启停 / 删除 / 命中测试 */
+/** Skill 面板：公共格式 data/skills/<name>/SKILL.md 列表 / 添加 / 启停 / 删除 / 命中测试 / 文风库导入 */
 export function SkillsPanel() {
   const [skills, setSkills] = useState<SkillInfo[] | null>(null);
+  const [filter, setFilter] = useState<'all' | 'style' | 'tactical'>('all');
+  const [importMsg, setImportMsg] = useState('');
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
   const [keywords, setKeywords] = useState('');
@@ -28,6 +30,21 @@ export function SkillsPanel() {
   };
 
   useEffect(() => { load(); }, []);
+
+  /** 从文风库导入作者风格 skill（43 条 + 底座 + NSFW；幂等可重复） */
+  const importStyle = async () => {
+    setBusy(true);
+    setError('');
+    setImportMsg('');
+    try {
+      const res = await fetch(`${API}/api/skills/import-style`, { method: 'POST' });
+      const d = await res.json();
+      if (!res.ok) throw new Error(d.error ?? `HTTP ${res.status}`);
+      setImportMsg(`导入完成：新建 ${d.created} / 更新 ${d.updated} / 未变 ${d.unchanged}`);
+      await load();
+    } catch (e) { setError((e as Error).message); }
+    setBusy(false);
+  };
 
   const add = async () => {
     if (!name.trim() || !content.trim()) { setError('技能名与指令正文不能为空'); return; }
@@ -96,12 +113,23 @@ export function SkillsPanel() {
 
       <section className="console-section">
         <h3>已有技能（{skills?.length ?? 0}）</h3>
+        <div className="console-bar" style={{ alignItems: 'center' }}>
+          <span className="muted">筛选:</span>
+          {(['all', 'style', 'tactical'] as const).map((f) => (
+            <button key={f} className={filter === f ? 'link-btn active' : 'link-btn'} onClick={() => setFilter(f)}>
+              {f === 'all' ? '全部' : f === 'style' ? '文风' : '战术'}
+            </button>
+          ))}
+          <button className="link-btn" onClick={importStyle} disabled={busy}>↑ 导入文风库（43 风格）</button>
+          <span className="muted">{importMsg}</span>
+        </div>
         {skills && skills.length === 0 && <p className="console-none">暂无技能 —— 在下方添加。</p>}
         <ul className="console-hits">
-          {skills?.map((s) => (
+          {skills?.filter((s) => filter === 'all' || s.role === filter).map((s) => (
             <li key={s.name} className="hit">
               <span className="hit-tag">[{s.enabled ? 'ON' : 'OFF'}]</span>
               <span className="hit-content"><b>{s.name}</b> · v{s.version} — {s.description || '（无描述）'}
+                {s.role === 'style' && <span className="muted"> · [{s.default ? '默认文风' : '文风'}{s.nsfw ? '/NSFW' : ''}]</span>}
                 {s.keywords?.length ? <span className="muted"> · 触发词: {s.keywords.join('/')}</span> : null}
               </span>
               <span className="hit-ops">

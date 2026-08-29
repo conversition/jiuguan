@@ -32,6 +32,9 @@ export interface AssembleInput {
   nsfwModule?: string;
   /** 预设生效块（启动流程审查 P0：用户选定预设 + 块勾选 → <预设> 注入） */
   presetBlocks?: string[];
+  /** 文风指令（稳定前缀：底座 + 激活作者风格 + [NSFW] + 世界书风格词条）
+   *  底座位同 session 逐字不变（缓存友好）；nsfw/世界书词条为随 turn 可变尾巴 */
+  styleBlock?: string;
   /** 是否附加 tools 定义（模式 A）；false 时使用 XML 降级指令 */
   useTools?: boolean;
   /** 稳定前缀目标（OpenAI 兼容隐式前缀缓存 ≥1024 tokens 门槛；审查 §4.2） */
@@ -89,6 +92,8 @@ export function assembleTurn(input: AssembleInput): AssembleResult {
   if (input.presetBlocks && input.presetBlocks.length > 0) {
     system += `\n\n<预设>\n${input.presetBlocks.join('\n\n')}\n</预设>`;
   }
+  // 文风指令：稳定前缀稳定槽（底座 + 激活文风逐字不变；nsfw/世界书词条为可变尾巴）
+  if (input.styleBlock) system += `\n\n<文风指令>\n${input.styleBlock}\n</文风指令>`;
   if (input.dynamicState) system += `\n\n<动态状态>\n${input.dynamicState}\n</动态状态>`;
   // 2. 前缀缓存填充：稳定前缀不足阈值时循环追加固定平台声明段（每段逐字不变，审查 §4.2 门槛）
   // 修复 §5.3：去掉硬上限（仅以防卫上限 256 防止异常阈值死循环，模运算循环段可无限扩展）
