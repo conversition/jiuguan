@@ -1199,7 +1199,9 @@ export class ChatSession {
     const scan = this.turnInput.scan;
     const activated = (scan?.activated ?? []) as { id: number; uid: string; comment: string; content: string; matchType: string }[];
     if (activated.length === 0) return { injected: '', promoted: [] };
-    const hits = activated.filter((e) => STYLE_TRIGGER_TERMS.some((r) => r.test(`${e.comment} ${e.content}`)));
+    const hits = activated.filter((e) => STYLE_TRIGGER_TERMS.some((r) => r.test(`${e.comment} ${e.content}`)))
+      // 空正文词条无法成为 skill（addSkill 拒空），跳过以免崩回合
+      .filter((e) => e.content.trim().length > 0);
     if (hits.length === 0) return { injected: '', promoted: [] };
     const specs: StyleSkillSpec[] = hits.map((e) => ({
       name: `文风-词条-${styleSha256(e.content).slice(0, 10)}`,
@@ -1234,8 +1236,14 @@ export class ChatSession {
       const nsfw = this.readStyleBody(NSFW_STYLE_NAME);
       if (nsfw) parts.push(`<NSFW文风>\n${nsfw}\n</NSFW文风>`);
     }
-    const wb = this.retrieveWorldbookStyleEntries();
-    if (wb.injected) parts.push(`<世界书文风>\n${wb.injected}\n</世界书文风>`);
+    // 世界书文风词条属增强层：任何异常（如空正文/磁盘写入失败）都只降级，绝不崩回合
+    let wbInjected = '';
+    try {
+      wbInjected = this.retrieveWorldbookStyleEntries().injected;
+    } catch (e) {
+      console.warn(`[文风] 世界书文风词条提升失败（已降级，不影响回合）: ${(e as Error).message}`);
+    }
+    if (wbInjected) parts.push(`<世界书文风>\n${wbInjected}\n</世界书文风>`);
     return parts.join('\n\n');
   }
 

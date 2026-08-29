@@ -304,15 +304,18 @@ export interface StyleSkillSpec {
 }
 
 /** 依规格同步文风 skill 到磁盘：无 → 创建；有但 sourceHash 变 → 更新；hash 同 → 跳过。
- *  实现「源变化→可更新／可增强」：调用方给同一 spec 反复跑，仅在源内容变化时真实重写。 */
+ *  实现「源变化→可更新／可增强」：调用方给同一 spec 反复跑，仅在源内容变化时真实重写。
+ *  防御：空正文 spec 无法成为 skill（addSkill 会抛），此处直接跳过并计入 skipped，不抛异常。 */
 export function syncStylesFromSource(
   specs: StyleSkillSpec[],
   dir = DEFAULT_SKILLS_DIR,
-): { created: string[]; updated: string[]; unchanged: string[] } {
+): { created: string[]; updated: string[]; unchanged: string[]; skipped: string[] } {
   const created: string[] = [];
   const updated: string[] = [];
   const unchanged: string[] = [];
+  const skipped: string[] = [];
   for (const spec of specs) {
+    if (!spec.body || !spec.body.trim()) { skipped.push(spec.name); continue; }
     const existing = findSkill(spec.name, dir);
     if (!existing) {
       addSkill({ ...spec, content: spec.body, enabled: spec.enabled ?? true }, dir);
@@ -324,5 +327,5 @@ export function syncStylesFromSource(
       updated.push(spec.name);
     }
   }
-  return { created, updated, unchanged };
+  return { created, updated, unchanged, skipped };
 }
