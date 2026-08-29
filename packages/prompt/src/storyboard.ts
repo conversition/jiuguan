@@ -262,6 +262,45 @@ export function storyboardStageTools(): Record<string, Record<string, unknown>> 
       },
       required: ['intention', 'master_desc', 'narrative', 'summary', 'scores'],
     }),
+    // Stage 5 按需旁路（video-prompt-generator 专用；orchestrator 主管线不取用）
+    dialogue: funcTool('storyboard_dialogue', '对白提取：从剧情上下文提取逐字对白与说话人（旁白/心理描写不算）', {
+      properties: {
+        lines: {
+          type: 'array',
+          description: '对白行序列（按出现顺序）',
+          items: {
+            type: 'object',
+            properties: {
+              speaker: str('角色名（原文）'),
+              text: str('对白逐字原文（禁止改写）'),
+              onScreen: { type: 'boolean', description: '说话时是否在画面内' },
+            },
+            required: ['speaker', 'text', 'onScreen'],
+          },
+        },
+      },
+      required: ['lines'],
+    }),
+    videoprompt: funcTool('storyboard_videoprompt', '视频提示词：逐镜转写为 MiniMax H3 T2VA 三字段提示词（4-15秒/≤7000字符）', {
+      properties: {
+        prompts: {
+          type: 'array',
+          description: '逐镜提示词（每镜一个对象，镜号与本批面板一一对应）',
+          items: {
+            type: 'object',
+            properties: {
+              panel: { type: 'number' },
+              target_duration: { type: 'number', description: '目标时长（秒，4-15）' },
+              english_prompt: str('三字段英文提示词全文'),
+              chinese_translation: str('逐行对照中文翻译'),
+              assumptions: str('采用的假设（可空）'),
+            },
+            required: ['panel', 'target_duration', 'english_prompt'],
+          },
+        },
+      },
+      required: ['prompts'],
+    }),
   };
 }
 
@@ -545,4 +584,102 @@ export function renderDirectorMarkdown(r: DirectorRenderInput): string {
     seqMd ? `\n---\n\n${seqMd}` : '',
     vpLines.length ? `\n---\n\n## 校验报告（Stage 3）\n\n${vpLines.join('\n\n')}` : '',
   ].join('\n');
+}
+
+// ── Stage 5 按需视频提示词（MiniMax H3 T2VA：对白提取 + 逐镜转写，管线旁路不进主管线）──
+// 格式权威：MiniMax H3 官方规范（三字段结构 / 4-15 秒 / 24FPS / ≤7000 字符 / <d> 对白 / (S1) 声源 ID）。
+// non_diegetic_music 默认 N/A —— 对齐管线 SFX-Only 纪律（S2-W8 禁 BGM）。
+
+/** H3 硬限制（官方包络：单条视频 4-15 秒，提示词 ≤7000 字符） */
+export const H3_MIN_DURATION = 4;
+export const H3_MAX_DURATION = 15;
+export const H3_PROMPT_MAX_CHARS = 7000;
+
+// ── 对白提取（会话上下文 → 逐字对白行；声源 ID 由代码分配，不由模型自定）──
+export const DialogueLineSchema = z.object({
+  speaker: z.string().describe('角色名（原文）'),
+  text: z.string().describe('对白逐字原文（中文，含标点，禁止改写）'),
+  onScreen: z.boolean().describe('说话时是否在画面内（false=画外音）'),
+});
+export type DialogueLine = z.infer<typeof DialogueLineSchema>;
+export const DialogueSchema = z.object({ lines: z.array(DialogueLineSchema) });
+export type Dialogue = z.infer<typeof DialogueSchema>;
+
+// ── 视频提示词（逐镜独立：一镜一段视频一份 H3 三字段提示词）──
+export const VideoPromptSchema = z.object({
+  panel: z.number().int().positive().describe('对应镜号'),
+  target_duration: z.number().min(H3_MIN_DURATION).max(H3_MAX_DURATION).describe('H3 目标时长（秒，4-15；分镜 time 为参考节奏，动作弧自然拉伸）'),
+  english_prompt: z.string().min(1).describe('H3 三字段英文提示词全文（integrated_multimodal_description / overall_soundscape / non_diegetic_music）'),
+  chinese_translation: z.string().default('').describe('逐行对照中文翻译（保留字段名/[Shot N]/(Sx)/<d> 结构标识）'),
+  assumptions: z.string().default('').describe('采用的假设（可空）'),
+});
+export type VideoPrompt = z.infer<typeof VideoPromptSchema>;
+export const VideoPromptsSchema = z.object({ prompts: z.array(VideoPromptSchema) });
+export type VideoPrompts = z.infer<typeof VideoPromptsSchema>;
+
+// ── 逐镜容错 schema（对齐 PanelSchemaLenient 惯例：数值 coerce + 辅助补默认，关键产出 english_prompt 仍必填）──
+export const VideoPromptSchemaLenient = z.object({
+  panel: z.coerce.number().int().positive().default(1),
+  target_duration: z.coerce.number().min(1).max(60).catch(5),
+  english_prompt: z.string().min(1, 'english_prompt 不能为空'),
+  chinese_translation: z.string().default(''),
+  assumptions: z.string().default(''),
+}).passthrough();
+export const VideoPromptsSchemaLenient = z.object({ prompts: z.array(VideoPromptSchemaLenient) });
+export type VideoPromptsLenient = z.infer<typeof VideoPromptsSchemaLenient>;
+
+/** 校验视频提示词组（VP5）：镜号对齐 / 字符上限 / 三字段齐全有序 / <d> 闭合与声源 ID / 时长 / BGM / 语言策略 */
+export function validateVideoPrompts(prompts: VideoPrompt[], expectedPanels: number[]): ValidationIssue {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+  const gotPanels = new Set(prompts.map((p) => p.panel));
+  const missing = expectedPanels.filter((n) => !gotPanels.has(n));
+  const dup = prompts.map((p) => p.panel).filter((n, i, arr) => arr.indexOf(n) !== i);
+  if (missing.length) errors.push(`VV-E1: 缺镜提示词: ${missing.join(', ')}`);
+  if (dup.length) errors.push(`VV-E1: 重复镜提示词: ${[...new Set(dup)].join(', ')}`);
+  for (const p of prompts) {
+    const ep = p.english_prompt || '';
+    if (ep.length > H3_PROMPT_MAX_CHARS) errors.push(`VV-E2: 格${p.panel} english_prompt ${ep.length} 字符超上限 ${H3_PROMPT_MAX_CHARS}`);
+    // 三字段齐全且顺序单调（integrated_multimodal_description → overall_soundscape → non_diegetic_music）
+    const iDesc = ep.indexOf('integrated_multimodal_description');
+    const iSnd = ep.indexOf('overall_soundscape');
+    const iMus = ep.indexOf('non_diegetic_music');
+    if (iDesc < 0 || iSnd < 0 || iMus < 0) errors.push(`VV-E3: 格${p.panel} 缺三字段之一（desc=${iDesc >= 0}, snd=${iSnd >= 0}, music=${iMus >= 0}）`);
+    else if (!(iDesc < iSnd && iSnd < iMus)) errors.push(`VV-E3: 格${p.panel} 三字段顺序错误（需 desc→snd→music）`);
+    // <d> 闭合 / 语言标签 / 声源 ID
+    const openCnt = (ep.match(/<d>/g) ?? []).length;
+    const closeCnt = (ep.match(/<\/d>/g) ?? []).length;
+    if (openCnt !== closeCnt) errors.push(`VV-E4: 格${p.panel} <d> 标签未闭合（开 ${openCnt} / 闭 ${closeCnt}）`);
+    const dBlocks = ep.match(/<d>[\s\S]*?<\/d>/g) ?? [];
+    if (dBlocks.length && !dBlocks.every((b) => b.includes('[中文]'))) errors.push(`VV-E4: 格${p.panel} <d> 内缺 [中文] 语言标签`);
+    if (dBlocks.length && !/\(S\d/.test(ep)) errors.push(`VV-E4: 格${p.panel} 有对白却无声源 ID (S1)…`);
+    // 时长越界（lenient 路径兜底：严格 schema 已限 4-15）
+    if (p.target_duration < H3_MIN_DURATION || p.target_duration > H3_MAX_DURATION) {
+      errors.push(`VV-E5: 格${p.panel} target_duration ${p.target_duration}s 越界（需 ${H3_MIN_DURATION}-${H3_MAX_DURATION}s）`);
+    }
+    // non_diegetic_music 默认 N/A（SFX-Only 纪律；写配乐仅警告不阻断）
+    if (iMus >= 0) {
+      const seg = ep.slice(iMus + 'non_diegetic_music'.length).replace(/^[\s:]+/, '').slice(0, 8).trim();
+      if (!/^N\/A/i.test(seg)) warnings.push(`VV-W1: 格${p.panel} non_diegetic_music 非 N/A（默认 SFX-Only；如确需配乐可忽略）`);
+    }
+    // [Shot 1] 带时间戳（单镜开场禁时间戳）
+    if (/\[Shot 1\][^\n]*At \d{2}:\d{2}/.test(ep)) warnings.push(`VV-W2: 格${p.panel} [Shot 1] 带时间戳（开场镜头禁时间戳）`);
+    // <d> 标签外出现中文（语言策略：对白原文之外须全英文）
+    const outside = ep.replace(/<d>[\s\S]*?<\/d>/g, '');
+    if (/[一-鿿]/.test(outside)) warnings.push(`VV-W3: 格${p.panel} <d> 标签外出现中文字符（正文须全英文）`);
+  }
+  return { stage: 'VP5', errors, warnings };
+}
+
+/** 视频提示词 markdown 小节渲染（仅本节；下载时由前端拼接到导演分镜 markdown 之后） */
+export function renderVideoPromptMarkdown(prompts: VideoPrompt[], speakers: string[], passed: boolean): string {
+  const lines: string[] = ['## MiniMax H3 视频提示词（按需生成）', ''];
+  if (speakers.length) lines.push(`> 声源名册：${speakers.join(' ｜ ')} ｜ 校验：VP5 ${passed ? '✅ PASS' : '❌ FAIL'}`, '');
+  for (const p of prompts) {
+    lines.push(`### 第 ${p.panel} 镜（目标 ${p.target_duration}s）`, '');
+    lines.push('**English Prompt**', '', '```text', p.english_prompt, '```', '');
+    if (p.chinese_translation) lines.push('**中文翻译**', '', `> ${p.chinese_translation.replace(/\n/g, '\n> ')}`, '');
+    if (p.assumptions) lines.push(`> 💡 假设：${p.assumptions}`, '');
+  }
+  return lines.join('\n');
 }

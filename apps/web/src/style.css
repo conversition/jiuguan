@@ -408,12 +408,13 @@ body { font-family: system-ui, 'PingFang SC', 'Microsoft YaHei', sans-serif; bac
 .html-msg { width: 100%; color: var(--ink-2); }
 .html-msg > :first-child { margin-top: 0; }
 .html-msg img { max-width: 100%; height: auto; border-radius: 8px; }
-/* 完整文档前端（开场页/状态栏 HUD）→ 沙箱 iframe：透明底、圆角、无边框，内容高度由 postMessage 自动适配 */
-.html-msg-frame { display: block; width: 100%; border: none; border-radius: 10px; background: transparent; }
+/* 完整文档前端（开场页/状态栏 HUD）→ 沙箱 iframe：透明底、圆角、无边框，内容高度由 postMessage 自动适配。
+   宽度收在阅读列（--read-w）内并居中：桌面整列宽会拉伸卡前端、与叙事气泡（720px）比例失配 */
+.html-msg-frame { display: block; width: 100%; max-width: var(--read-w); margin: 0 auto; border: none; border-radius: 10px; background: transparent; }
 .html-msg-frame::-webkit-scrollbar { width: 6px; }
 .html-msg-frame::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
-/* 消息分段：叙事气泡 + HTML 前端段纵向排布 */
-.msg-segments { display: flex; flex-direction: column; gap: 8px; }
+/* 消息分段：叙事气泡 + HTML 前端段纵向排布（width:100% 铺满列，子段各自控制宽度/居中） */
+.msg-segments { display: flex; flex-direction: column; gap: 8px; width: 100%; }
 
 /* ═══════════ 剧情分支按钮（AI 索引 → 点按填入输入框）═══════════ */
 .story-branches { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
@@ -526,6 +527,22 @@ body { font-family: system-ui, 'PingFang SC', 'Microsoft YaHei', sans-serif; bac
 .director-val { padding: 8px 22px 0; max-height: 96px; overflow-y: auto; }
 .director-val .director-error, .director-val .director-warn { margin: 4px 0; font-size: 12px; line-height: 1.5; }
 .director-warn { color: var(--ink-4); }
+
+/* ── H3 视频提示词（DirectorModal / StoryboardPanel 按需生成） ── */
+.director-vp { padding: 10px 22px 0; max-height: 340px; overflow-y: auto; border-top: 1px dashed var(--border); margin-top: 10px; }
+.vp-chip { color: var(--accent); }
+.vp-speakers { margin: 6px 0; color: var(--ink-3); font-size: 12px; }
+.vp-card { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin: 8px 0; background: var(--bg-deep); }
+.vp-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; color: var(--ink-1); font-size: 13px; }
+.vp-copy { background: var(--bg-card); color: var(--ink-2); border: 1px solid var(--border); border-radius: 6px; padding: 3px 10px; font-size: 12px; cursor: pointer; }
+.vp-copy:hover { background: var(--bg-hover); }
+.vp-code {
+  margin: 0; padding: 10px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 6px;
+  color: var(--ink-2); font-size: 12px; line-height: 1.6; white-space: pre-wrap; word-break: break-word;
+  max-height: 220px; overflow-y: auto;
+}
+.vp-zh { margin: 8px 0 0; color: var(--ink-3); font-size: 12px; line-height: 1.7; white-space: pre-wrap; }
+.vp-assumption { margin: 6px 0 0; color: var(--ink-4); font-size: 12px; }
 
 /* ── GLA 远端资源面板（AssetsPanel） ── */
 .asset-status .console-meta { margin: 6px 0; }

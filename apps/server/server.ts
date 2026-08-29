@@ -23,9 +23,12 @@ import { parseCharaCard, extractCharaFromPng, pngPayloadToJson, buildCharaPng } 
 import { RegexLibrary } from '../../packages/core/src/regex-library.ts';
 import { StoryboardOrchestrator, StoryboardRegistry, DEFAULT_WORKFLOW } from '../../tools/cli/storyboard-orchestrator.ts';
 import type { StoryboardResult } from '../../tools/cli/storyboard-orchestrator.ts';
-import { renderDirectorMarkdown } from '../../packages/prompt/src/storyboard.ts';
+import { VideoPromptGenerator } from '../../tools/cli/video-prompt-generator.ts';
+import type { VideoPromptResult } from '../../tools/cli/video-prompt-generator.ts';
+import { renderDirectorMarkdown, safeParseStage, PanelsSchemaLenient } from '../../packages/prompt/src/storyboard.ts';
+import type { Panel } from '../../packages/prompt/src/storyboard.ts';
 import { OpenAICompatibleClient } from '../../packages/proxy/src/client.ts';
-import { loadProviderConfig } from '../../packages/proxy/src/config.ts';
+import { loadProviderConfig, assertProviderReady } from '../../packages/proxy/src/config.ts';
 import { RetrievalEngine } from '../../packages/memory/src/retrieval.ts';
 import { HashEmbeddingProvider, createEmbeddingProvider } from '../../packages/memory/src/embedding.ts';
 import { LorebookScanner } from '../../packages/core/src/scanner.ts';
@@ -177,13 +180,11 @@ function storyboardDonePayload(
     passed: result.passed,
     voice: result.directorsRead?.voice ?? '',
     intention: result.directorsRead?.intention ?? '',
-    panels: result.panels.map((p) => ({
-      panel: p.panel, time: p.time, shot_size: p.shot_size, angle: p.angle,
-      transition_hint: p.transition_hint, positive_prompt_short: p.positive_prompt_short,
-    })),
+    // panels 全字段下发（H3 视频提示词按需转写的回传输入；localhost SSE 载荷无压力）
+    panels: result.panels,
     sequence: result.sequence ? {
       master_prompt: result.sequence.master_prompt.slice(0, 400), narrative: result.sequence.narrative.slice(0, 400),
-      consistency: result.sequence.consistency.slice(0, 200), sfx: result.sequence.sfx.slice(0, 200),
+      consistency: result.sequence.consistency.slice(0, 200), sfx: result.sequence.sfx,
     } : null,
     humanized: result.humanized?.summary ?? '',
     validation: result.validation,
@@ -200,6 +201,27 @@ function storyboardDonePayload(
       validation: result.validation,
     }),
   };
+}
+
+/** H3 视频提示词完成载荷（/api/storyboard/video-prompt 与 /api/session/:id/director/video-prompt 共用） */
+function videoPromptDonePayload(result: VideoPromptResult): Record<string, unknown> {
+  return {
+    type: 'done',
+    passed: result.passed,
+    speakers: result.speakers,
+    prompts: result.prompts,
+    validation: result.validation,
+    errors: result.errors.slice(0, 12),
+    warnings: result.warnings.slice(0, 12),
+    markdown: result.markdown,
+  };
+}
+
+/** 前端回传面板重校验（PanelsSchemaLenient 容错；上限 30 对齐分镜管线） */
+function parseVideoPromptPanels(raw: unknown): Panel[] {
+  if (!Array.isArray(raw) || raw.length === 0) return [];
+  const parsed = safeParseStage(JSON.stringify({ panels: raw }), PanelsSchemaLenient);
+  return parsed ? parsed.panels.slice(0, 30) : [];
 }
 
 const server = createServer(async (req, res) => {
@@ -1341,6 +1363,52 @@ const server = createServer(async (req, res) => {
           sceneName: `导演分镜「${selectedText.slice(0, 10)}…」`,
           directorSource: selectedText.slice(0, 120),
         }));
+      } catch (e) {
+        sseSend(res, { type: 'error', message: (e as Error).message.slice(0, 200) });
+      }
+      res.end();
+      return;
+    }
+
+    // ── H3 视频提示词（分镜完成后按需旁路：会话模式走会话上下文提取对白，独立页走场景描述；panels 由前端回传）──
+    if (method === 'POST' && p.startsWith('/api/session/') && p.endsWith('/director/video-prompt')) {
+      const id = p.split('/')[3];
+      const session = sessions.get(id);
+      if (!session) return json(res, { error: '会话不存在' }, 404);
+      const body = await readBody(req);
+      const panels = parseVideoPromptPanels(body.panels);
+      if (!panels.length) return json(res, { error: 'panels 为空或非法' }, 400);
+      sse(res);
+      try {
+        const result = await session.videoPromptRun({
+          panels,
+          sequenceSfx: typeof body.sequenceSfx === 'string' ? body.sequenceSfx : undefined,
+          selectedText: typeof body.selectedText === 'string' ? body.selectedText : undefined,
+          round: Number(body.round) || undefined,
+        }, (label, detail) => sseSend(res, { type: 'stage', label, detail: detail ?? '' }));
+        sseSend(res, videoPromptDonePayload(result));
+      } catch (e) {
+        sseSend(res, { type: 'error', message: (e as Error).message.slice(0, 200) });
+      }
+      res.end();
+      return;
+    }
+
+    // 独立页模式（无会话上下文：scene 作对白提取源；一次性客户端不落库）
+    if (method === 'POST' && p === '/api/storyboard/video-prompt') {
+      const body = await readBody(req);
+      const panels = parseVideoPromptPanels(body.panels);
+      if (!panels.length) return json(res, { error: 'panels 为空或非法' }, 400);
+      const scene = (body.scene ?? '').toString().trim();
+      if (!scene) return json(res, { error: '场景描述为空' }, 400);
+      sse(res);
+      try {
+        const cfg = loadProviderConfig();
+        assertProviderReady(cfg);
+        const gen = new VideoPromptGenerator({ client: new OpenAICompatibleClient(cfg), cardName: '导演分镜', round: 1 });
+        const result = await gen.run(panels, { sequenceSfx: typeof body.sequenceSfx === 'string' ? body.sequenceSfx : undefined, dialogueSource: scene },
+          (label, detail) => sseSend(res, { type: 'stage', label, detail: detail ?? '' }));
+        sseSend(res, videoPromptDonePayload(result));
       } catch (e) {
         sseSend(res, { type: 'error', message: (e as Error).message.slice(0, 200) });
       }

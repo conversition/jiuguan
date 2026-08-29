@@ -63,6 +63,9 @@ import { resolveAsset, listAssets } from '../../packages/core/src/asset-paths.ts
 import type { AssetKind } from '../../packages/core/src/asset-paths.ts';
 import { StoryboardOrchestrator } from './storyboard-orchestrator.ts';
 import type { StoryboardResult } from './storyboard-orchestrator.ts';
+import { VideoPromptGenerator, DIALOGUE_SOURCE_MAX_CHARS } from './video-prompt-generator.ts';
+import type { VideoPromptResult } from './video-prompt-generator.ts';
+import type { Panel } from '../../packages/prompt/src/storyboard.ts';
 import { indexSessionLore } from './lore-index-task.ts';
 
 /** 资产解析（用户层 data/{presets,worldbooks} 优先于 剧本方案 源目录，编辑器 P2） */
@@ -1914,6 +1917,25 @@ ${context}`;
       extraContext: ctx.slice(0, 6000),
       namespace: ns,
     }, onStage);
+  }
+
+  // ── H3 视频提示词（导演模式按需旁路：复用会话上下文提取对白 → 逐镜转写；panels 由前端回传完整面板）──
+
+  async videoPromptRun(
+    params: { panels: Panel[]; sequenceSfx?: string; selectedText?: string; round?: number },
+    onStage?: (label: string, detail?: string) => void,
+  ): Promise<VideoPromptResult> {
+    // 对白源：选中消息所在轮次之前的近期原文（buildChatWindow，对齐 directorRun extraContext 口径）
+    const maxRound = Number.isInteger(params.round) && (params.round ?? 0) > 0 ? (params.round as number) : this.round;
+    const window = this.buildChatWindow(maxRound);
+    const dialogueSource = [
+      window.messages.length > 0
+        ? `【近期剧情（至第 ${maxRound} 轮）】\n${window.messages.map((m) => `${m.role === 'user' ? '玩家' : '角色'}: ${m.content}`).join('\n')}`
+        : '',
+      params.selectedText ? `【用户选中片段】\n${params.selectedText}` : '',
+    ].filter(Boolean).join('\n\n');
+    const gen = new VideoPromptGenerator({ client: this.client, cardName: this.cardName || '导演分镜', round: this.round, mem: this.mem });
+    return gen.run(params.panels, { sequenceSfx: params.sequenceSfx, dialogueSource: dialogueSource.slice(0, DIALOGUE_SOURCE_MAX_CHARS) }, onStage);
   }
 }
 

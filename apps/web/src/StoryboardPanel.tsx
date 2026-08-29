@@ -23,6 +23,15 @@ interface RunResult {
   errors: string[];
   warnings: string[];
 }
+/** H3 视频提示词（逐镜独立，一镜一段视频一份提示词） */
+interface VideoPromptItem {
+  panel: number; target_duration: number; english_prompt: string;
+  chinese_translation: string; assumptions: string;
+}
+interface VideoPromptResult {
+  passed: boolean; speakers: string[]; prompts: VideoPromptItem[];
+  validation: ValidationIssue[]; errors: string[]; warnings: string[]; markdown: string;
+}
 
 interface StageEvent { label: string; detail: string }
 
@@ -39,6 +48,12 @@ export function StoryboardPanel() {
   const [stages, setStages] = useState<StageEvent[]>([]);
   const [result, setResult] = useState<RunResult | null>(null);
   const [error, setError] = useState('');
+  // H3 视频提示词（按需旁路：panels 回传 + scene 作对白源）
+  const [vpBusy, setVpBusy] = useState(false);
+  const [vpStages, setVpStages] = useState<StageEvent[]>([]);
+  const [vp, setVp] = useState<VideoPromptResult | null>(null);
+  const [vpError, setVpError] = useState('');
+  const [copied, setCopied] = useState<number | null>(null);
 
   React.useEffect(() => {
     api<{ workflows: string[]; defaultWorkflow: string; voices: string[] }>('/api/storyboard/workflows')
@@ -48,7 +63,7 @@ export function StoryboardPanel() {
 
   const run = async () => {
     if (!scene.trim() || busy) return;
-    setBusy(true); setError(''); setResult(null); setStages([]);
+    setBusy(true); setError(''); setResult(null); setStages([]); setVp(null); setVpStages([]); setVpError('');
     try {
       const res = await fetch(`${API}/api/storyboard/run`, {
         method: 'POST',
@@ -83,6 +98,51 @@ export function StoryboardPanel() {
     setBusy(false);
   };
 
+  /** H3 视频提示词：分镜完成后按需生成（panels 回传，scene 作对白提取源） */
+  const runVideoPrompt = async () => {
+    if (!result?.panels?.length || vpBusy) return;
+    setVpBusy(true); setVpError(''); setVpStages([]); setVp(null);
+    try {
+      const res = await fetch(`${API}/api/storyboard/video-prompt`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+        body: JSON.stringify({ panels: result.panels, sequenceSfx: result.sequence?.sfx, scene: scene.trim() }),
+      });
+      if (!res.ok || !res.body) {
+        const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+        throw new Error(err.error ?? `HTTP ${res.status}`);
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split('\n');
+        buf = lines.pop() ?? '';
+        for (const line of lines) {
+          const t = line.trim();
+          if (!t.startsWith('data:')) continue;
+          try {
+            const ev = JSON.parse(t.slice(5).trim()) as Record<string, unknown>;
+            if (ev.type === 'stage') setVpStages((s) => [...s, { label: String(ev.label ?? ''), detail: String(ev.detail ?? '') }]);
+            if (ev.type === 'done') setVp(ev as unknown as VideoPromptResult);
+            if (ev.type === 'error') setVpError(String(ev.message ?? '视频提示词生成失败'));
+          } catch { /* 忽略坏块 */ }
+        }
+      }
+    } catch (e) { setVpError((e as Error).message); }
+    setVpBusy(false);
+  };
+
+  const copyPrompt = (panel: number, text: string): void => {
+    navigator.clipboard.writeText(text).then(() => {
+      setCopied(panel);
+      setTimeout(() => setCopied((c) => (c === panel ? null : c)), 1500);
+    }).catch(() => { /* 剪贴板不可用时静默 */ });
+  };
+
   return (
     <>
       <p className="hint">导演分镜（Commit B）：导演读本 → 逐镜分镜 → 串联序列 → 人类化改写，五级校验内联，结果落库。</p>
@@ -112,6 +172,7 @@ export function StoryboardPanel() {
             {workflows.map((w) => <option key={w} value={w}>{w}</option>)}
           </select>
           <button onClick={run} disabled={busy || !scene.trim()}>{busy ? '执行中…' : '开始分镜'}</button>
+          <button onClick={runVideoPrompt} disabled={!result?.panels?.length || vpBusy}>🎞 {vpBusy ? '生成中…' : '生成视频提示词'}</button>
         </div>
       </section>
 
@@ -161,6 +222,33 @@ export function StoryboardPanel() {
           {result.humanized && <p className="muted"><b>人类化改写:</b> {result.humanized}</p>}
           {result.errors.length > 0 && result.errors.map((e, i) => <p key={i} className="error">✕ {e}</p>)}
           {result.warnings.length > 0 && result.warnings.slice(0, 6).map((w, i) => <p key={i} className="hint">⚠ {w}</p>)}
+        </section>
+      )}
+      {(vpStages.length > 0 || vpError) && (
+        <section className="console-section">
+          <h3>视频提示词</h3>
+          {vpStages.map((s, i) => (
+            <p key={i} className="muted">▶ {s.label}{s.detail ? `（${s.detail}）` : ''}</p>
+          ))}
+          {vpError && <p className="error">⚠ {vpError}</p>}
+          {vp && (
+            <>
+              {vp.speakers.length > 0 && <p className="ok">🔊 声源名册：{vp.speakers.join(' ｜ ')}</p>}
+              {vp.prompts.map((p) => (
+                <div key={p.panel} className="vp-card">
+                  <div className="vp-head">
+                    <b>第 {p.panel} 镜（目标 {p.target_duration}s）</b>
+                    <button className="vp-copy" onClick={() => copyPrompt(p.panel, p.english_prompt)}>
+                      {copied === p.panel ? '✓ 已复制' : '📋 复制'}
+                    </button>
+                  </div>
+                  <pre className="vp-code">{p.english_prompt}</pre>
+                  {p.chinese_translation && <p className="vp-zh">{p.chinese_translation}</p>}
+                  {p.assumptions && <p className="vp-assumption">💡 {p.assumptions}</p>}
+                </div>
+              ))}
+            </>
+          )}
         </section>
       )}
       {error && <p className="error">{error}</p>}
