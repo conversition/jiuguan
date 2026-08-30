@@ -1,5 +1,14 @@
 # jiuguan · 酒馆剧本引擎
 
+<p align="center">
+  <img src="https://img.shields.io/github/license/conversition/jiuguan" alt="License"/>
+  <img src="https://img.shields.io/github/languages/top/conversition/jiuguan" alt="Top Language"/>
+  <img src="https://img.shields.io/github/languages/count/conversition/jiuguan" alt="Languages"/>
+  <img src="https://img.shields.io/github/repo-size/conversition/jiuguan" alt="Repo Size"/>
+  <img src="https://img.shields.io/github/last-commit/conversition/jiuguan" alt="Last Commit"/>
+  <img src="https://img.shields.io/github/stars/conversition/jiuguan" alt="Stars"/>
+</p>
+
 > 下一代 SillyTavern 角色扮演平台 —— **本地优先 + 提示词架构驱动**。
 > 用最优提示词架构保障完整剧本记忆、最大化大模型涌现能力、创造最佳沉浸游玩体验。
 > **想跑起来看效果？先读 [`启动指南.md`](启动指南.md)**（3 步启动 + 试用路径 + CLI + 常见问题）。
