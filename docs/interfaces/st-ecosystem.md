@@ -135,7 +135,7 @@ iframe 侧 `rpcCall(ns, op, payload, timeoutMs?)`：发 `{__jgfh:'rpc',id,ns,op,
 | `SillyTavern.getContext().getMessageById(id)` | 从缓存 chat 查 | **已接（真实数据）** |
 | `getCharacters()` | 缓存 character（若有）→ `{name:char}` | **已接（真实数据）** |
 | `extensionSettings` / `eventSource` / `addOneMessage` 等 | 安全空实现，保证探测/初始化不崩 | 空实现 |
-| `getSTFn` / `getVariables` / `replaceVariables` | 安全空实现 | 空实现 |
+| `getSTFn` / `getVariables` / `replaceVariables` | 已知助手符号给无副作用安全默认（可 await 不抛，流程走到底）；未知符号 `undefined`（保留探测降级） | **已接** |
 | `SillyTavern.getContext().getCharacters` | 同 `getCharacters` | 已接 |
 
 ### 宿主分发路由（`App.tsx handleRpcMessage`）

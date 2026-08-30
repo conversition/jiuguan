@@ -146,6 +146,21 @@ console.log('\n== ③ getContext 首次拉 session.getContext → 缓存回读 n
   check('window.parent.document.querySelector("#send_textarea") 正确变换为 __jgSafeParent', t2.includes('window.__jgSafeParent.document.querySelector("#send_textarea")'));
   check('变换后无 window.parent 字面', !/window\.parent/.test(t2));
 
+  console.log('\n== ⑥ getSTFn 安全默认（卡「开始剧情」链：await api_updateWorldbookWith 不得抛、流程不截断）==');
+  const gStFn = (ctx.getSTFn as (n: string) => unknown);
+  const uwb = gStFn('updateWorldbookWith') as () => Promise<unknown>;
+  check('getSTFn(updateWorldbookWith) 返回可调用函数', typeof uwb === 'function');
+  let uwbThrew = false;
+  try { await uwb(); } catch { uwbThrew = true; }
+  check('await api_updateWorldbookWith() 不抛（卡内不提前 return，能走到 #send_textarea）', !uwbThrew);
+  const gwb = gStFn('getWorldbook') as () => Promise<unknown[]>;
+  check('getSTFn(getWorldbook) 可 await 且默认空数组', typeof gwb === 'function' && Array.isArray(await gwb()));
+  const cbNames = gStFn('getCharWorldbookNames') as () => { primary: unknown };
+  check('getSTFn(getCharWorldbookNames) 返回 {primary} 可探测', typeof cbNames === 'function' && cbNames().primary === null);
+  const lastId = gStFn('getLastMessageId') as () => Promise<number>;
+  check('getSTFn(getLastMessageId) 默认 0', typeof lastId === 'function' && (await lastId()) === 0);
+  check('getSTFn(未知符号) 仍返回 undefined（探测降级语义保留）', gStFn('obviouslyUnknownStFn9987') === undefined);
+
   console.log(`\n结果: ${passed} passed, ${failed} failed`);
   process.exit(failed > 0 ? 1 : 0);
 })();

@@ -154,7 +154,8 @@ export const PARENT_PROXY_SNIPPET = `<script>(function(){
       // SillyTavern 生态前端经 ST_WIN=父窗口代理 探测/调用宿主能力：白名单 key 转发到 iframe 内 ST shim
       // （shim 定义于 window 上，见 ST_COMPAT_SNIPPET；无则返回 undefined 使 ST 探测优雅降级）
       if (p === 'toastr' || p === 'SillyTavern' || p === 'eventSource' || p === 'events'
-        || p === 'jQuery' || p === 'jquery' || p === 'name1' || p === 'name2' || p === 'characters') {
+        || p === 'jQuery' || p === 'jquery' || p === 'name1' || p === 'name2' || p === 'characters'
+        || p === 'getSTFn' || p === 'getVariables' || p === 'replaceVariables') {
         return (typeof window[p] !== 'undefined') ? window[p] : undefined;
       }
       if (p === 'toString') return function(){ return '[object Window]'; };
@@ -372,8 +373,25 @@ export const ST_COMPAT_SNIPPET = `<script>(function(){
     saveMacros: function(){},
     getApiUrl: function(){ return ''; }
   };
-  // WuWa 类卡会读顶层 getSTFn/getVariables 等（SillyTavern 助手扩展 API）→ 安全空实现，保证脚本初始化不中断
-  if (typeof window.getSTFn !== 'function') { window.getSTFn = function(){ return undefined; }; }
+  // WuWa 类卡会读顶层 getSTFn/getVariables 等（SillyTavern 助手扩展 API）。宿主无 ST 助手运行时，
+  // 卡脚本常「const api_x = getSTFn('updateWorldbookWith'); ... await api_x(...)」——若返回 undefined，
+  // await undefined(...) 抛 TypeError，被卡内 try/catch 后常提前 return，导致后续 #send_textarea 注入永不执行。
+  // 对已知 ST 助手符号给「无副作用安全默认」（可 await、可调用、不抛真值），让填写开场选项/注入聊天框等流程走到底；
+  // 未知符号仍返回 undefined（保留「探测到再降级」的语义，不误报能力存在）。
+  if (typeof window.getSTFn !== 'function') {
+    var __jgStFnSafe = {
+      updateWorldbookWith: function(){ return Promise.resolve([]); },
+      getWorldbook: function(){ return Promise.resolve([]); },
+      getCharWorldbookNames: function(){ return { primary: null }; },
+      getLastMessageId: function(){ return Promise.resolve(0); },
+      calculateStoryLogic: function(d){ return d; },
+      getVariables: function(){ return Promise.resolve({}); },
+      replaceVariables: function(v){ return v; },
+    };
+    window.getSTFn = function(name){
+      return Object.prototype.hasOwnProperty.call(__jgStFnSafe, name) ? __jgStFnSafe[name] : undefined;
+    };
+  }
   if (typeof window.getVariables !== 'function') { window.getVariables = function(){ return {}; }; }
   if (typeof window.replaceVariables !== 'function') { window.replaceVariables = function(t){ return t; }; }
 })();</script>`;
