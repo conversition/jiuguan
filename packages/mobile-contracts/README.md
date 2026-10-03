@@ -69,7 +69,7 @@ PC Web、手机 PWA、Android 壳与电脑服务端共用的线协议契约。
 
 - `PublicTurnJob` 只公开任务身份、状态、时间、版本和最终结果引用；不公开 prompt、设备身份、
   Idempotency-Key、Provider 参数或内部 lease。
-- 合法状态迁移由 [`ADR-0003`](../../docs/adr/0003-server-owned-turn-jobs.md) 固定；终态不可改写。
+- 合法状态迁移由 [turn job 契约](src/turn-jobs.ts) 固定；终态不可改写。
 - `requestId` 是第一次成功创建 job 的传输身份。幂等重试可以使用新的 requestId，但必须得到同一 runId。
 - 客户端只能把 job DTO 当作 REST 真值；事件和旧 SSE 流都不能单独决定任务是否完成。
 

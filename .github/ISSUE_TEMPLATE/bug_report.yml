@@ -1,0 +1,95 @@
+name: Bug 报告
+description: 报告可以稳定复现的错误或退化
+title: "[Bug] "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。请勿粘贴 API Key、Cookie、配对码、完整会话、角色卡、世界书或未脱敏日志。
+
+  - type: input
+    id: version
+    attributes:
+      label: Jiuguan 版本
+      description: 例如 v0.1.0、main 提交短 SHA。
+      placeholder: v0.1.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: entry
+    attributes:
+      label: 使用入口
+      options:
+        - 电脑本机网页
+        - 手机 Tailscale 私有网页
+        - 自行构建的 Android APK
+        - CLI / 开发环境
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: 问题模块
+      options:
+        - 启动 / 安装
+        - Provider / 反代
+        - 主对话 / 流式传输
+        - 角色卡 / 世界书 / 预设 / Skill
+        - 记忆 / 剧情索引
+        - Agent / Harness
+        - 手机连接 / 设备认证
+        - APK
+        - 其他
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 最小复现步骤
+      description: 使用合成或匿名内容描述，避免上传私人素材。
+      placeholder: |
+        1. 启动……
+        2. 打开……
+        3. 执行……
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期结果
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际结果
+      description: 如需日志，只粘贴已脱敏且与问题直接相关的最小片段。
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: 环境
+      placeholder: |
+        Windows 版本：
+        Node.js：
+        pnpm：
+        浏览器：
+        Provider 类型（不要提供 Key）：
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: 隐私确认
+      options:
+        - label: 我已确认本 Issue 不包含密钥、凭据、私人会话或受版权保护的用户素材。
+          required: true

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全漏洞
+    url: https://github.com/conversition/jiuguan/security/policy
+    about: 请先阅读安全策略，不要在公开 Issue 中披露漏洞细节或凭据。
+  - name: 安装与使用文档
+    url: https://github.com/conversition/jiuguan/blob/main/docs/%E5%AE%89%E8%A3%85%E4%B8%8E%E4%BD%BF%E7%94%A8.md
+    about: 提交问题前先查看完整安装、手机连接与常见问题说明。

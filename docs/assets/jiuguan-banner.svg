@@ -1,0 +1,91 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="520" viewBox="0 0 1600 520" role="img" aria-labelledby="title desc">
+  <title id="title">Jiuguan 酒馆</title>
+  <desc id="desc">本地优先的可控多 Agent 角色扮演平台</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#090b18"/>
+      <stop offset="0.52" stop-color="#17102f"/>
+      <stop offset="1" stop-color="#071927"/>
+    </linearGradient>
+    <radialGradient id="violetGlow" cx="0.24" cy="0.45" r="0.52">
+      <stop offset="0" stop-color="#8b5cf6" stop-opacity="0.42"/>
+      <stop offset="1" stop-color="#8b5cf6" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="amberGlow" cx="0.78" cy="0.2" r="0.52">
+      <stop offset="0" stop-color="#f59e0b" stop-opacity="0.2"/>
+      <stop offset="1" stop-color="#f59e0b" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="mark" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#c4b5fd"/>
+      <stop offset="0.52" stop-color="#8b5cf6"/>
+      <stop offset="1" stop-color="#38bdf8"/>
+    </linearGradient>
+    <linearGradient id="gold" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#fde68a"/>
+      <stop offset="1" stop-color="#f59e0b"/>
+    </linearGradient>
+    <pattern id="grid" width="42" height="42" patternUnits="userSpaceOnUse">
+      <path d="M42 0H0V42" fill="none" stroke="#c4b5fd" stroke-opacity="0.055"/>
+    </pattern>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="18" stdDeviation="22" flood-color="#000" flood-opacity="0.45"/>
+    </filter>
+    <filter id="softGlow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="8"/>
+    </filter>
+  </defs>
+
+  <rect width="1600" height="520" rx="38" fill="url(#bg)"/>
+  <rect width="1600" height="520" rx="38" fill="url(#violetGlow)"/>
+  <rect width="1600" height="520" rx="38" fill="url(#amberGlow)"/>
+  <rect x="1" y="1" width="1598" height="518" rx="37" fill="none" stroke="#c4b5fd" stroke-opacity="0.22" stroke-width="2"/>
+  <rect width="1600" height="520" rx="38" fill="url(#grid)"/>
+
+  <g opacity="0.55">
+    <circle cx="1435" cy="90" r="5" fill="#fde68a"/>
+    <circle cx="1490" cy="165" r="3" fill="#a78bfa"/>
+    <circle cx="1370" cy="220" r="4" fill="#38bdf8"/>
+    <path d="M1370 220L1435 90L1490 165" fill="none" stroke="#a78bfa" stroke-opacity="0.35"/>
+  </g>
+
+  <g transform="translate(120 72)" filter="url(#shadow)">
+    <rect width="330" height="376" rx="64" fill="#0f1328" fill-opacity="0.9" stroke="#a78bfa" stroke-opacity="0.35" stroke-width="2"/>
+    <path d="M77 286V143C77 93 116 53 165 53s88 40 88 90v143" fill="none" stroke="url(#mark)" stroke-width="24" stroke-linecap="round"/>
+    <path d="M113 286V151c0-29 23-53 52-53s52 24 52 53v135" fill="#151936" stroke="#f8fafc" stroke-opacity="0.78" stroke-width="6"/>
+    <path d="M165 108v178" stroke="#c4b5fd" stroke-opacity="0.35" stroke-width="3"/>
+    <circle cx="192" cy="196" r="7" fill="#fde68a"/>
+    <path d="M64 303h202" stroke="url(#gold)" stroke-width="9" stroke-linecap="round"/>
+
+    <g fill="#38bdf8">
+      <circle cx="45" cy="93" r="9"/>
+      <circle cx="285" cy="98" r="9"/>
+      <circle cx="41" cy="252" r="9"/>
+      <circle cx="289" cy="253" r="9"/>
+    </g>
+    <g fill="none" stroke="#38bdf8" stroke-opacity="0.5" stroke-width="3">
+      <path d="M52 98l49 28"/>
+      <path d="M278 103l-49 28"/>
+      <path d="M49 248l48-31"/>
+      <path d="M281 249l-48-31"/>
+    </g>
+    <circle cx="165" cy="194" r="26" fill="#8b5cf6" fill-opacity="0.18" filter="url(#softGlow)"/>
+  </g>
+
+  <g transform="translate(525 118)">
+    <text x="0" y="92" fill="#f8fafc" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="108" font-weight="800" letter-spacing="7">JIUGUAN</text>
+    <rect x="4" y="125" width="760" height="4" rx="2" fill="url(#gold)" opacity="0.9"/>
+    <text x="2" y="190" fill="#e9d5ff" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="40" font-weight="600">酒馆 · 可控多 Agent 角色扮演平台</text>
+    <text x="3" y="241" fill="#aeb7cf" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="25">本地优先 · 上下文编排 · 私有多端 · 有界自主</text>
+
+    <g transform="translate(2 282)" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="20" font-weight="600">
+      <rect width="176" height="50" rx="25" fill="#8b5cf6" fill-opacity="0.18" stroke="#a78bfa" stroke-opacity="0.6"/>
+      <text x="88" y="32" fill="#ddd6fe" text-anchor="middle">LOCAL FIRST</text>
+
+      <rect x="194" width="190" height="50" rx="25" fill="#0ea5e9" fill-opacity="0.15" stroke="#38bdf8" stroke-opacity="0.55"/>
+      <text x="289" y="32" fill="#bae6fd" text-anchor="middle">FAIL CLOSED</text>
+
+      <rect x="402" width="232" height="50" rx="25" fill="#f59e0b" fill-opacity="0.12" stroke="#fbbf24" stroke-opacity="0.55"/>
+      <text x="518" y="32" fill="#fde68a" text-anchor="middle">USER CONTROLLED</text>
+    </g>
+  </g>
+</svg>
