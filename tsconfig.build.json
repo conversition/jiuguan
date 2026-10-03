@@ -1,0 +1,25 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "dist-runtime",
+    "declaration": false,
+    "declarationMap": false,
+    "jsx": "react-jsx"
+  },
+  "include": [
+    "apps/commandcode-proxy/src/**/*.ts",
+    "apps/server/**/*.ts",
+    "packages/**/src/**/*.ts",
+    "plugins/**/src/**/*.ts",
+    "tools/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "review-package-*/**",
+    "**/dist/**",
+    "dist-runtime",
+    "**/tests/**",
+    "tools/**/verify-*.ts"
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "name": "commandcode-provider",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "First-party PC-only CommandCode Provider for the Jiuguan DSH host",
+  "main": "bundle/index.js",
+  "files": [
+    "bundle/index.js",
+    "package.json",
+    "README.md"
+  ],
+  "jiuguan": {
+    "hostApi": 1,
+    "pcOnly": true
+  },
+  "dsh": {
+    "bundle": {
+      "entry": "bundle/index.js"
+    }
+  },
+  "scripts": {
+    "build": "node build.mjs"
+  }
+}

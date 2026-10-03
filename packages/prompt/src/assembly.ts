@@ -1,0 +1,459 @@
+/**
+ * prompt 包 - 提示词装配管道（v2 07 §3 ① / 04 §4.3）
+ * 输入各层（L0 系统核心 + L1 静态设定 + L2 动态状态 + L3 记忆块 + 对话历史 + 用户输入）
+ * → OpenAI 兼容消息数组 + tools 定义。
+ * 铁律：稳定前缀在前（L0/L1/L2 静态部分），易变内容（记忆/输入）在后，缓存友好。
+ */
+import { createHash } from 'node:crypto';
+import { gameTurnTool } from './turn.ts';
+import {
+  contextModelProfileFromRuntime,
+  resolveModelRuntimeProfile,
+  type ModelRuntimeProfile,
+} from './model-runtime-profile.ts';
+
+export interface Message {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+}
+
+export interface AssembleInput {
+  /** L0 系统核心（稳定前缀，逐字不变） */
+  systemCore: string;
+  /** L1 静态设定（角色卡描述 + 激活世界书条目，平台注入） */
+  staticSettings?: string;
+  /** L2 动态状态（表0-5 紧凑表格 + 推进槽 + 平行事件） */
+  dynamicState?: string;
+  /** L3 记忆召回块（<记忆召回> 注入块，来自记忆服务） */
+  memoryBlock?: string;
+  /**
+   * AM-03：人物关键事实块（来自**合法版本头投影**，按稳定 ID 精确读取）。
+   * 语义上是受保护的**状态输入**：不参与普通历史滑窗裁剪，也不被记忆块裁剪顺位吃掉。
+   * 预算确实放不下时报告冲突（`budgetTrace.conflicts`），不做无上限追加、不静默截断半段 JSON。
+   */
+  characterBlock?: string;
+  /** L3 前置：滚动长期摘要（memory_meta.longterm，远史骨架；放在记忆召回之前） */
+  longTermBlock?: string;
+  /** 对话历史（近 N 轮原文 + 更早滚动摘要） */
+  chatHistory?: Message[];
+  /** 用户本轮输入（已包裹 <最新互动>） */
+  userInput: string;
+  /** 上一轮 game.turn 结果（首轮为空） */
+  lastTurn?: string;
+  /** 注入点：NSFW/NSF 分支模块（默认空） */
+  nsfwModule?: string;
+  /** 预设生效块（启动流程审查 P0：用户选定预设 + 块勾选 → <预设> 注入） */
+  presetBlocks?: string[];
+  /** 文风指令（稳定前缀：底座 + 激活作者风格 + [NSFW] + 世界书风格词条）
+   *  底座位同 session 逐字不变（缓存友好）；nsfw/世界书词条为随 turn 可变尾巴 */
+  styleBlock?: string;
+  /**
+   * P14-02S：已经由 whole-skill admission 冻结的完整 Skill。
+   * 装配器只校验快照并逐字注入；不得重新筛选、截断、摘要或改写正文。
+   */
+  admittedSkills?: readonly ProtectedSkillInput[];
+  /** 是否附加 tools 定义（模式 A）；false 时使用 XML 降级指令 */
+  useTools?: boolean;
+  /** 稳定前缀目标（OpenAI 兼容隐式前缀缓存 ≥1024 tokens 门槛；审查 §4.2） */
+  prefixCacheThreshold?: number;
+  /** VMS 变量值（宏展开用，06 §6） */
+  variableValues?: Record<string, string | number | boolean>;
+  /** UP-07: one final prompt budget across system, context, history, tools and user input. */
+  maxPromptTokens?: number;
+}
+
+export interface PromptBudgetTrace {
+  budgetTokens: number;
+  usedTokens: number;
+  dropped: { id: string; reason: 'over-budget' | 'over-cost' }[];
+  /** 受保护块放不下时的**显式预算冲突**（不静默截断、不隐性超限） */
+  conflicts: { id: string; reason: string; overBy: number }[];
+}
+
+export interface AssembleResult {
+  messages: Message[];
+  tools?: Record<string, unknown>[];
+  /** 稳定前缀长度（缓存断点参考） */
+  stablePrefixTokens: number;
+  promptTokens: number;
+  budgetTrace: PromptBudgetTrace;
+  /** 内部可审计的 Skill 注入事实；不进入 HTTP/SSE 公共协议。 */
+  skillTrace: SkillInjectionTrace;
+}
+
+export interface ProtectedSkillSnapshot {
+  readonly skillId: string;
+  readonly name: string;
+  readonly role: 'style' | 'tactical';
+  readonly version: string;
+  readonly sourceHash: string;
+  readonly bodyHash: string;
+  readonly exactTokens: number;
+  readonly selectionReason: 'explicit' | 'keyword' | 'semantic';
+  readonly explicit: boolean;
+}
+
+export interface ProtectedSkillInput {
+  readonly body: string;
+  readonly snapshot: ProtectedSkillSnapshot;
+}
+
+export interface SkillInjectionTrace {
+  readonly injectionCount: number;
+  readonly exactTokens: number;
+  readonly entries: readonly {
+    readonly skillId: string;
+    readonly version: string;
+    readonly sourceHash: string;
+    readonly bodyHash: string;
+    readonly exactTokens: number;
+  }[];
+}
+
+/** Stable pre-Provider failure for an indivisible protected Skill that cannot fit input budget. */
+export class SkillContextConflictError extends Error {
+  readonly code = 'skill-context-conflict' as const;
+  constructor(readonly overBy: number) {
+    super('skill-context-conflict');
+    this.name = 'SkillContextConflictError';
+  }
+}
+
+/** 粗估 token：中文 1 字 ≈ 1.5 token，英文 1 词 ≈ 1.3 token */
+export function estimateTokens(text: string): number {
+  const cjk = (text.match(/[\u4e00-\u9fff]/g) ?? []).length;
+  const rest = text.length - cjk;
+  return Math.ceil(cjk * 1.5 + rest * 0.4);
+}
+
+function positiveInteger(raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) throw new TypeError('prompt budget environment values must be positive integers');
+  return parsed;
+}
+
+/**
+ * Resolve an input-only budget while preserving final-output capacity. The legacy final-prompt
+ * override may lower this value, but can never expand past modelContext - reservedOutput.
+ */
+export function resolveSafePromptInputBudget(
+  env: Readonly<Record<string, string | undefined>> = process.env,
+  runtimeProfile?: ModelRuntimeProfile,
+): { modelContextTokens: number; reservedOutputTokens: number; inputBudgetTokens: number } {
+  const profile = runtimeProfile ?? resolveModelRuntimeProfile({
+    providerId: env.JG_PROVIDER_ID ?? 'builtin.openai',
+    modelId: env.JG_MODEL ?? 'unregistered-model',
+    env,
+  });
+  const contextProfile = contextModelProfileFromRuntime(profile, env);
+  const modelContextTokens = contextProfile.modelContextTokens;
+  const reservedOutputTokens = contextProfile.outputReserveTokens;
+  const safeMaximum = modelContextTokens - reservedOutputTokens;
+  const legacyOverride = env.JG_FINAL_PROMPT_BUDGET_TOKENS === undefined
+    || env.JG_FINAL_PROMPT_BUDGET_TOKENS.trim() === ''
+    ? safeMaximum
+    : positiveInteger(env.JG_FINAL_PROMPT_BUDGET_TOKENS, safeMaximum);
+  return {
+    modelContextTokens,
+    reservedOutputTokens,
+    inputBudgetTokens: Math.min(safeMaximum, legacyOverride),
+  };
+}
+
+function renderProtectedSkills(skills: readonly ProtectedSkillInput[] | undefined): {
+  content: string;
+  trace: SkillInjectionTrace;
+} {
+  const entries: SkillInjectionTrace['entries'][number][] = [];
+  const blocks: string[] = [];
+  for (const [index, skill] of (skills ?? []).entries()) {
+    if (!skill || typeof skill.body !== 'string' || skill.body.length === 0) {
+      throw new TypeError(`admittedSkills[${index}] has no complete body`);
+    }
+    const { snapshot } = skill;
+    if (!snapshot || snapshot.role !== 'tactical') {
+      throw new TypeError(`admittedSkills[${index}] must be a tactical Skill`);
+    }
+    const bodyHash = `sha256:${createHash('sha256').update(skill.body, 'utf8').digest('hex')}`;
+    if (snapshot.bodyHash !== bodyHash) {
+      throw new TypeError(`admittedSkills[${index}] bodyHash mismatch`);
+    }
+    const exactTokens = estimateTokens(skill.body);
+    if (snapshot.exactTokens !== exactTokens) {
+      throw new TypeError(`admittedSkills[${index}] exactTokens mismatch`);
+    }
+    blocks.push(`[${snapshot.name}|${snapshot.selectionReason}]\n${skill.body}`);
+    entries.push({
+      skillId: snapshot.skillId,
+      version: snapshot.version,
+      sourceHash: snapshot.sourceHash,
+      bodyHash: snapshot.bodyHash,
+      exactTokens,
+    });
+  }
+  return {
+    content: blocks.length > 0 ? `<Skill 指令>\n${blocks.join('\n\n')}\n</Skill 指令>` : '',
+    trace: Object.freeze({
+      injectionCount: entries.length,
+      exactTokens: entries.reduce((sum, entry) => sum + entry.exactTokens, 0),
+      entries: Object.freeze(entries),
+    }),
+  };
+}
+
+/** Exact estimator for the rendered protected Skill system block, including its stable wrapper. */
+export function estimateProtectedSkillsTokens(skills: readonly ProtectedSkillInput[] | undefined): number {
+  const rendered = renderProtectedSkills(skills);
+  return rendered.content ? estimateTokens(rendered.content) : 0;
+}
+
+/** Token estimate for the exact final-turn tool schema used by assembleTurn(). */
+export function estimateTurnToolSchemaTokens(useTools = true): number {
+  return useTools ? estimateTokens(JSON.stringify([gameTurnTool()])) : 0;
+}
+
+/** 宏展开：替换 {{var:key}} / {{var:ns:key}} / {{getvar::key}} / {{getvar::key::default}} 为变量值（VMS 集成点，06 §6）
+ * 查找策略：完整键 > 短名（key 尾部段）> 后缀匹配（:name 结尾）
+ * 键放宽：支持中文与点路径（引擎变量如 {{var:主角.核心状态.魔力值.当前}}），见 v1.1 引擎桥接 */
+export function expandVariables(text: string, values: Record<string, string | number | boolean>): string {
+  const lookup = (key: string): string | number | boolean | undefined => {
+    if (key in values) return values[key];
+    const short = key.split(':').pop() ?? key;
+    for (const [k, v] of Object.entries(values)) {
+      if (k === short || k.endsWith(`:${short}`)) return v;
+    }
+    return undefined;
+  };
+  return text
+    .replace(/\{\{var:([^}\s]+?)\}\}/g, (_m, key: string) => {
+      const v = lookup(key);
+      return v === undefined ? '' : String(v);
+    })
+    .replace(/\{\{getvar::([^}]+?)(?:::(.*?))?\}\}/g, (_m, key: string, def: string) => {
+      const v = lookup(key);
+      return v === undefined ? (def ?? '') : String(v);
+    });
+}
+
+function totalMessageTokens(messages: Message[], tools?: Record<string, unknown>[]): number {
+  return messages.reduce((sum, m) => sum + estimateTokens(m.content), 0)
+    + (tools ? estimateTokens(JSON.stringify(tools)) : 0);
+}
+
+function applyFinalPromptBudget(messages: Message[], tools: Record<string, unknown>[] | undefined, maxPromptTokens?: number, protectedIds: string[] = []): PromptBudgetTrace {
+  const budgetTokens = maxPromptTokens ?? Number(process.env.JG_FINAL_PROMPT_BUDGET_TOKENS ?? 0);
+  if (!budgetTokens || budgetTokens <= 0) {
+    return { budgetTokens: 0, usedTokens: totalMessageTokens(messages, tools), dropped: [], conflicts: [] };
+  }
+  const dropped: PromptBudgetTrace['dropped'] = [];
+  const trimUserBlock = (label: string, minKeep = 120) => {
+    // 受保护块不参与裁剪：人物关键事实是状态输入，先裁无关历史和低优先级细节
+    if (protectedIds.includes(label)) return false;
+    const last = messages[messages.length - 1];
+    if (!last || last.role !== 'user') return false;
+    const start = last.content.indexOf(`<${label}`);
+    if (start < 0) return false;
+    const endTag = `</${label}>`;
+    const end = last.content.indexOf(endTag, start);
+    if (end < 0) return false;
+    const fullEnd = end + endTag.length;
+    const block = last.content.slice(start, fullEnd);
+    if (estimateTokens(block) <= minKeep) return false;
+    const replacement = shrinkInlineBlock(block, minKeep);
+    last.content = last.content.slice(0, start) + replacement + last.content.slice(fullEnd);
+    dropped.push({ id: label, reason: 'over-cost' });
+    return true;
+  };
+  const dropOldestHistory = () => {
+    const idx = messages.findIndex((m, i) => i > 0 && i < messages.length - 1 && (m.role === 'user' || m.role === 'assistant'));
+    if (idx < 0) return false;
+    messages.splice(idx, 1);
+    dropped.push({ id: 'chatHistory', reason: 'over-budget' });
+    return true;
+  };
+
+  const reducers = [
+    () => trimUserBlock('上一轮编排', 120),
+    () => trimUserBlock('记忆召回', 180),
+    () => trimUserBlock('长期摘要', 160),
+    dropOldestHistory,
+  ];
+  let guard = 0;
+  while (totalMessageTokens(messages, tools) > budgetTokens && guard < 512) {
+    const changed = reducers.some((fn) => fn());
+    if (!changed) break;
+    guard++;
+  }
+  // 受保护块仍未放下 → 明确报预算冲突（不追加、不截断）
+  const used = totalMessageTokens(messages, tools);
+  const conflicts: PromptBudgetTrace['conflicts'] = [];
+  if (used > budgetTokens && protectedIds.length > 0) {
+    for (const id of protectedIds) {
+      conflicts.push({
+        id,
+        reason: '受保护输入与最低必需上下文合计超出预算：需提高预算或减少必需块',
+        overBy: used - budgetTokens,
+      });
+    }
+  }
+  return { budgetTokens, usedTokens: used, dropped, conflicts };
+}
+
+function shrinkInlineBlock(text: string, budget: number): string {
+  if (estimateTokens(text) <= budget) return text;
+  const marker = '\n...已按最终预算裁剪\n';
+  // 保留开标签与闭标签、只裁中间正文：闭标签被截掉会破坏标签配对，
+  // 下游依赖 <记忆召回>/<长期摘要>/<上一轮编排> 等标签的解析与展示会静默失效。
+  const openMatch = /^<([^\s>/]+)[^>]*>/.exec(text);
+  const head = openMatch ? openMatch[0] : '';
+  const closeTag = openMatch ? `</${openMatch[1]}>` : '';
+  const tail = closeTag && text.endsWith(closeTag) ? closeTag : '';
+  const innerStart = head.length;
+  const innerEnd = text.length - tail.length;
+  if (innerEnd <= innerStart) return text;
+  let end = innerEnd;
+  while (end > innerStart) {
+    const candidate = head + text.slice(innerStart, end) + marker + tail;
+    if (estimateTokens(candidate) <= budget) return candidate;
+    end--;
+  }
+  return head + marker + tail;
+}
+
+/** 组装本轮请求 */
+export function assembleTurn(input: AssembleInput): AssembleResult {
+  const messages: Message[] = [];
+  const threshold = input.prefixCacheThreshold ?? 1024;
+  const protectedSkills = renderProtectedSkills(input.admittedSkills);
+
+  // 1. L0 系统核心 + NSFW 分支 + 稳定静态层（全部进 system，稳定前缀）
+  let system = input.systemCore;
+  if (input.nsfwModule) system += `\n\n${input.nsfwModule}`;
+  if (input.staticSettings) system += `\n\n<静态设定>\n${input.staticSettings}\n</静态设定>`;
+  if (input.presetBlocks && input.presetBlocks.length > 0) {
+    system += `\n\n<预设>\n${input.presetBlocks.join('\n\n')}\n</预设>`;
+  }
+  // 文风指令：稳定前缀稳定槽（底座 + 激活文风逐字不变；nsfw/世界书词条为可变尾巴）
+  if (input.styleBlock) system += `\n\n<文风指令>\n${input.styleBlock}\n</文风指令>`;
+  if (input.dynamicState) system += `\n\n<动态状态>\n${input.dynamicState}\n</动态状态>`;
+  // 2. 前缀缓存填充：稳定前缀不足阈值时循环追加固定平台声明段（每段逐字不变，审查 §4.2 门槛）
+  // 修复 §5.3：去掉硬上限（仅以防卫上限 256 防止异常阈值死循环，模运算循环段可无限扩展）
+  let guard = 0;
+  while (estimateTokens(system) < threshold && guard < 256) {
+    system += `\n\n${PLATFORM_PADDING_SEGMENTS[guard % PLATFORM_PADDING_SEGMENTS.length]}`;
+    guard++;
+  }
+  messages.push({ role: 'system', content: system });
+
+  // Skill 是独立的受保护 system 块：不伪装成用户输入，也不污染第一条稳定缓存前缀。
+  if (protectedSkills.content) messages.push({ role: 'system', content: protectedSkills.content });
+
+  // 2. 对话历史（user/assistant 交替）
+  if (input.chatHistory) messages.push(...input.chatHistory);
+
+  // 3. 用户输入（长期摘要 + 记忆块 + 上轮结果 + 输入，均为易变尾部）；宏展开（VMS 变量）
+  let userContent = '';
+  if (input.longTermBlock) userContent += `${input.longTermBlock}\n\n`;
+  // 人物事实块在记忆召回之前：语义上是"受保护的状态输入"，但**不越过系统指令优先级**
+  // （它仍在 user 内容里被明确标注为数据来源），也不占用 <记忆召回> 的裁剪顺位。
+  if (input.characterBlock) userContent += `${input.characterBlock}\n\n`;
+  if (input.memoryBlock) userContent += `${input.memoryBlock}\n\n`;
+  if (input.lastTurn) userContent += `<上一轮编排>\n${input.lastTurn}\n</上一轮编排>\n\n`;
+  const inputExpanded = input.variableValues ? expandVariables(input.userInput, input.variableValues) : input.userInput;
+  if (input.useTools) {
+    userContent += `${inputExpanded}\n\n请调用 game.turn 工具完成本轮回合。`;
+  } else {
+    // XML 降级：输出契约指令（对齐 L4 降级模板）
+    userContent += `${inputExpanded}\n\n严格按系统提示中的输出契约，输出单一 <plot> XML 块。`;
+  }
+  messages.push({ role: 'user', content: userContent });
+
+  const stablePrefixTokens = estimateTokens(system);
+  const tools = input.useTools ? [gameTurnTool()] : undefined;
+  const protectedIds = [
+    ...(input.characterBlock ? ['人物事实'] : []),
+    ...(protectedSkills.content ? ['Skill 指令'] : []),
+  ];
+  const budgetTrace = applyFinalPromptBudget(messages, tools, input.maxPromptTokens, protectedIds);
+  const skillConflict = budgetTrace.conflicts.find((conflict) => conflict.id === 'Skill 指令');
+  if (skillConflict) throw new SkillContextConflictError(skillConflict.overBy);
+  return {
+    messages,
+    tools,
+    stablePrefixTokens,
+    promptTokens: budgetTrace.usedTokens,
+    budgetTrace,
+    skillTrace: protectedSkills.trace,
+  };
+}
+
+/** L0 稳定前缀最小模板（可被平台资源文件覆盖） */
+export const DEFAULT_SYSTEM_CORE = `# 身份
+你是一个专业的沉浸式剧情创作引擎，名为【剧本引擎】。
+你的职责：基于角色卡、世界设定、记忆状态与用户输入，执行"分析 → 规划 → 创作"的完整流程。
+
+# 最高法则
+1. 【输出即契约】：每轮输出必须严格符合输出模式（tools 或 XML 契约），严禁契约外文字。
+2. 【记忆即事实】：<记忆召回> 条目是剧情唯一事实来源，严禁与召回条目矛盾或编造。
+3. 【认知隔离】：角色只能知道其经历可知的信息，严禁上帝视角泄露。
+4. 【因果自洽】：正文、编排、记忆更新三者必须因果一致。
+5. 【情绪基调】：允许冲突、伤痛与欲望，禁止无意义绝望崩溃与恶意虐待。
+
+# 输入结构（平台按序装配）
+<系统核心> ← 本层 ｜【NSFW/NSF 分支注入点】｜<静态设定> ｜<动态状态> ｜<记忆召回> ｜<对话历史> ｜<本轮输入>
+
+# 思维链
+先理解用户意图 → 核对记忆 → 规划 → 创作。禁止跳过记忆核对直接创作。
+
+# Token 预算（平台执行）
+L0≤5% / L1≤20% / L2≤10% / L3≤45% / L4≤10% / 预留输出≥10%`;
+
+/** 平台固定声明段（稳定前缀填充：与回合无关、逐字不变、内容有用；用于达到隐式前缀缓存 ≥1024 tok 门槛） */
+const PLATFORM_PADDING_SEGMENTS: string[] = [
+`# 平台服务声明（稳定前缀，勿改动）
+
+本系统由本地优先的剧本游玩平台驱动，平台与模型的分工如下：
+
+## 平台负责（确定性，100% 可测）
+- 记忆检索：混合检索（全文索引 BM25 + 向量余弦 + 时效加权 + AM 码直查），结果全部来自数据库行
+- 记忆写入：AM 码由平台自增分配（全局唯一），双表一致性由代码强校验
+- 契约校验：输出模式、数值范围（推进槽 0-100、倒计时 ≤30 分钟）、格式与泄漏启发式
+- 上下文装配：稳定前缀在前、易变内容在后；Token 预算由平台按层截断
+- 世界书激活：关键词/正则触发器 + 概率门 + 深度扫描
+- 错误输出召回：契约失败时注入错误报告并重试（≤2 次）
+
+## 模型负责（涌现，不可替代）
+- 剧情规划：宏观蓝图、关键事件、推进槽增量、平行事件、下轮预见（委员会多视角推理）
+- 记忆增量内容：本轮的 delta_summary（≤300 字）只描述最终正文已经向玩家揭示的变化；状态变更、新事件只给内容，不给码
+- 分支种子：随同本轮正文给出 3–4 个互不重复、玩家此刻可直接执行的动作候选
+- 正文创作：三模式（扩写/转述/直接创作）、文风控制、情感基调、NSFW 导演
+
+## 认知隔离
+角色只能知晓其经历可知的信息（认知边界 knows/unknowns）；严禁上帝视角。
+
+## 输出边界
+- 顶层字段顺序固定为 plan → memory_delta → story_index_seed → prose；prose 必须是最后一个字段
+- delta_summary 只能复述最终正文已经向玩家揭示的变化，禁止写内部 plan、尚未发生的结果或 NPC 私有知识
+- story_index_seed.branches 只能写玩家基于当前输入与最终正文可立即采取的动作；禁止替玩家决定结果，禁止泄露内部 plan、未来事实或 NPC 私有知识
+
+## 输出质量
+- 正文不重复已知事实、不解释已展示内容、信任读者
+- 禁八股：禁"突然/一抹/弧度/不容置疑"等 AI 痕迹；禁数字"三"式清单化表达
+- 对白口语化、有信息量；措辞、断句、称呼、自称的差异塑造人物
+
+本声明为稳定前缀的组成部分，与任何单回合内容无关，不得删除或改写。`,
+`# 记忆召回协议（稳定前缀，勿改动）
+
+<记忆召回> 块是本轮剧情的事实来源，遵循以下协议：
+1. 条目格式：[AM码|类别|得分|来源] 内容摘要；低置信条目标注 [存疑]
+2. 事实唯一性：正文与规划必须与召回条目一致，严禁编造召回中不存在的关键事实
+3. 来源标注：score 为归一化融合得分（BM25 确定性优先），source 标记命中通道
+4. 未命中时：块内为"（本轮无高置信记忆命中）"，此时以角色卡与对话历史为准
+
+## 写环协议（平台执行）
+- 每轮增量摘要 ≤300 字，只记录最终正文已向玩家揭示的变化（时间/角色经历/物品技能/任务进度）
+- 内部规划、未来结果、未向玩家揭示的 NPC 私有知识不得进入增量摘要
+- 静态不变信息不重复写入
+- 章节收束时触发滚动摘要压缩（≤500 字/章）`,
+];

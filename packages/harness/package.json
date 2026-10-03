@@ -1,0 +1,10 @@
+{
+  "name": "@jiuguan/harness",
+  "private": true,
+  "version": "0.1.0",
+  "description": "P13 有界 Harness 核心：硬预算、注入式依赖、mock/replay 与服务端白名单工具；客户端不得导入。",
+  "type": "module",
+  "scripts": {
+    "verify": "node --experimental-strip-types --experimental-transform-types tests/verify-harness.ts && node --experimental-strip-types --experimental-transform-types tests/verify-context-compiler.ts && node --experimental-strip-types --experimental-transform-types tests/verify-p14-replay-evidence.ts && node --experimental-strip-types --experimental-transform-types tests/verify-p14-lane-evaluation.ts"
+  }
+}

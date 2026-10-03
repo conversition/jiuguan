@@ -1,0 +1,20 @@
+{
+  "name": "@jiuguan/prompt",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./turn": "./dist/turn.js",
+    "./assembly": "./dist/assembly.js",
+    "./context-plan": "./dist/context-plan.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "zod": "^4.4.3"
+  }
+}

@@ -1,0 +1,54 @@
+# Dependencies and build output
+/node_modules/
+**/node_modules/
+/dist/
+/dist-*/
+**/dist/
+/.pnpm-store/
+*.apk
+*.aab
+*.zip
+*.rar
+
+# Local configuration and credentials
+/.env
+/.env.*
+!/.env.example
+**/.env.local
+**/config.json
+!**/config.example.json
+**/local.properties
+**/keystore.properties
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+
+# User content and runtime state
+/data/
+/.workbuddy/
+/.codex/
+/.agents/
+**/runtime-data/
+**/captured-requests/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.log
+/coverage/
+
+# Generated first-party plugin bundle (source remains tracked)
+/plugins/*/bundle/
+
+# Local review/export packages
+/review-package-*/
+/review-package-*.zip
+
+# OS/editor files
+Thumbs.db
+.DS_Store
+.idea/
+.vscode/

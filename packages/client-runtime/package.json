@@ -1,0 +1,34 @@
+{
+  "name": "@jiuguan/client-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Platform-neutral Jiuguan API client runtime",
+  "license": "MIT",
+  "sideEffects": false,
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./endpoint": "./dist/endpoint.js",
+    "./errors": "./dist/errors.js",
+    "./capability-handshake": "./dist/capability-handshake.js",
+    "./auth-transport": "./dist/auth-transport.js",
+    "./api-client": "./dist/api-client.js",
+    "./url-resolver": "./dist/url-resolver.js",
+    "./storage-namespace": "./dist/storage-namespace.js",
+    "./protocol-access": "./dist/protocol-access.js",
+    "./asset-resource": "./dist/asset-resource.js",
+    "./client-profile": "./dist/client-profile.js",
+    "./native-asset-download": "./dist/native-asset-download.js",
+    "./event-stream": "./dist/event-stream.js",
+    "./job-poller": "./dist/job-poller.js",
+    "./revision-client": "./dist/revision-client.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@jiuguan/mobile-contracts": "workspace:*"
+  }
+}

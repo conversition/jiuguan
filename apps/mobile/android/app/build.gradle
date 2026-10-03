@@ -1,0 +1,95 @@
+apply plugin: 'com.android.application'
+
+// P10：签名配置只在本地 keystore.properties 提供时启用；该文件绝不入库（.gitignore）。
+// release 缺签名材料必须失败，绝不回退 debug 身份。
+def keystoreProperties = new Properties()
+def keystorePropertiesFile = rootProject.file('keystore.properties')
+def pinnedEndpoint = System.getenv('JG_PINNED_ENDPOINT') ?: ''
+def capacitorAppOrigin = System.getenv('JG_CAPACITOR_APP_ORIGIN') ?: 'https://localhost'
+def appVersion = System.getenv('JG_APP_VERSION') ?: '0.0.0-invalid'
+def appVersionCodeText = System.getenv('JG_VERSION_CODE') ?: '0'
+def appVersionCode = appVersionCodeText ==~ /^[1-9][0-9]{0,9}$/ ? appVersionCodeText.toInteger() : 0
+if (keystorePropertiesFile.exists()) {
+    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+}
+
+android {
+    namespace "com.jiuguan.app"
+    compileSdk rootProject.ext.compileSdkVersion
+    defaultConfig {
+        // 基准 applicationId 是 release 身份；debug buildType 追加 .dev 后缀实现双身份。
+        applicationId "com.jiuguan.app"
+        minSdkVersion rootProject.ext.minSdkVersion
+        targetSdkVersion rootProject.ext.targetSdkVersion
+        versionCode appVersionCode
+        versionName appVersion
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        buildConfigField "String", "JG_PINNED_ENDPOINT", '"' + pinnedEndpoint.replace('"', '\\"') + '"'
+        buildConfigField "String", "JG_CAPACITOR_APP_ORIGIN", '"' + capacitorAppOrigin.replace('"', '\\"') + '"'
+        aaptOptions {
+             // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
+             // Default: https://android.googlesource.com/platform/frameworks/base/+/282e181b58cf72b6ca770dc7ca5f91f135444502/tools/aapt/AaptAssets.cpp#61
+            ignoreAssetsPattern '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
+        }
+    }
+    signingConfigs {
+        if (keystorePropertiesFile.exists()) {
+            release {
+                storeFile rootProject.file(keystoreProperties['storeFile'])
+                storePassword keystoreProperties['storePassword']
+                keyAlias keystoreProperties['keyAlias']
+                keyPassword keystoreProperties['keyPassword']
+            }
+        }
+    }
+    buildTypes {
+        debug {
+            applicationIdSuffix ".dev"
+            resValue "string", "app_name", "酒馆提示词Agent DEV"
+            resValue "string", "title_activity_main", "酒馆提示词Agent DEV"
+            debuggable true
+        }
+        release {
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+            if (keystorePropertiesFile.exists()) {
+                signingConfig signingConfigs.release
+            }
+            debuggable false
+        }
+    }
+    buildFeatures { buildConfig true }
+}
+
+def releaseRequested = gradle.startParameter.taskNames.any { it.toLowerCase().contains('release') }
+if (releaseRequested && !keystorePropertiesFile.exists()) {
+    throw new GradleException('release 构建缺少 android/keystore.properties；拒绝回退 debug 签名')
+}
+if (gradle.startParameter.taskNames.any { it.toLowerCase().contains('assemble') } && appVersion == '0.0.0-invalid') {
+    throw new GradleException('构建缺少 JG_APP_VERSION；拒绝生成版本身份不明确的 APK')
+}
+if (gradle.startParameter.taskNames.any { it.toLowerCase().contains('assemble') } && appVersionCode <= 0) {
+    throw new GradleException('构建缺少合法 JG_VERSION_CODE；拒绝生成不可单调升级的 APK')
+}
+
+repositories {
+    flatDir{
+        dirs '../capacitor-cordova-android-plugins/src/main/libs', 'libs'
+    }
+}
+
+dependencies {
+    implementation fileTree(include: ['*.jar'], dir: 'libs')
+    implementation "androidx.appcompat:appcompat:$androidxAppCompatVersion"
+    implementation "androidx.coordinatorlayout:coordinatorlayout:$androidxCoordinatorLayoutVersion"
+    implementation "androidx.core:core-splashscreen:$coreSplashScreenVersion"
+    implementation "androidx.webkit:webkit:$androidxWebkitVersion"
+    implementation project(':capacitor-android')
+    testImplementation "junit:junit:$junitVersion"
+    androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
+    androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
+    implementation project(':capacitor-cordova-android-plugins')
+}
+
+apply from: 'capacitor.build.gradle'

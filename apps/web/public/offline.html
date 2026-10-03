@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#0f1115" />
+    <title>酒馆暂时离线</title>
+    <style>
+      :root { color-scheme: dark; font-family: system-ui, "PingFang SC", sans-serif; }
+      body { margin: 0; min-height: 100dvh; display: grid; place-items: center; background: #0f1115; color: #e6e6e6; }
+      main { width: min(32rem, calc(100% - 2rem)); padding: 1.5rem; border: 1px solid #2a3348; border-radius: 1rem; background: #161a24; }
+      p { color: #cfd6e6; line-height: 1.7; }
+      button { min-height: 44px; padding: .65rem 1rem; border: 0; border-radius: .6rem; background: #2b5bb8; color: white; font: inherit; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>电脑端酒馆当前不可达</h1>
+      <p>请确认电脑端酒馆和私有连接均已启动，然后重试。离线页不会保存或展示会话、资产与认证数据。</p>
+      <button type="button" onclick="location.reload()">重新连接</button>
+    </main>
+  </body>
+</html>

@@ -1,0 +1,9 @@
+{
+  "name": "@jiuguan/commandcode-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "PC-only loopback CommandCode standalone fallback adapter",
+  "sideEffects": false,
+  "scripts": {}
+}

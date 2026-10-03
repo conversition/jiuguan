@@ -1,0 +1,11 @@
+packages:
+  - packages/*
+  - tools/*
+  - apps/*
+  - plugins/*
+allowBuilds:
+  esbuild: true
+  onnxruntime-node: true
+  protobufjs: true
+  sharp: true
+# 使用 pnpm 默认全局 store，避免跨机器固定路径导致安装失败。

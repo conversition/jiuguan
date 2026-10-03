@@ -1,0 +1,23 @@
+{
+  "name": "@jiuguan/mobile-shell",
+  "private": true,
+  "version": "0.1.0",
+  "description": "P10：Capacitor Android 薄壳。主 WebView 只加载 bundled local origin；endpoint 只用于 API transport。",
+  "type": "module",
+  "scripts": {
+    "verify": "node --experimental-strip-types --experimental-transform-types tests/verify-p10-shell.ts && node --experimental-strip-types --experimental-transform-types tests/verify-p10-android.ts && node --experimental-strip-types --experimental-transform-types tests/verify-p10-bridge.ts && node --experimental-strip-types --experimental-transform-types tests/verify-p10-cleanup.ts && node --experimental-strip-types --experimental-transform-types tests/verify-p10-ui.ts && node --experimental-strip-types --experimental-transform-types tests/verify-p10-entry.ts && node --experimental-strip-types --experimental-transform-types tests/verify-p10-hardening.ts && node --experimental-strip-types --experimental-transform-types tests/verify-p10-native-security.ts",
+    "sync:www": "node --experimental-strip-types --experimental-transform-types scripts/prepare-www.ts",
+    "cap:sync": "pnpm run sync:www && pnpm exec cap sync android",
+    "p10:verify": "node --experimental-strip-types --experimental-transform-types scripts/verify-p10-acceptance.ts",
+    "p10:verify:release": "node --experimental-strip-types --experimental-transform-types scripts/verify-p10-acceptance.ts --release-only",
+    "p10:verify:device": "node --experimental-strip-types --experimental-transform-types scripts/verify-p10-acceptance.ts --device-only"
+  },
+  "dependencies": {
+    "@capacitor/android": "6.2.2",
+    "@capacitor/core": "6.2.2"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "6.2.2",
+    "tslib": "2.8.1"
+  }
+}

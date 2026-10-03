@@ -1,0 +1,21 @@
+{
+  "host": "127.0.0.1",
+  "port": 3050,
+  "maxBodyMiB": 8,
+  "maxInflight": 8,
+  "keepAliveTimeoutMs": 65000,
+  "deviceProjectDir": "C:\\jiuguan\\commandcode-workspace",
+  "cliMode": "agent",
+  "cliSessionMode": "interactive",
+  "emptySystemPlaceholder": true,
+  "zdr": false,
+  "useProviderModels": true,
+  "modelRefreshIntervalMs": 300000,
+  "modelRequestTimeoutMs": 10000,
+  "initializationRequestTimeoutMs": 15000,
+  "streamIdleTimeoutMs": 300000,
+  "nonStreamIdleTimeoutMs": 90000,
+  "proxyConnectTimeoutMs": 15000,
+  "maxNdjsonBufferedChars": 8388608,
+  "upstreamProxy": ""
+}

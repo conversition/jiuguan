@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">酒馆提示词Agent</string>
+    <string name="title_activity_main">酒馆提示词Agent</string>
+    <string name="package_name">com.jiuguan.app.dev</string>
+    <string name="custom_url_scheme">com.jiuguan.app.dev</string>
+</resources>

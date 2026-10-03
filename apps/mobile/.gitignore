@@ -1,0 +1,10 @@
+# 构建产物
+www/
+android/.gradle/
+android/app/build/
+android/build/
+android/local.properties
+android/.idea/
+android/capacitor-cordova-android-plugins/
+*.keystore
+keystore.properties

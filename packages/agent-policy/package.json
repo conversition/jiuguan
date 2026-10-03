@@ -1,0 +1,37 @@
+{
+  "name": "@jiuguan/agent-policy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Deterministic, privacy-safe planning contracts for Jiuguan agents",
+  "license": "MIT",
+  "sideEffects": false,
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./query-plan": "./dist/query-plan.js",
+    "./policy-router": "./dist/policy-router.js",
+    "./skill-admission": "./dist/skill-admission.js",
+    "./admission": "./dist/admission.js",
+    "./maintenance-admission": "./dist/maintenance-admission.js",
+    "./branch-preference": "./dist/branch-preference.js",
+    "./prompt-preference": "./dist/prompt-preference.js",
+    "./style-evidence": "./dist/style-evidence.js",
+    "./learning-hydration": "./dist/learning-hydration.js",
+    "./style-compiler": "./dist/style-compiler.js",
+    "./style-evaluator": "./dist/style-evaluator.js",
+    "./arc-projection": "./dist/arc-projection.js",
+    "./npc-evidence": "./dist/npc-evidence.js",
+    "./domain-projection-contract": "./dist/domain-projection-contract.js",
+    "./director-critic-shadow": "./dist/director-critic-shadow.js",
+    "./director-prelude": "./dist/director-prelude.js",
+    "./precommit-critic": "./dist/precommit-critic.js",
+    "./budget-profile": "./dist/budget-profile.js",
+    "./worldbook-conflict-evidence": "./dist/worldbook-conflict-evidence.js",
+    "./worldbook-repair-proposal": "./dist/worldbook-repair-proposal.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  }
+}

@@ -1,0 +1,17 @@
+* text=auto
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.gif binary
+*.apk binary
+*.aab binary
+
+# Never include local release artifacts in source archives.
+/.workbuddy/ export-ignore
+/data/ export-ignore
+/node_modules/ export-ignore
+/dist/ export-ignore
+/dist-*/ export-ignore

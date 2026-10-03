@@ -1,0 +1,21 @@
+{
+  "name": "@jiuguan/server-auth",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Node-only authentication cryptography and persistence boundary for Jiuguan",
+  "license": "MIT",
+  "sideEffects": false,
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "engines": {
+    "node": ">=22.7.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {}
+}

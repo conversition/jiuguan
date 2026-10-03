@@ -1,0 +1,24 @@
+{
+  "name": "@jiuguan/mobile-contracts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./version": "./dist/version.js",
+    "./meta": "./dist/meta.js",
+    "./events": "./dist/events.js",
+    "./http": "./dist/http.js",
+    "./turn-jobs": "./dist/turn-jobs.js",
+    "./maintenance-jobs": "./dist/maintenance-jobs.js",
+    "./auth": "./dist/auth.js",
+    "./files": "./dist/files.js",
+    "./platform": "./dist/platform.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {}
+}
