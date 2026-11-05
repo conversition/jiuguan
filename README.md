@@ -28,7 +28,7 @@
 </p>
 
 > [!IMPORTANT]
-> 这是 `v0.1.0` 公开预览版。仓库不附带角色卡、世界书、预设、Skill、会话、学习记录、
+> 这是 `v0.2.0` 公开预览版。仓库不附带角色卡、世界书、预设、Skill、会话、学习记录、
 > API Key 或任何个人运行数据；首次启动看到空资产库是正常现象。
 
 ## ✨ 它是什么
@@ -42,7 +42,7 @@ Jiuguan 是一个 **Windows 优先、本地优先** 的角色扮演对话宿主�
 
 ### 与常见酒馆工作流的侧重点
 
-| 维度 | 常见前端式酒馆 | Jiuguan v0.1 |
+| 维度 | 常见前端式酒馆 | Jiuguan v0.2 |
 |---|---|---|
 | 主要定位 | 丰富的聊天前端与扩展生态 | 本地对话宿主与 Agent 编排运行时 |
 | 资产工作流 | 角色卡、世界书、预设 | 提供对应的导入、编辑和会话装配基础设施 |
@@ -207,8 +207,8 @@ tools/
 
 ## 📦 版本与下载
 
-- 最新版本：[Jiuguan v0.1.0 · 首个公开清洁版](https://github.com/conversition/jiuguan/releases/tag/v0.1.0)
-- 独立源码包：[jiuguan-v0.1.0-clean-source.zip](https://github.com/conversition/jiuguan/releases/download/v0.1.0/jiuguan-v0.1.0-clean-source.zip)
+- 最新版本：[Jiuguan v0.2.0 · 会话内核与 Skill 治理快照](https://github.com/conversition/jiuguan/releases/tag/v0.2.0)
+- 独立源码包：[jiuguan-v0.2.0-clean-source.zip](https://github.com/conversition/jiuguan/releases/download/v0.2.0/jiuguan-v0.2.0-clean-source.zip)
 - 清洁版说明：[CLEAN_RELEASE_MANIFEST.md](CLEAN_RELEASE_MANIFEST.md)
 
 每次公开提交或重新打包前运行：
@@ -219,7 +219,7 @@ pnpm public:verify
 
 该门禁会拒绝运行数据、凭据、个人绝对路径、私有 tailnet 主机、生成插件 bundle 和常见密钥格式。
 
-## ⚠️ v0.1 已知边界
+## ⚠️ v0.2 已知边界
 
 - 这是 Windows-first 公开预览版，不是面向所有系统的一键安装器。
 - 不提供内置角色卡、世界书、预设或 Skill 示例；文风与流程文本表在公开版中为空，

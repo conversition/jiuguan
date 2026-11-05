@@ -17,7 +17,7 @@ front-end ecosystem; Jiuguan currently focuses on server-side state, context orc
 controlled autonomy and one source of truth shared by PC and phone.
 
 > [!IMPORTANT]
-> This public `v0.1.0` repository contains no user sessions, character cards, worldbooks, presets,
+> This public `v0.2.0` repository contains no user sessions, character cards, worldbooks, presets,
 > learned Skills, installed plugins, API keys, device credentials, private hostnames or signing
 > material. Empty asset lists on first launch are expected.
 
@@ -36,7 +36,7 @@ controlled autonomy and one source of truth shared by PC and phone.
 The normal chat path works after the user configures a Provider. Experimental autonomous lanes
 start fail-closed:
 
-| Capability | v0.1 default |
+| Capability | v0.2 default |
 |---|---|
 | Interactive Agent / bounded tool loop | Off |
 | Preference and Style model learning | Off |
@@ -88,7 +88,7 @@ user-selected remote model runs offline.
 
 ## Mobile access
 
-The recommended v0.1 mobile path is a browser over Tailscale private HTTPS. Join the PC and phone
+The recommended v0.2 mobile path is a browser over Tailscale private HTTPS. Join the PC and phone
 to the same tailnet, enable MagicDNS and HTTPS Certificates, then run `私有远程启动.bat`. Jiuguan
 does not enable Funnel or public port mapping.
 

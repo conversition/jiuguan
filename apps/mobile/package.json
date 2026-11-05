@@ -1,7 +1,7 @@
 {
   "name": "@jiuguan/mobile-shell",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "P10：Capacitor Android 薄壳。主 WebView 只加载 bundled local origin；endpoint 只用于 API transport。",
   "type": "module",
   "scripts": {

@@ -1,6 +1,6 @@
 {
   "name": "@jiuguan/skill-hub",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Pure contracts, deterministic selection, whole-body admission and candidate lifecycle for Agent Skills",

@@ -1,8 +1,8 @@
-# Jiuguan v0.1 clean-release manifest
+# Jiuguan v0.2 clean-release manifest
 
 ## Provenance
 
-- Public version: `0.1.0`（公开预览版；内部开发线版本号与公开版解耦）
+- Public version: `0.2.0`（公开预览版；内部开发线版本号与公开版解耦）
 - Source revision used for the clean export: `5a0aa7d7d077855ed91069854bdd74a4ede9db47`
 - Snapshot date: `2026-11-05`
 - Export method: tracked `HEAD` files only, followed by a new repository history

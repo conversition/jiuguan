@@ -2,7 +2,7 @@
 
 ## Supported release
 
-The `v0.1.x` line receives security fixes while it is the newest public line.
+The `v0.2.x` line receives security fixes while it is the newest public line.
 
 ## Reporting a vulnerability
 

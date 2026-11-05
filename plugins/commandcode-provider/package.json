@@ -1,6 +1,6 @@
 {
   "name": "commandcode-provider",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "First-party PC-only CommandCode Provider for the Jiuguan DSH host",

@@ -103,8 +103,8 @@ for (const file of files) {
 
 const rootPackage = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
 const webPackage = JSON.parse(readFileSync(join(root, 'apps', 'web', 'package.json'), 'utf8'));
-if (rootPackage.version !== '0.1.0' || webPackage.version !== '0.1.0') {
-  errors.push('package versions must both be 0.1.0');
+if (rootPackage.version !== '0.2.0' || webPackage.version !== '0.2.0') {
+  errors.push('package versions must both be 0.2.0');
 }
 const profile = readFileSync(join(root, 'tools', 'windows', 'public-safe-v0.1.env'), 'utf8');
 for (const expected of [

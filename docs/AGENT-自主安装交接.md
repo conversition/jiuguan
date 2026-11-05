@@ -306,7 +306,7 @@ Release 签名还要求用户自己的 JDK 17、Android SDK 34 和仓库外 keys
 ## 12. 标准交接回复
 
 ```text
-酒馆 v0.1 已安装到：<绝对路径>
+酒馆 v0.2 已安装到：<绝对路径>
 源码版本：<tag/commit>
 数据目录：<隔离或标准路径>
 本机入口：http://localhost:5173
