@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "roots": ["apps", "packages", "plugins", "tools"],
+  "sourceExtensions": [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"],
+  "ignoredDirectories": ["node_modules", "dist", "dist-runtime", "bundle", ".git"],
+  "ignoredPaths": ["apps/mobile/android"],
+  "baseline": "tools/architecture/import-boundaries.baseline.json",
+  "rules": {
+    "crossWorkspacePackagePrivateSource": true,
+    "relativeNodeModulesTraversal": true,
+    "packageImportAlias": true,
+    "privateWorkspaceAlias": true,
+    "packageToOuterLayer": true,
+    "appToPluginOrTool": true,
+    "pluginToAppOrTool": true
+  }
+}

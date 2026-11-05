@@ -2,7 +2,7 @@
  * sandbox 包 - MVU 引擎 ↔ VMS 桥（接入回合，Phase 3 收尾）
  *
  * 职责（用户指令：MVU 引擎接入回合）：
- *  1. 在沙箱中零转译运行角色卡自带的通用 MVU 引擎脚本
+ *  1. 在沙箱中零转译运行角色卡原生的 MVU 引擎脚本（示例卡组卡 34.5KB v23.5）
  *  2. 提供 lodash 白名单子集 `_`（引擎硬依赖：cloneDeep/get/set/isEqual/random/sample/uniq）
  *  3. stat_data 全量状态：启动时从 memory_state(entity_type='mvu') 恢复，否则用 schema 默认值起步
  *  4. AI 回合后驱动 tick：追加 assistant 消息到聊天上下文 → emit VARIABLE_UPDATE_ENDED{stat_data}
@@ -178,6 +178,18 @@ export class MvuBridge {
   /** 扁平叶子（VMS 完整名 → 值），供提示词宏展开 */
   snapshotState(): { state: Record<string, unknown>; stateVersion: number } {
     return { state: lodashCloneDeep(this.state), stateVersion: this.stateVersion };
+  }
+
+  /**
+   * Restore an in-memory snapshot after the surrounding session transaction
+   * failed.  This deliberately does not persist: SQLite has already rolled
+   * back to the same snapshot.  VMS is resynchronised so removed/added leaves
+   * cannot leak from the rejected tick into the next prompt.
+   */
+  restoreSnapshot(snapshot: { state: Record<string, unknown>; stateVersion: number }): void {
+    this.state = lodashCloneDeep(snapshot.state);
+    this.stateVersion = snapshot.stateVersion;
+    this.syncToVms();
   }
 
   replaceState(state: Record<string, unknown>, round: number, opts: { persist?: boolean } = {}): MvuUpdateResult {

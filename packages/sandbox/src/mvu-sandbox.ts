@@ -1,6 +1,6 @@
 /**
  * sandbox 包 - MVU 沙箱执行器（Phase 3：本地 vendor + 沙箱 + 薄适配层）
- * 目标：在不转译的前提下，于沙箱中运行角色卡自带的通用 MVU 引擎，保持行为等价。
+ * 目标：在不转译的前提下，于沙箱中运行示例卡组卡的 34.5KB 原引擎（v23.5），行为等价。
  *
  * 安全（审查 §9）：node:vm 沙箱 + 白名单 API——不提供 require/process/Buffer/fetch/XMLHttpRequest/
  * module/exports；console 仅白名单方法；setTimeout 有限；无文件/网络能力。

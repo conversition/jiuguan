@@ -5,21 +5,50 @@ import {
   AGENT_ROLLOUT_LANES,
   AGENT_ROLLOUT_STATES,
   AGENT_TEST_SESSION_WINDOW_CALLS,
+  PLAYER_SOVEREIGNTY_ACTION_ALIAS_DEFECT_ID,
+  PLAYER_SOVEREIGNTY_POLICY_REVISION,
   narrowAgentRolloutState,
   type AgentRolloutLane,
   type AgentRolloutState,
 } from '../../packages/agent-policy/src/lane-rollout.ts';
-import { AgentControlStore } from '../../apps/server/agent-control-store.ts';
-import { AGENT_LANE_RECOVERY_ACK } from '../../apps/server/agent-control-mutation.ts';
+import {
+  AgentControlStore,
+  KNOWN_DEFECT_CORRECTION_MIN_PROVIDER_CALLS,
+  KNOWN_DEFECT_CORRECTION_MAX_PROVIDER_CALLS,
+  type ExpectedMaintenanceCapabilityKill,
+  type MaintenanceCapabilityId,
+} from '../../apps/server/agent-control-store.ts';
+import {
+  AGENT_KNOWN_DEFECT_CORRECTION_ACK,
+  AGENT_LANE_RECOVERY_ACK,
+} from '../../apps/server/agent-control-mutation.ts';
 import { parseAgentLaneRuntimeConfig } from '../../apps/server/agent-lane-runtime-config.ts';
 import { resolveOperationalDataDirectory } from './operational-data-root.ts';
 import { readRuntimeProfileEnvironment } from './runtime-profile-env.ts';
+
+const MAINTENANCE_CAPABILITY_IDS = Object.freeze([
+  'maintenance.memory',
+  'maintenance.branchIndex',
+  'maintenance.arc',
+  'maintenance.npc',
+  'maintenance.worldbook',
+] as const satisfies readonly MaintenanceCapabilityId[]);
 
 const args = process.argv.slice(2);
 const command = args[0] ?? 'status';
 const valueOf = (name: string): string | undefined => {
   const index = args.indexOf(name);
   return index >= 0 ? args[index + 1] : undefined;
+};
+const valuesOf = (name: string): readonly string[] => {
+  const values: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    if (args[index] !== name) continue;
+    const value = args[index + 1];
+    if (!value || value.startsWith('--')) throw new Error(`${name} requires a value`);
+    values.push(value);
+  }
+  return Object.freeze(values);
 };
 const laneOf = (): AgentRolloutLane => {
   const value = valueOf('--lane');
@@ -35,6 +64,16 @@ const positiveCallsOf = (lane: AgentRolloutLane): number => {
   }
   return value;
 };
+const positiveKnownDefectCallsOf = (): number => {
+  const value = Number(valueOf('--max-provider-calls'));
+  if (!Number.isSafeInteger(value) || value < KNOWN_DEFECT_CORRECTION_MIN_PROVIDER_CALLS
+    || value > KNOWN_DEFECT_CORRECTION_MAX_PROVIDER_CALLS) {
+    throw new Error(
+      `--max-provider-calls must be an explicit integer in ${KNOWN_DEFECT_CORRECTION_MIN_PROVIDER_CALLS}..${KNOWN_DEFECT_CORRECTION_MAX_PROVIDER_CALLS} for known-defect correction`,
+    );
+  }
+  return value;
+};
 const expectedRevisionOf = (): string => {
   const value = valueOf('--expected-revision');
   if (!value) throw new Error('--expected-revision required');
@@ -47,6 +86,30 @@ const expectedWindowSequenceOf = (): number => {
   }
   return value;
 };
+const maintenanceCapabilityKillsOf = (): readonly ExpectedMaintenanceCapabilityKill[] => {
+  const values = valuesOf('--capability');
+  if (values.length < 1) throw new Error('--capability required');
+  const seen = new Set<string>();
+  return Object.freeze(values.map((value) => {
+    const separator = value.lastIndexOf('@');
+    const capabilityId = value.slice(0, separator);
+    const expectedRevision = value.slice(separator + 1);
+    if (separator < 1
+      || !(MAINTENANCE_CAPABILITY_IDS as readonly string[]).includes(capabilityId)) {
+      throw new Error('--capability must use maintenance.<id>@<ISO revision>');
+    }
+    if (!Number.isFinite(Date.parse(expectedRevision))
+      || new Date(expectedRevision).toISOString() !== expectedRevision) {
+      throw new Error('--capability revision must be a canonical ISO timestamp');
+    }
+    if (seen.has(capabilityId)) throw new Error('--capability must not repeat an id');
+    seen.add(capabilityId);
+    return Object.freeze({
+      capabilityId: capabilityId as MaintenanceCapabilityId,
+      expectedRevision,
+    });
+  }));
+};
 const requireRecoveryAck = (): void => {
   if (valueOf('--ack') !== AGENT_LANE_RECOVERY_ACK) {
     throw new Error(`--ack must equal ${AGENT_LANE_RECOVERY_ACK}`);
@@ -55,7 +118,7 @@ const requireRecoveryAck = (): void => {
 const data = resolveOperationalDataDirectory({ explicit: valueOf('--data-dir') });
 const dataDir = data.path;
 const profilePath = resolve(valueOf('--profile')
-  ?? 'tools/windows/public-safe-v0.1.env');
+  ?? 'tools/windows/learning-maintenance-test-session-v1.env');
 const hasProcessRuntime = Boolean(process.env.JG_AGENT_LANE_ROLLOUT?.trim());
 const runtimeEnvironment = hasProcessRuntime
   ? process.env
@@ -106,6 +169,7 @@ try {
     console.log(JSON.stringify(store.recoverQualityKillCas({
       lane,
       expectedRevision,
+      expectedWindowSequence: expectedWindowSequenceOf(),
       evidenceDigest,
       maxProviderCalls: positiveCallsOf(lane),
     }), null, 2));
@@ -146,6 +210,75 @@ try {
       authorizationWindow: reopened.authorizationWindow,
       evidence: store.evidence(lane),
     }, null, 2));
+  } else if (command === 'recover-maintenance-capabilities') {
+    const runtime = parseAgentLaneRuntimeConfig(runtimeEnvironment);
+    if (!runtime.managed
+      || narrowAgentRolloutState('test-session', runtime.ceilings.maintenance) !== 'test-session') {
+      throw new Error('capability recovery requires a managed Maintenance test-session host ceiling');
+    }
+    requireRecoveryAck();
+    const expectedLaneRevision = expectedRevisionOf();
+    const expectedWindowSequence = expectedWindowSequenceOf();
+    const evidenceDigest = valueOf('--evidence-digest');
+    if (!evidenceDigest) throw new Error('--evidence-digest required');
+    const expectedCapabilities = maintenanceCapabilityKillsOf();
+    const before = store.get('maintenance');
+    const beforeWindow = store.authorizationWindow('maintenance');
+    const beforeCapabilities = expectedCapabilities.map(
+      ({ capabilityId }) => store.capabilityControl(capabilityId),
+    );
+    const recovered = store.recoverMaintenanceCapabilityQualityKillsCas({
+      expectedCapabilities,
+      expectedLaneRevision,
+      expectedWindowSequence,
+      evidenceDigest,
+      maxProviderCalls: positiveCallsOf('maintenance'),
+    });
+    console.log(JSON.stringify({
+      lane: 'maintenance',
+      operation: recovered.operation,
+      previousControl: before,
+      previousAuthorizationWindow: beforeWindow,
+      previousCapabilities: beforeCapabilities,
+      control: recovered.control,
+      authorizationWindow: recovered.authorizationWindow,
+      recoveredCapabilities: recovered.recoveredCapabilities,
+      evidence: store.evidence('maintenance'),
+    }, null, 2));
+  } else if (command === 'correct-known-interactive-sovereignty-defect') {
+    const runtime = parseAgentLaneRuntimeConfig(runtimeEnvironment);
+    if (!runtime.managed
+      || narrowAgentRolloutState('test-session', runtime.ceilings.interactive) !== 'test-session') {
+      throw new Error('known-defect correction requires a managed Interactive test-session host ceiling');
+    }
+    if (valueOf('--ack') !== AGENT_KNOWN_DEFECT_CORRECTION_ACK) {
+      throw new Error(`--ack must equal ${AGENT_KNOWN_DEFECT_CORRECTION_ACK}`);
+    }
+    if (valueOf('--defect-id') !== PLAYER_SOVEREIGNTY_ACTION_ALIAS_DEFECT_ID) {
+      throw new Error(`--defect-id must equal ${PLAYER_SOVEREIGNTY_ACTION_ALIAS_DEFECT_ID}`);
+    }
+    if (valueOf('--fixed-policy-revision')
+      !== PLAYER_SOVEREIGNTY_POLICY_REVISION) {
+      throw new Error(
+        `--fixed-policy-revision must equal ${PLAYER_SOVEREIGNTY_POLICY_REVISION}`,
+      );
+    }
+    const result = store.correctKnownInteractiveSovereigntyFalsePositiveAndReopenCas({
+      lane: 'interactive',
+      defectId: PLAYER_SOVEREIGNTY_ACTION_ALIAS_DEFECT_ID,
+      fixedPolicyRevision: PLAYER_SOVEREIGNTY_POLICY_REVISION,
+      expectedRevision: expectedRevisionOf(),
+      expectedWindowSequence: expectedWindowSequenceOf(),
+      maxProviderCalls: positiveKnownDefectCallsOf(),
+    });
+    console.log(JSON.stringify({
+      lane: 'interactive',
+      operation: result.operation,
+      control: result.control,
+      authorizationWindow: result.authorizationWindow,
+      correction: result.correction,
+      evidence: store.evidence('interactive'),
+    }, null, 2));
   } else if (command === 'record-evaluation') {
     const lane = laneOf();
     const file = valueOf('--report');
@@ -172,7 +305,7 @@ try {
     });
     console.log(JSON.stringify({ lane, evidence: store.evidence(lane) }, null, 2));
   } else {
-    throw new Error('command must be status|set|kill|clear-kill|recover|reopen|record-evaluation');
+    throw new Error('command must be status|set|kill|clear-kill|recover|reopen|recover-maintenance-capabilities|correct-known-interactive-sovereignty-defect|record-evaluation');
   }
 } finally {
   store.close();

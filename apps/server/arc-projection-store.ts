@@ -49,11 +49,25 @@ export interface ArcProjectionRollbackResult {
 
 export type ArcProjectionCommitResult =
   | { readonly status: 'committed'; readonly receipt: ArcProjectionReceipt }
-  | { readonly status: 'stale'; readonly actualRevision: string; readonly actionCount: 0 };
+  | {
+    readonly status: 'stale';
+    readonly staleReason: 'source-revision-stale' | 'arc-projection-stale';
+    readonly actualRevision: string;
+    readonly actualProjectionDigest?: string;
+    readonly actionCount: 0;
+  };
 
 type SqlRow = Record<string, unknown>;
 const TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,239}$/u;
 const DIGEST_RE = /^sha256:[a-f0-9]{64}$/u;
+const ARC_ID_RE = /^arc:sha256:[a-f0-9]{64}$/u;
+
+export interface ArcProjectionRecoveryInput {
+  readonly runId: string;
+  /** Resolve only after finding durable evidence, so never-applicable legacy proposals remain rejectable. */
+  readonly proposal: ArcMaintenanceProposal | (() => ArcMaintenanceProposal);
+  readonly provenanceDigest: string;
+}
 
 function canonical(value: unknown): string {
   if (value === null || typeof value === 'string' || typeof value === 'boolean' || typeof value === 'number') {
@@ -66,6 +80,48 @@ function canonical(value: unknown): string {
 
 function sha256(value: unknown): string {
   return `sha256:${createHash('sha256').update(canonical(value), 'utf8').digest('hex')}`;
+}
+
+/** The retained projection is a historical receipt, not the current overlay head. */
+function parseReceiptProjection(value: unknown, sessionId: string): ArcDerivedProjection {
+  const invalid = (): never => { throw new Error('arc-maintenance-receipt-corrupt'); };
+  const record = (candidate: unknown): Record<string, unknown> => {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) invalid();
+    return candidate as Record<string, unknown>;
+  };
+  const exact = (candidate: Record<string, unknown>, keys: readonly string[]) => {
+    if (canonical(Object.keys(candidate).sort()) !== canonical([...keys].sort())) invalid();
+  };
+  const references = (candidate: unknown, pattern: RegExp, minimum: number): boolean =>
+    Array.isArray(candidate) && candidate.length >= minimum
+      && candidate.every((item) => typeof item === 'string' && pattern.test(item))
+      && new Set(candidate).size === candidate.length;
+  const row = record(value);
+  exact(row, ['sessionId', 'actionCount', 'statuses', 'mergedInto', 'chapterBoundaries',
+    'dependencies', 'sourceConflicts', 'projectionDigest']);
+  if (row.sessionId !== sessionId || !Number.isSafeInteger(row.actionCount) || Number(row.actionCount) < 1
+    || typeof row.projectionDigest !== 'string' || !DIGEST_RE.test(row.projectionDigest)) invalid();
+  if (Object.entries(record(row.statuses)).some(([id, status]) => !ARC_ID_RE.test(id)
+    || !['open', 'closed', 'dormant'].includes(status as string))) invalid();
+  if (Object.entries(record(row.mergedInto)).some(([id, target]) => !ARC_ID_RE.test(id)
+    || typeof target !== 'string' || !ARC_ID_RE.test(target) || id === target)) invalid();
+  if (Object.entries(record(row.dependencies)).some(([id, targets]) => !ARC_ID_RE.test(id)
+    || !references(targets, ARC_ID_RE, 1) || (targets as string[]).includes(id))) invalid();
+  if (!Array.isArray(row.chapterBoundaries) || !Array.isArray(row.sourceConflicts)) invalid();
+  for (const value of row.chapterBoundaries as unknown[]) {
+    const boundary = record(value);
+    exact(boundary, ['arcIds', 'boundaryRound', 'sourceRefs']);
+    if (!references(boundary.arcIds, ARC_ID_RE, 1) || !references(boundary.sourceRefs, TOKEN_RE, 1)
+      || !Number.isSafeInteger(boundary.boundaryRound) || Number(boundary.boundaryRound) < 1) invalid();
+  }
+  for (const value of row.sourceConflicts as unknown[]) {
+    const conflict = record(value);
+    exact(conflict, ['arcIds', 'sourceRefs']);
+    if (!references(conflict.arcIds, ARC_ID_RE, 1) || !references(conflict.sourceRefs, TOKEN_RE, 2)) invalid();
+  }
+  const { projectionDigest, ...body } = row;
+  if (sha256(body) !== projectionDigest) invalid();
+  return Object.freeze(row) as unknown as ArcDerivedProjection;
 }
 
 function initialize(db: DatabaseSync): void {
@@ -184,26 +240,22 @@ export class ArcProjectionStore {
     readonly runId: string;
     readonly proposal: ArcMaintenanceProposal;
     readonly provenanceDigest: string;
+    readonly expectedProjectionDigest: string;
     readonly currentRevision: () => string;
   }): ArcProjectionCommitResult {
     this.#assertOpen();
-    if (!TOKEN_RE.test(input.runId) || !DIGEST_RE.test(input.provenanceDigest)) {
+    if (!TOKEN_RE.test(input.runId) || !DIGEST_RE.test(input.provenanceDigest)
+      || !DIGEST_RE.test(input.expectedProjectionDigest)) {
       throw new Error('arc-maintenance-commit-binding-invalid');
     }
-    const prior = this.#receipt(input.runId);
-    if (prior) {
-      if (prior.sessionId !== input.proposal.sessionId
-        || prior.sourceRevision !== input.proposal.sourceRevision
-        || prior.proposalDigest !== input.proposal.proposalDigest
-        || prior.provenanceDigest !== input.provenanceDigest) {
-        throw new Error('arc-maintenance-operation-intent-conflict');
-      }
-      return { status: 'committed', receipt: { ...prior, deduped: true } };
-    }
+    const prior = this.recover(input);
+    if (prior) return prior;
     let actualRevision = input.currentRevision();
     if (typeof actualRevision !== 'string') throw new Error('arc-maintenance-current-revision-invalid');
     if (actualRevision !== input.proposal.sourceRevision) {
-      return { status: 'stale', actualRevision, actionCount: 0 };
+      return {
+        status: 'stale', staleReason: 'source-revision-stale', actualRevision, actionCount: 0,
+      };
     }
     this.#db.exec('BEGIN IMMEDIATE');
     try {
@@ -211,7 +263,20 @@ export class ArcProjectionStore {
       if (typeof actualRevision !== 'string') throw new Error('arc-maintenance-current-revision-invalid');
       if (actualRevision !== input.proposal.sourceRevision) {
         this.#db.exec('ROLLBACK');
-        return { status: 'stale', actualRevision, actionCount: 0 };
+        return {
+          status: 'stale', staleReason: 'source-revision-stale', actualRevision, actionCount: 0,
+        };
+      }
+      const actualProjection = this.#readProjection(input.proposal.sessionId);
+      if (actualProjection.projectionDigest !== input.expectedProjectionDigest) {
+        this.#db.exec('ROLLBACK');
+        return {
+          status: 'stale',
+          staleReason: 'arc-projection-stale',
+          actualRevision,
+          actualProjectionDigest: actualProjection.projectionDigest,
+          actionCount: 0,
+        };
       }
       const createdAt = this.#now();
       const insert = this.#db.prepare(
@@ -245,6 +310,81 @@ export class ArcProjectionStore {
       };
     } catch (error) {
       try { this.#db.exec('ROLLBACK'); } catch { /* preserve original error */ }
+      throw error;
+    }
+  }
+
+  /** Read one exact durable commit without consulting current source or writing/replaying actions. */
+  recover(input: ArcProjectionRecoveryInput): Extract<ArcProjectionCommitResult, { status: 'committed' }> | null {
+    const result = this.#readCommit(input, false);
+    return result ? { status: 'committed', receipt: result.receipt } : null;
+  }
+
+  /** Original commit time belongs to the native receipt/actions, never the later approval clock. */
+  readCommitEvidence(input: ArcProjectionRecoveryInput): Readonly<{ receipt: ArcProjectionReceipt; committedAt: string }> | null {
+    return this.#readCommit(input, true);
+  }
+
+  #readCommit(input: ArcProjectionRecoveryInput, includeTime: boolean): Readonly<{
+    receipt: ArcProjectionReceipt; committedAt: string;
+  }> | null {
+    this.#assertOpen();
+    if (!TOKEN_RE.test(input.runId) || !DIGEST_RE.test(input.provenanceDigest)) {
+      throw new Error('arc-maintenance-recovery-binding-invalid');
+    }
+    // Both tables must be observed in the same read snapshot. A receipt-less write is uncertainty,
+    // never evidence that the proposal is safe to reject or apply again.
+    this.#db.exec('BEGIN');
+    try {
+      const receipt = this.#receipt(input.runId);
+      const actions = this.#db.prepare(`SELECT session_id,source_revision,proposal_digest,provenance_digest,
+        action_index,action_kind,action_json,created_at FROM arc_projection_action WHERE run_id=? ORDER BY action_index`)
+        .all(input.runId) as SqlRow[];
+      if (!receipt) {
+        if (actions.length !== 0) throw new Error('arc-maintenance-recovery-incomplete');
+        this.#db.exec('COMMIT');
+        return null;
+      }
+      const proposal = typeof input.proposal === 'function' ? input.proposal() : input.proposal;
+      if (!proposal || proposal.version !== 'arc-maintenance-proposal-v1'
+        || !TOKEN_RE.test(proposal.sessionId) || !DIGEST_RE.test(proposal.sourceRevision)
+        || !DIGEST_RE.test(proposal.proposalDigest) || !Array.isArray(proposal.actions)
+        || proposal.actions.length < 1 || proposal.actions.length > 32
+        || sha256({ version: proposal.version, sessionId: proposal.sessionId,
+          sourceRevision: proposal.sourceRevision, actions: proposal.actions }) !== proposal.proposalDigest) {
+        throw new Error('arc-maintenance-recovery-binding-invalid');
+      }
+      if (receipt.sessionId !== proposal.sessionId || receipt.sourceRevision !== proposal.sourceRevision
+        || receipt.proposalDigest !== proposal.proposalDigest || receipt.provenanceDigest !== input.provenanceDigest) {
+        throw new Error('arc-maintenance-operation-intent-conflict');
+      }
+      if (actions.length !== proposal.actions.length || receipt.projection.actionCount < actions.length) {
+        throw new Error('arc-maintenance-recovery-incomplete');
+      }
+      let committedAt = '';
+      if (includeTime) {
+        const row = this.#db.prepare('SELECT created_at FROM arc_projection_receipt WHERE run_id=?').get(input.runId);
+        if (typeof row?.created_at !== 'string' || !Number.isFinite(Date.parse(row.created_at))
+          || new Date(row.created_at).toISOString() !== row.created_at
+          || actions.some(action => action.created_at !== row.created_at))
+          throw new Error('arc-maintenance-commit-time-invalid');
+        committedAt = row.created_at;
+      }
+      for (const [index, action] of actions.entries()) {
+        if (action.session_id !== proposal.sessionId || action.source_revision !== proposal.sourceRevision
+          || action.proposal_digest !== proposal.proposalDigest || action.provenance_digest !== input.provenanceDigest
+          || action.action_index !== index || action.action_kind !== proposal.actions[index]!.kind) {
+          throw new Error('arc-maintenance-operation-intent-conflict');
+        }
+        let payload: unknown;
+        try { payload = JSON.parse(String(action.action_json)); }
+        catch { throw new Error('arc-maintenance-receipt-corrupt'); }
+        if (canonical(payload) !== canonical(proposal.actions[index])) throw new Error('arc-maintenance-receipt-corrupt');
+      }
+      this.#db.exec('COMMIT');
+      return Object.freeze({ receipt: Object.freeze({ ...receipt, deduped: true }), committedAt });
+    } catch (error) {
+      try { this.#db.exec('ROLLBACK'); } catch { /* preserve the read failure */ }
       throw error;
     }
   }
@@ -322,11 +462,19 @@ export class ArcProjectionStore {
        FROM arc_projection_receipt WHERE run_id=?`,
     ).get(runId) as SqlRow | undefined;
     if (!row) return null;
+    if (row.run_id !== runId || typeof row.session_id !== 'string' || !TOKEN_RE.test(row.session_id)
+      || typeof row.source_revision !== 'string' || !DIGEST_RE.test(row.source_revision)
+      || typeof row.proposal_digest !== 'string' || !DIGEST_RE.test(row.proposal_digest)
+      || typeof row.provenance_digest !== 'string' || !DIGEST_RE.test(row.provenance_digest)
+      || typeof row.projection_json !== 'string') throw new Error('arc-maintenance-receipt-corrupt');
+    let projection: unknown;
+    try { projection = JSON.parse(row.projection_json); }
+    catch { throw new Error('arc-maintenance-receipt-corrupt'); }
     return {
       runId: String(row.run_id), sessionId: String(row.session_id),
       sourceRevision: String(row.source_revision), proposalDigest: String(row.proposal_digest),
       provenanceDigest: String(row.provenance_digest), deduped: false,
-      projection: JSON.parse(String(row.projection_json)) as ArcDerivedProjection,
+      projection: parseReceiptProjection(projection, row.session_id),
     };
   }
 

@@ -11,14 +11,29 @@ import {
 import type { SnapshotComponentPlan, SnapshotPluginPlan } from './snapshot-coordinator.ts';
 import type { SnapshotComponentRole } from './snapshot-manifest.ts';
 import { TURN_JOB_DB_FILE } from './turn-job-manager.ts';
-import { MAINTENANCE_JOB_DB_FILE } from './maintenance-job-manager.ts';
+import {
+  MAINTENANCE_JOB_DB_FILE,
+  MAINTENANCE_JOB_APPLICATION_ID,
+  MAINTENANCE_JOB_SCHEMA_VERSION,
+} from './maintenance-job-manager.ts';
 import { INTERACTIVE_LEDGER_DB_FILE } from './interactive-call-ledger.ts';
 import { MODEL_USAGE_DB_FILE } from './model-usage-ledger.ts';
 import { AGENT_ADMISSION_DB_FILE } from './agent-admission-ledger.ts';
 import { AGENT_LEARNING_DB_FILE } from './agent-learning-ledger.ts';
 import { ARC_PROJECTION_DB_FILE } from './arc-projection-store.ts';
+import { AGENT_LOOP_PROJECTION_DB_FILE } from './agent-loop-projection-store.ts';
 import { AGENT_CONTROL_DB_FILE } from './agent-control-store.ts';
 import { WORLDBOOK_REPAIR_DB_FILE } from './worldbook-repair-control.ts';
+import { AGENT_CLOSURE_DB_FILE } from './agent-closure-store.ts';
+import { AGENT_EVIDENCE_DB_FILE } from './agent-evidence-ledger.ts';
+import { DIRECTOR_CREATIVE_DB_FILE } from './director-creative-store.ts';
+import { AGENT_SKILL_CANDIDATE_DB_FILE } from './agent-skill-candidate-store.ts';
+import { SKILL_COMPILE_DB_FILE } from './skill-compile-store.ts';
+import { SKILL_EVALUATE_DB_FILE } from './skill-evaluate-store.ts';
+import { SKILL_SAMPLE_DB_FILE } from './skill-sample-store.ts';
+import { SKILL_QUALITY_DB_FILE } from './skill-quality-store.ts';
+import { SKILL_PACKAGE_PIN_DB_FILE } from './skill-package-pin-store.ts';
+import { STYLE_COMPILE_JOB_DATA_DIRECTORY, STYLE_COMPILE_JOB_DB_FILE } from './skill-hub/style-compile-job-store.ts';
 
 export interface DefaultSnapshotInventory {
   readonly components: readonly SnapshotComponentPlan[];
@@ -68,6 +83,47 @@ function readSqliteSchemaVersion(path: string): number {
   } finally {
     db.close();
   }
+}
+
+/** A route-owned Manager history cannot be restored without its AL authority
+ * ledger. Check only this dependency, not receipt JSON or execution liveness.
+ * Full SQLite schema/integrity validation still belongs to the original adapter. */
+function assertNoAgentLoopManagerDependency(root: string): void {
+  const path = join(root, MAINTENANCE_JOB_DB_FILE);
+  const entry = lstatSync(path, { throwIfNoEntry: false });
+  if (!entry) return;
+  for (const suffix of ['', '-wal', '-shm', '-journal']) {
+    const stats = suffix === '' ? entry : lstatSync(path + suffix, { throwIfNoEntry: false });
+    if (stats && (!stats.isFile() || stats.isSymbolicLink())) throw new Error('inventory Maintenance SQLite 必须是普通文件');
+  }
+  const db = new DatabaseSync(path, { readOnly: true });
+  try {
+    const applicationId = db.prepare('PRAGMA application_id').get()?.application_id;
+    const version = db.prepare('PRAGMA user_version').get()?.user_version;
+    if (applicationId !== MAINTENANCE_JOB_APPLICATION_ID
+      || ![4, 5, 6, 7, MAINTENANCE_JOB_SCHEMA_VERSION].includes(Number(version))) {
+      throw new Error('inventory Maintenance 依赖来源版本非法');
+    }
+    const table = db.prepare("SELECT type FROM sqlite_master WHERE name='maintenance_job'").get();
+    const columns = db.prepare('PRAGMA table_info(maintenance_job)').all();
+    // The original job header is unchanged in v4..current except v5's appended route.
+    const expected = ['run_id', 'session_id', 'task_kind', 'source_revision', 'policy_version', 'parent_run_id',
+      'trigger_kind', 'mode', 'status', 'attempt', 'created_at', 'updated_at', 'started_at', 'finished_at',
+      'cancel_requested_at', 'lease_owner_instance_id', 'lease_expires_at', 'error_code', 'budget_json',
+      'proposal_digest', 'proposal_disposition', 'diff_json', ...(version === 4 ? [] : ['executor_route'])];
+    if (table?.type !== 'table' || JSON.stringify(columns.map(column => column.name)) !== JSON.stringify(expected)) {
+      throw new Error('inventory Maintenance 依赖来源列非法');
+    }
+    if (version === 4) return; // Authentic pre-route legacy history requires no AL ledger.
+    const route = columns.at(-1)!;
+    if (route.type !== 'TEXT' || route.notnull !== 1 || route.dflt_value !== "'legacy'" || route.pk !== 0
+      || db.prepare("SELECT 1 FROM maintenance_job WHERE executor_route IS NULL OR executor_route NOT IN ('legacy','agent-loop') LIMIT 1").get()) {
+      throw new Error('inventory Maintenance executor route 非法');
+    }
+    if (db.prepare("SELECT 1 FROM maintenance_job WHERE executor_route='agent-loop' LIMIT 1").get()) {
+      throw new Error('inventory Maintenance AL 历史缺少 AgentLoop 数据库');
+    }
+  } finally { db.close(); }
 }
 
 function walkPlainFiles(root: string, relativeDir: string): string[] {
@@ -152,9 +208,6 @@ export function buildDefaultSnapshotInventory(dataDir: string): DefaultSnapshotI
     add('control-db', TURN_JOB_DB_FILE, 'sqlite-online', readSqliteSchemaVersion(turnJobPath));
   }
   const maintenanceJobPath = join(root, MAINTENANCE_JOB_DB_FILE);
-  if (existsSync(maintenanceJobPath)) {
-    add('control-db', MAINTENANCE_JOB_DB_FILE, 'sqlite-online', readSqliteSchemaVersion(maintenanceJobPath));
-  }
   const interactiveLedgerPath = join(root, INTERACTIVE_LEDGER_DB_FILE);
   if (existsSync(interactiveLedgerPath)) {
     add('control-db', INTERACTIVE_LEDGER_DB_FILE, 'sqlite-online', readSqliteSchemaVersion(interactiveLedgerPath));
@@ -175,6 +228,35 @@ export function buildDefaultSnapshotInventory(dataDir: string): DefaultSnapshotI
   if (existsSync(arcProjectionPath)) {
     add('control-db', ARC_PROJECTION_DB_FILE, 'sqlite-online', readSqliteSchemaVersion(arcProjectionPath));
   }
+  // This optional Store lives below dataDir. Inspect each existing ancestor and
+  // SQLite entry BEFORE opening it; existsSync alone hides dangling links and
+  // checking only the final file would follow a nested junction outside root.
+  // Do not instantiate the Store: inventory must neither create nor migrate it.
+  const agentLoopDirectory = join(root, 'agent-loop-projection');
+  const agentLoopDirectoryStats = lstatSync(agentLoopDirectory, { throwIfNoEntry: false });
+  let hasAgentLoopProjection = false;
+  if (agentLoopDirectoryStats) {
+    if (!agentLoopDirectoryStats.isDirectory() || agentLoopDirectoryStats.isSymbolicLink()) {
+      throw new Error('inventory AgentLoop 目录必须是普通目录');
+    }
+    const agentLoopRelativePath = 'agent-loop-projection/' + AGENT_LOOP_PROJECTION_DB_FILE;
+    const agentLoopPath = join(agentLoopDirectory, AGENT_LOOP_PROJECTION_DB_FILE);
+    const agentLoopStats = lstatSync(agentLoopPath, { throwIfNoEntry: false });
+    for (const suffix of ['', '-wal', '-shm', '-journal']) {
+      const stats = suffix === '' ? agentLoopStats : lstatSync(agentLoopPath + suffix, { throwIfNoEntry: false });
+      if (stats && (!stats.isFile() || stats.isSymbolicLink())) {
+        throw new Error('inventory AgentLoop SQLite 必须是普通文件');
+      }
+    }
+    if (agentLoopStats) {
+      add('control-db', agentLoopRelativePath, 'sqlite-online', readSqliteSchemaVersion(agentLoopPath));
+      hasAgentLoopProjection = true;
+    }
+  }
+  if (!hasAgentLoopProjection) assertNoAgentLoopManagerDependency(root);
+  if (existsSync(maintenanceJobPath)) {
+    add('control-db', MAINTENANCE_JOB_DB_FILE, 'sqlite-online', readSqliteSchemaVersion(maintenanceJobPath));
+  }
   const agentControlPath = join(root, AGENT_CONTROL_DB_FILE);
   if (existsSync(agentControlPath)) {
     add('control-db', AGENT_CONTROL_DB_FILE, 'sqlite-online', readSqliteSchemaVersion(agentControlPath));
@@ -182,6 +264,51 @@ export function buildDefaultSnapshotInventory(dataDir: string): DefaultSnapshotI
   const worldbookRepairPath = join(root, WORLDBOOK_REPAIR_DB_FILE);
   if (existsSync(worldbookRepairPath)) {
     add('control-db', WORLDBOOK_REPAIR_DB_FILE, 'sqlite-online', readSqliteSchemaVersion(worldbookRepairPath));
+  }
+  const agentClosurePath = join(root, AGENT_CLOSURE_DB_FILE);
+  if (existsSync(agentClosurePath)) {
+    add('control-db', AGENT_CLOSURE_DB_FILE, 'sqlite-online', readSqliteSchemaVersion(agentClosurePath));
+  }
+  // Inventory is read-only: an absent optional evidence ledger must remain absent.
+  const agentEvidencePath = join(root, AGENT_EVIDENCE_DB_FILE);
+  const creativePath = join(root, DIRECTOR_CREATIVE_DB_FILE);
+  if (existsSync(creativePath)) add('control-db', DIRECTOR_CREATIVE_DB_FILE, 'sqlite-online', readSqliteSchemaVersion(creativePath));
+  if (existsSync(agentEvidencePath)) {
+    add('control-db', AGENT_EVIDENCE_DB_FILE, 'sqlite-online', readSqliteSchemaVersion(agentEvidencePath));
+  }
+
+  const skillCandidatesPath = join(root, AGENT_SKILL_CANDIDATE_DB_FILE);
+  if (existsSync(skillCandidatesPath)) {
+      add('control-db', AGENT_SKILL_CANDIDATE_DB_FILE, 'sqlite-online', readSqliteSchemaVersion(skillCandidatesPath));
+  }
+
+  const skillCompilePath = join(root, SKILL_COMPILE_DB_FILE);
+  if (existsSync(skillCompilePath)) {
+      add('control-db', SKILL_COMPILE_DB_FILE, 'sqlite-online', readSqliteSchemaVersion(skillCompilePath));
+  }
+
+  // Style intent delivery is not completion: preserve its execution/unknown ledger on restore.
+  const styleCompileRelativePath = `${STYLE_COMPILE_JOB_DATA_DIRECTORY}/${STYLE_COMPILE_JOB_DB_FILE}`;
+  const styleCompilePath = join(root, styleCompileRelativePath);
+  if (existsSync(styleCompilePath)) {
+      add('control-db', styleCompileRelativePath, 'sqlite-online', readSqliteSchemaVersion(styleCompilePath));
+  }
+
+  const skillEvaluatePath = join(root, SKILL_EVALUATE_DB_FILE);
+  if (existsSync(skillEvaluatePath)) {
+      add('control-db', SKILL_EVALUATE_DB_FILE, 'sqlite-online', readSqliteSchemaVersion(skillEvaluatePath));
+  }
+
+  const skillSamplePath = join(root, SKILL_SAMPLE_DB_FILE);
+  if (existsSync(skillSamplePath)) {
+      add('control-db', SKILL_SAMPLE_DB_FILE, 'sqlite-online', readSqliteSchemaVersion(skillSamplePath));
+  }
+
+  const skillQualityPath = join(root, SKILL_QUALITY_DB_FILE);
+  const skillPinPath = join(root, SKILL_PACKAGE_PIN_DB_FILE);
+  if (existsSync(skillPinPath)) add('control-db', SKILL_PACKAGE_PIN_DB_FILE, 'sqlite-online', readSqliteSchemaVersion(skillPinPath));
+  if (existsSync(skillQualityPath)) {
+      add('control-db', SKILL_QUALITY_DB_FILE, 'sqlite-online', readSqliteSchemaVersion(skillQualityPath));
   }
 
   const securityDir = join(root, 'security');

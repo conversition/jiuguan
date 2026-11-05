@@ -17,12 +17,28 @@ export interface NpcMaintenanceProposalAdapterOptions {
 }
 
 export interface NpcMaintenanceProposalAdapters {
+  /** Read-only crash-window probe. It never starts a first-time domain write. */
+  readonly recoverNpcProposal: (
+    pending: MaintenancePendingProposalRecord,
+  ) => Extract<NpcMaintenanceCommitResult, { readonly status: 'committed' }> | null;
   readonly applyNpcProposal: (pending: MaintenancePendingProposalRecord) => NpcMaintenanceCommitResult;
   readonly rollbackNpcProposal: (anchor: Readonly<Record<string, unknown>>) => NpcMaintenanceRollbackReceipt;
 }
 
 const TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,239}$/u;
 const MESSAGE_REF_RE = /^msg:([1-9][0-9]*)$/u;
+
+/**
+ * Crash recovery may run after an admitted source message was deleted. The public
+ * token already freezes the durable SourceRef identity, so reconstruction is
+ * deterministic and read-only; first-time writes still pass through sourceBindings()
+ * and therefore still require a currently existing chat_log row.
+ */
+function recoverySourceRef(token: string): SourceRef | null {
+  const matched = MESSAGE_REF_RE.exec(token);
+  if (!matched) return null;
+  return { source: 'message', recordId: matched[1]!, recordVersion: 1 };
+}
 
 function openSessionDb(dataDir: string, sessionId: string): MemoryDb {
   if (!TOKEN_RE.test(sessionId)) throw new Error('npc-maintenance-session-invalid');
@@ -98,7 +114,37 @@ function committerFor(
 export function createNpcMaintenanceProposalAdapters(
   options: NpcMaintenanceProposalAdapterOptions,
 ): NpcMaintenanceProposalAdapters {
+  const recoverNpcProposal = (
+    pending: MaintenancePendingProposalRecord,
+  ): Extract<NpcMaintenanceCommitResult, { readonly status: 'committed' }> | null => {
+    if (pending.taskKind !== 'npc_state' || pending.proposal.taskKind !== 'npc_state') {
+      throw new Error('npc-maintenance-proposal-kind-invalid');
+    }
+    const context = pending.context as NpcMaintenanceProposalContext;
+    const memory = openSessionDb(options.dataDir, pending.sessionId);
+    try {
+      const runtime = committerFor(
+        memory,
+        options.currentRevision,
+        (_sessionId, token) => recoverySourceRef(token),
+      );
+      const recovered = runtime.committer.recoverApplied({
+        runId: pending.jobRunId,
+        proposal: pending.proposal.payload,
+        context,
+        provenanceDigest: pending.proposalDigest,
+      });
+      if (recovered === null) return null;
+      if (recovered.status !== 'committed') {
+        throw new Error('npc-maintenance-recovery-status-invalid');
+      }
+      return recovered;
+    } finally {
+      memory.close();
+    }
+  };
   return Object.freeze({
+    recoverNpcProposal,
     applyNpcProposal: (pending: MaintenancePendingProposalRecord) => {
       if (pending.taskKind !== 'npc_state' || pending.proposal.taskKind !== 'npc_state') {
         throw new Error('npc-maintenance-proposal-kind-invalid');
@@ -106,14 +152,19 @@ export function createNpcMaintenanceProposalAdapters(
       const context = pending.context as NpcMaintenanceProposalContext;
       const memory = openSessionDb(options.dataDir, pending.sessionId);
       try {
-        const recoveryRuntime = committerFor(memory, options.currentRevision, () => null);
+        // Keep the first-time apply path on one open handle, while using the
+        // same read-only recovery contract exposed to reject/reconciliation.
+        const recoveryRuntime = committerFor(memory, options.currentRevision,
+          (_sessionId, token) => recoverySourceRef(token));
         const recovered = recoveryRuntime.committer.recoverApplied({
-          runId: pending.jobRunId,
-          proposal: pending.proposal.payload,
-          context,
+          runId: pending.jobRunId, proposal: pending.proposal.payload, context,
           provenanceDigest: pending.proposalDigest,
         });
         if (recovered) return recovered;
+        const actualRevision = options.currentRevision(pending.sessionId);
+        if (actualRevision !== pending.sourceRevision) {
+          return Object.freeze({ status: 'stale', actualRevision, characterWrites: 0 });
+        }
         const bindings = sourceBindings(memory, context.allowedSourceRefs);
         const runtime = committerFor(memory, options.currentRevision, (_sessionId, token) => bindings.resolve(token));
         return runtime.committer.commit({

@@ -3,6 +3,8 @@
  * 两级：TransformersProvider（本地 bge 中文模型，真实语义）/ HashProvider（轻量兜底，无依赖）
  * 检索通道 B 通过注入 provider 使用向量（06/05 设计：vec_memory BLOB + 余弦全扫）
  */
+import { existsSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
 
 export interface EmbeddingProvider {
   readonly name: string;
@@ -11,6 +13,17 @@ export interface EmbeddingProvider {
   embed(text: string): Promise<number[]>;
   /** 批量向量（向量化管线用） */
   embedBatch(texts: string[]): Promise<number[][]>;
+}
+
+/** 与 pg-vector.ts 同一套约定：从 cwd 向上找 pnpm-workspace.yaml 得到仓库根。 */
+function workspaceRootFromCwd(): string {
+  let cursor = resolve(process.cwd());
+  while (true) {
+    if (existsSync(resolve(cursor, 'pnpm-workspace.yaml'))) return cursor;
+    const parent = dirname(cursor);
+    if (parent === cursor) return cursor;
+    cursor = parent;
+  }
 }
 
 type FeatureExtractionResult = { data: Float32Array };
@@ -78,12 +91,13 @@ export class TransformersEmbeddingProvider implements EmbeddingProvider {
     if (this.pipelineFactory) return this.pipelineFactory();
     // 动态导入避免顶层依赖（无 transformers 环境时仍可 import 本模块）
     const tf = await import('@huggingface/transformers');
-    // 国内网络：走 HF 镜像（可通过环境变量 JG_HF_MIRROR 覆盖）
-    const mirror = process.env.JG_HF_MIRROR ?? 'https://hf-mirror.com';
-    try {
-      tf.env.remoteHost = mirror;
-      tf.env.remotePathTemplate = '{model}/resolve/{revision}/';
-    } catch { /* env 配置失败忽略 */ }
+    // 本地模型目录优先（pnpm embed:pull 预下载到 <仓库根>/models/）。
+    // hf-mirror 实测不稳定：同一仓库里 config.json 200、tokenizer.json/model_quantized.onnx
+    // 直接 UND_ERR_CONNECT_TIMEOUT；一旦远程失败这里就会回落 hash(256)，PG 的 vector(512)
+    // 全部拒绝写入。所以先指到本地目录，远程只作为缺文件时的兜底。
+    const modelDir = process.env.JG_EMBED_MODEL_DIR
+      ?? resolve(workspaceRootFromCwd(), 'models');
+    try { tf.env.localModelPath = modelDir; } catch { /* env 配置失败忽略 */ }
     const { pipeline } = tf;
     return await pipeline('feature-extraction', this.modelName, {
       dtype: 'q8',

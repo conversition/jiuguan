@@ -2,7 +2,7 @@
  * 会话级共享脚本运行时（FE-B2/B3）
  *
  * 问题（FE-A 基线实测）：真实开局页在读取剧情版本时中断 ——
- *   剧情数据库未运行 → window.CardShared 不存在 → #ww-story-version 无选项
+ *   剧情数据库未运行 → window.WuWaShared 不存在 → #ww-story-version 无选项
  *   → .val() 返回 null → null.split(',') 抛错 → 处理器中断 → 草稿永不写入。
  * 因此不能只把 null.split() 改成不报错，必须让**真实共享脚本在正确环境和顺序下运行**。
  *

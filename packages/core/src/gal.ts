@@ -1,7 +1,7 @@
 /**
  * GLA（Galgame 交互）场景解析器——把角色卡/AI 回复里的 <gal_inface>…</gal_inface> 块解析为可渲染场景脚本。
  * 纯逻辑、零依赖，可在 node --experimental-strip-types 下单测（tools/cli/verify-gal.ts 用真实卡断言）。
- * 语法（外部页面卡等 GLA 卡约定，行级扫描保留顺序）：
+ * 语法（示例角色卡等 GLA 卡约定，行级扫描保留顺序）：
  *   指令行  [bg|背景名] [bgm|曲名] [show|角色|服装表情|槽位] [alter|角色|服装表情]
  *           [action|角色|动画] [cg|CG名] [hide_cg] [choice|选项1|选项2|…] [leave|角色]
  *   对话行  角色名|台词　旁白|台词　<user>|台词（行尾可内联 [action|…] 等指令，自动剥离并应用）

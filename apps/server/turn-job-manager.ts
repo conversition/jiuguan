@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, lstatSync, mkdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { TurnOperationBudgetStore } from './turn-operation-budget-store.ts';
 import {
   isSafeOpaqueId,
   isTurnJobAction,
@@ -12,13 +13,14 @@ import {
 } from '../../packages/mobile-contracts/src/index.ts';
 
 export const TURN_JOB_DB_FILE = 'turn-jobs.sqlite';
-export const TURN_JOB_SCHEMA_VERSION = 3;
+export const TURN_JOB_SCHEMA_VERSION = 5;
 /** ASCII `JGTJ`. */
 export const TURN_JOB_APPLICATION_ID = 0x4a47544a;
 export const DEFAULT_TURN_JOB_LEASE_MS = 30_000;
 export const DEFAULT_TURN_JOB_HEARTBEAT_MS = 10_000;
 const DEFAULT_BUSY_TIMEOUT_MS = 5_000;
 const MAX_REQUEST_JSON_BYTES = 4 * 1024 * 1024;
+const MAX_REPAIR_EVIDENCE_BYTES = 256 * 1024;
 
 const LEGAL_TRANSITIONS: Readonly<Record<TurnJobStatus, readonly TurnJobStatus[]>> = {
   queued: ['running', 'cancelled', 'failed'],
@@ -241,6 +243,21 @@ function initializeSchema(db: DatabaseSync): void {
         PRIMARY KEY (origin_device_id, action, session_id, key_digest)
       );
       CREATE INDEX idx_turn_job_idempotency_expiry ON turn_job_idempotency (expires_at);
+      CREATE TABLE turn_job_candidate (
+        run_id TEXT PRIMARY KEY REFERENCES turn_job(run_id) ON DELETE CASCADE,
+        candidate TEXT NOT NULL,
+        digest TEXT NOT NULL
+      );
+      CREATE TRIGGER turn_job_candidate_cleanup AFTER UPDATE OF status ON turn_job
+      WHEN NEW.status IN ('succeeded', 'cancelled')
+      BEGIN DELETE FROM turn_job_candidate WHERE run_id = NEW.run_id; END;
+      CREATE TABLE turn_job_repair_evidence (
+        run_id TEXT PRIMARY KEY REFERENCES turn_job(run_id) ON DELETE CASCADE,
+        candidate_digest TEXT NOT NULL, original_candidate TEXT NOT NULL, evidence TEXT NOT NULL
+      );
+      CREATE TRIGGER turn_job_repair_evidence_cleanup AFTER UPDATE OF status ON turn_job
+      WHEN NEW.status IN ('succeeded', 'cancelled')
+      BEGIN DELETE FROM turn_job_repair_evidence WHERE run_id = NEW.run_id; END;
       PRAGMA user_version = ${TURN_JOB_SCHEMA_VERSION};
       `);
       db.exec('COMMIT;');
@@ -273,11 +290,43 @@ function initializeSchema(db: DatabaseSync): void {
         );
         ALTER TABLE turn_job ADD COLUMN lease_expires_at TEXT;
         ALTER TABLE turn_job ADD COLUMN lease_heartbeat_at TEXT;
-        PRAGMA user_version = ${TURN_JOB_SCHEMA_VERSION};
+        PRAGMA user_version = 3;
       `);
       db.exec('COMMIT;');
     } catch (error) {
       try { db.exec('ROLLBACK;'); } catch { /* 保留原始错误。 */ }
+      throw error;
+    }
+  }
+  if (version >= 1 && version <= 3) {
+    db.exec('BEGIN IMMEDIATE;');
+    try {
+      db.exec(`CREATE TABLE turn_job_candidate (
+        run_id TEXT PRIMARY KEY REFERENCES turn_job(run_id) ON DELETE CASCADE,
+        candidate TEXT NOT NULL, digest TEXT NOT NULL
+      ); CREATE TRIGGER turn_job_candidate_cleanup AFTER UPDATE OF status ON turn_job
+      WHEN NEW.status IN ('succeeded', 'cancelled')
+      BEGIN DELETE FROM turn_job_candidate WHERE run_id = NEW.run_id; END;
+      PRAGMA user_version = 4;`);
+      db.exec('COMMIT;');
+    } catch (error) {
+      try { db.exec('ROLLBACK;'); } catch { /* retain original error */ }
+      throw error;
+    }
+  }
+  if (version >= 1 && version <= 4) {
+    db.exec('BEGIN IMMEDIATE;');
+    try {
+      db.exec(`CREATE TABLE turn_job_repair_evidence (
+        run_id TEXT PRIMARY KEY REFERENCES turn_job(run_id) ON DELETE CASCADE,
+        candidate_digest TEXT NOT NULL, original_candidate TEXT NOT NULL, evidence TEXT NOT NULL
+      ); CREATE TRIGGER turn_job_repair_evidence_cleanup AFTER UPDATE OF status ON turn_job
+      WHEN NEW.status IN ('succeeded', 'cancelled')
+      BEGIN DELETE FROM turn_job_repair_evidence WHERE run_id = NEW.run_id; END;
+      PRAGMA user_version = 5;`);
+      db.exec('COMMIT;');
+    } catch (error) {
+      try { db.exec('ROLLBACK;'); } catch { /* retain original error */ }
       throw error;
     }
   }
@@ -324,6 +373,7 @@ function isConstraintError(error: unknown): boolean {
 
 export class TurnJobManager {
   readonly #db: DatabaseSync;
+  #operationBudgetStore: TurnOperationBudgetStore | undefined;
   readonly #now: () => string;
   readonly #randomId: () => string;
   #closed = false;
@@ -350,6 +400,67 @@ export class TurnJobManager {
     }
     this.#now = options.now ?? (() => new Date().toISOString());
     this.#randomId = options.randomId ?? randomUUID;
+  }
+
+  /** Share this manager's validated database and lifetime with the operation ledger. */
+  operationBudgetStore(): TurnOperationBudgetStore {
+    this.#assertOpen();
+    return this.#operationBudgetStore ??= new TurnOperationBudgetStore(this.#db);
+  }
+
+  /** Private candidate, never part of the public job or session history. */
+  saveCandidate(sessionId: string, runId: string, candidate: string): void {
+    this.#assertOpen();
+    requireOpaque(sessionId, 'sessionId');
+    requireOpaque(runId, 'runId');
+    if (typeof candidate !== 'string' || !candidate || Buffer.byteLength(candidate, 'utf8') > MAX_REQUEST_JSON_BYTES)
+      throw new Error('turn-candidate-invalid');
+    const result = this.#db.prepare(`INSERT INTO turn_job_candidate (run_id, candidate, digest)
+      SELECT run_id, ?, ? FROM turn_job WHERE run_id = ? AND session_id = ? AND status = 'running'
+      ON CONFLICT(run_id) DO UPDATE SET candidate = excluded.candidate, digest = excluded.digest`)
+      .run(candidate, sha256(candidate), runId, sessionId);
+    if (Number(result.changes) !== 1) throw new Error('turn-candidate-job-not-running');
+  }
+
+  /** Private model repair evidence, bound to the saved candidate and running job. */
+  saveRepairEvidence(sessionId: string, runId: string, candidateDigest: string, evidence: string): void {
+    this.#assertOpen();
+    requireOpaque(sessionId, 'sessionId'); requireOpaque(runId, 'runId');
+    if (!/^sha256:[a-f0-9]{64}$/u.test(candidateDigest) || typeof evidence !== 'string'
+      || !evidence || Buffer.byteLength(evidence, 'utf8') > MAX_REPAIR_EVIDENCE_BYTES)
+      throw new Error('turn-repair-evidence-invalid');
+    try { const parsed: unknown = JSON.parse(evidence); if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error(); }
+    catch { throw new Error('turn-repair-evidence-invalid'); }
+    const result = this.#db.prepare(`INSERT INTO turn_job_repair_evidence (run_id, candidate_digest, original_candidate, evidence)
+      SELECT j.run_id, ?, c.candidate, ? FROM turn_job j JOIN turn_job_candidate c ON c.run_id = j.run_id
+      WHERE j.run_id = ? AND j.session_id = ? AND j.status = 'running' AND c.digest = ?
+      ON CONFLICT(run_id) DO UPDATE SET candidate_digest = excluded.candidate_digest, evidence = excluded.evidence`)
+      .run(candidateDigest, evidence, runId, sessionId, candidateDigest.slice(7));
+    if (Number(result.changes) !== 1) throw new Error('turn-repair-evidence-binding-invalid');
+  }
+
+  /** Local debugging only; never exposed through the candidate API or public job. */
+  failedRepairEvidence(sessionId: string, runId: string): { candidateDigest: string; originalCandidate: string; evidence: string } | null {
+    this.#assertOpen(); requireOpaque(sessionId, 'sessionId'); requireOpaque(runId, 'runId');
+    const row = this.#db.prepare(`SELECT e.candidate_digest, e.original_candidate, e.evidence FROM turn_job_repair_evidence e
+      JOIN turn_job j ON j.run_id = e.run_id WHERE j.run_id = ? AND j.session_id = ? AND j.status = 'failed'`)
+      .get(runId, sessionId) as SqlRow | undefined;
+    return row ? { candidateDigest: String(row.candidate_digest), originalCandidate: String(row.original_candidate), evidence: String(row.evidence) } : null;
+  }
+
+  /** Expose only failed jobs, and only recoverable prose; never model metadata. */
+  failedCandidate(runId: string): { prose: string; digest: string } | null {
+    this.#assertOpen();
+    requireOpaque(runId, 'runId');
+    const row = this.#db.prepare(`SELECT c.candidate, c.digest FROM turn_job_candidate c
+      JOIN turn_job j ON j.run_id = c.run_id WHERE c.run_id = ? AND j.status = 'failed'`).get(runId) as SqlRow | undefined;
+    if (!row) return null;
+    try {
+      const parsed: unknown = JSON.parse(String(row.candidate));
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
+        || typeof (parsed as { prose?: unknown }).prose !== 'string') return null;
+      return { prose: (parsed as { prose: string }).prose, digest: String(row.digest) };
+    } catch { return null; }
   }
 
   create(input: CreateTurnJobInput): CreateTurnJobResult {
@@ -848,6 +959,17 @@ export class TurnJobManager {
     const sessionId = requireOpaque(sessionIdValue, 'sessionId');
     this.#db.exec('BEGIN IMMEDIATE;');
     try {
+      const operationTables = this.#db.prepare(`SELECT name FROM sqlite_master WHERE type='table'
+        AND name IN ('turn_operation_budget_v3','turn_operation_attempt_v3','turn_operation_hold_v3')`).all();
+      if (operationTables.length !== 0 && operationTables.length !== 3) {
+        throw new Error('turn-operation-privacy-schema-incomplete');
+      }
+      if (operationTables.length === 3) {
+        for (const table of ['turn_operation_attempt_v3', 'turn_operation_hold_v3', 'turn_operation_budget_v3']) {
+          this.#db.prepare(`DELETE FROM ${table} WHERE operation_id IN
+            (SELECT run_id FROM turn_job WHERE session_id = ?)`).run(sessionId);
+        }
+      }
       const bindingRow = this.#db.prepare(`
         SELECT COUNT(*) AS count FROM turn_job_idempotency WHERE session_id = ?
       `).get(sessionId) as { count: number };

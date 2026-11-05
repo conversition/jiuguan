@@ -1,14 +1,24 @@
+import {
+  parseRuntimeSessionScope,
+  runtimeSessionScopeAllows,
+  type RuntimeSessionScope,
+} from './managed-local-session-scope.ts';
+
 export interface MaintenanceAdmissionRuntimeConfig {
   readonly mode: 'off' | 'shadow' | 'enforce';
   readonly enabled: boolean;
   readonly executionEnabled: boolean;
   readonly sessionAllowlist: ReadonlySet<string>;
+  readonly sessionScope: RuntimeSessionScope;
   readonly sessionBudgetLimit: number;
   readonly dailyBudgetLimit: number;
 }
 
 export const MAINTENANCE_ENFORCE_ACK = 'p14-maintenance-enforce-v2' as const;
-export const DEFAULT_MAINTENANCE_SESSION_BUDGET_24H = 16 as const;
+// Keep enough per-session headroom for the 20-sample Maintenance validation
+// window. A lower default makes that window impossible to complete in one
+// rolling day even when every admitted job succeeds.
+export const DEFAULT_MAINTENANCE_SESSION_BUDGET_24H = 24 as const;
 export const DEFAULT_MAINTENANCE_DAILY_BUDGET_24H = 32 as const;
 export const MAX_MAINTENANCE_DAILY_BUDGET_24H = 32 as const;
 
@@ -62,6 +72,7 @@ export function parseMaintenanceAdmissionRuntimeConfig(
     enabled: false,
     executionEnabled: false,
     sessionAllowlist: new Set<string>(),
+    sessionScope: 'exact',
     sessionBudgetLimit,
     dailyBudgetLimit,
   });
@@ -70,6 +81,7 @@ export function parseMaintenanceAdmissionRuntimeConfig(
     enabled: true,
     executionEnabled: false,
     sessionAllowlist: new Set<string>(),
+    sessionScope: 'exact',
     sessionBudgetLimit,
     dailyBudgetLimit,
   });
@@ -82,14 +94,18 @@ export function parseMaintenanceAdmissionRuntimeConfig(
     );
   }
   const sessionAllowlist = parseAllowlist(env.JG_MAINTENANCE_ADMISSION_SESSION_ALLOWLIST);
-  if (sessionAllowlist.size === 0) {
-    throw new Error('enforce 需要非空 JG_MAINTENANCE_ADMISSION_SESSION_ALLOWLIST');
+  const sessionScope = parseRuntimeSessionScope(env);
+  if (sessionAllowlist.size === 0 && sessionScope === 'exact') {
+    throw new Error(
+      'enforce 需要非空 JG_MAINTENANCE_ADMISSION_SESSION_ALLOWLIST 或显式 managed-local scope',
+    );
   }
   return Object.freeze({
     mode: 'enforce',
     enabled: true,
     executionEnabled: true,
     sessionAllowlist,
+    sessionScope,
     sessionBudgetLimit,
     dailyBudgetLimit,
   });
@@ -99,5 +115,6 @@ export function maintenanceAdmissionAllowsSession(
   config: MaintenanceAdmissionRuntimeConfig,
   sessionId: string,
 ): boolean {
-  return config.executionEnabled && config.sessionAllowlist.has(sessionId);
+  return config.executionEnabled
+    && runtimeSessionScopeAllows(config.sessionScope, config.sessionAllowlist, sessionId);
 }

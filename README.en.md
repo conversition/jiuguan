@@ -47,6 +47,24 @@ start fail-closed:
 No historical test session or authorization window is bundled. Enabling a lane requires an exact
 session, a physical-request ceiling, a cost ceiling and a rollback policy.
 
+## Snapshot update (2026-11-05)
+
+This snapshot re-exports the internal development line `5a0aa7d`:
+
+- ChatSession moved into its own `packages/session` package; turn commit, context assembly and state
+  writes now share one entry point.
+- Added `packages/skill-hub` with the Skill package lifecycle commands
+  (`skill:package-propose / verify / apply / migrate`) and the `skill:real-*` gates.
+- Added the Agent loop production dispatcher, admission fences, completion gates and an evidence
+  ledger — all still disabled by the public profile.
+- Added `packages/agent-closure` and `pnpm p16:closure-report` for per-domain closure evidence.
+- Variable patch applies and rollbacks are recorded as body-free, INSERT-only observations.
+- Model IDs may contain non-ASCII characters, fixing 500s on providers that use Chinese model names.
+- The asset library now resolves through `JG_ASSET_BASE` or `<data dir>\library`.
+
+Style and procedure text tables ship **empty** in the public tree: they are user assets, materialised
+locally with `JG_STYLE_SRC` and `pnpm style:import`. Worldbooks are never preselected.
+
 ## Quick start
 
 Requirements: Windows 10/11 x64, Node.js `22.22.2`, pnpm `10.33.0`, Git and a modern browser.

@@ -50,7 +50,27 @@ export interface HostReleaseManifestV2 extends HostReleaseManifestBase {
   };
 }
 
-export type HostReleaseManifest = HostReleaseManifestV1 | HostReleaseManifestV2;
+export interface HostReleaseManifestV3 extends HostReleaseManifestBase {
+  readonly version: 3;
+  readonly schemas: {
+    readonly memory: number;
+    readonly auth: number;
+    readonly turnJobs: number;
+    readonly maintenance: number;
+    readonly interactiveLedger: number;
+    readonly modelUsage: number;
+    readonly agentAdmission: number;
+    readonly agentLearning: number;
+    readonly arcProjection: number;
+    readonly agentControl: number;
+    readonly agentClosure: number;
+  };
+}
+
+export type HostReleaseManifest =
+  | HostReleaseManifestV1
+  | HostReleaseManifestV2
+  | HostReleaseManifestV3;
 
 const RELEASE_ID = /^[A-Za-z0-9._-]{1,80}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
@@ -98,12 +118,15 @@ export function parseHostReleaseManifest(value: unknown): HostReleaseManifest {
   ]);
   const components = exactObject(row.components, ['server', 'web', 'plugin']);
   const protocol = exactObject(row.protocol, ['api', 'minClient', 'maxClient']);
-  if (row.version !== 1 && row.version !== 2) throw new Error('host-release-manifest-invalid');
+  if (row.version !== 1 && row.version !== 2 && row.version !== 3) {
+    throw new Error('host-release-manifest-invalid');
+  }
   const schemaKeys = row.version === 1
     ? ['memory', 'auth', 'turnJobs', 'maintenance', 'interactiveLedger']
     : [
       'memory', 'auth', 'turnJobs', 'maintenance', 'interactiveLedger',
       'modelUsage', 'agentAdmission', 'agentLearning', 'arcProjection', 'agentControl',
+      ...(row.version === 3 ? ['agentClosure'] : []),
     ];
   const schemas = exactObject(row.schemas, schemaKeys);
   const artifacts = exactObject(row.artifacts, [
@@ -149,16 +172,25 @@ export function parseHostReleaseManifest(value: unknown): HostReleaseManifest {
   if (row.version === 1) {
     return Object.freeze({ ...common, version: 1, schemas: Object.freeze(legacySchemas) });
   }
-  return Object.freeze({
+  const modernSchemas = {
+    ...legacySchemas,
+    modelUsage: positiveInt(schemas.modelUsage),
+    agentAdmission: positiveInt(schemas.agentAdmission),
+    agentLearning: positiveInt(schemas.agentLearning),
+    arcProjection: positiveInt(schemas.arcProjection),
+    agentControl: positiveInt(schemas.agentControl),
+  } as const;
+  if (row.version === 2) return Object.freeze({
     ...common,
     version: 2,
+    schemas: Object.freeze(modernSchemas),
+  });
+  return Object.freeze({
+    ...common,
+    version: 3,
     schemas: Object.freeze({
-      ...legacySchemas,
-      modelUsage: positiveInt(schemas.modelUsage),
-      agentAdmission: positiveInt(schemas.agentAdmission),
-      agentLearning: positiveInt(schemas.agentLearning),
-      arcProjection: positiveInt(schemas.arcProjection),
-      agentControl: positiveInt(schemas.agentControl),
+      ...modernSchemas,
+      agentClosure: positiveInt(schemas.agentClosure),
     }),
   });
 }
@@ -195,12 +227,51 @@ export function loadHostRelease(layout: ReleaseHostLayout, releaseId: string): H
   return manifest;
 }
 
-export function assertRollbackCompatible(current: HostReleaseManifest, target: HostReleaseManifest): void {
-  if (current.version !== 2 || target.version !== 2) throw new Error('host-release-schema-proof-incomplete');
-  if (Object.keys(current.schemas).some((key) => (
-    current.schemas[key as keyof typeof current.schemas] !== target.schemas[key as keyof typeof target.schemas]
-  ))) throw new Error('host-release-schema-incompatible');
+function schemasMatch(
+  left: Readonly<Record<string, number>>,
+  right: Readonly<Record<string, number>>,
+): boolean {
+  const leftKeys = Object.keys(left).sort();
+  const rightKeys = Object.keys(right).sort();
+  return leftKeys.length === rightKeys.length
+    && leftKeys.every((key, index) => key === rightKeys[index] && left[key] === right[key]);
+}
+
+function protocolCompatible(current: HostReleaseManifest, target: HostReleaseManifest): void {
   if (target.protocol.api < current.protocol.minClient || target.protocol.api > current.protocol.maxClient) {
     throw new Error('host-release-protocol-incompatible');
   }
+}
+
+/** Forward activation may add the isolated Agent closure sidecar. */
+export function assertActivationCompatible(
+  current: HostReleaseManifest,
+  target: HostReleaseManifest,
+): void {
+  if (current.version === 2 && target.version === 3) {
+    const { agentClosure: _additiveSidecar, ...targetShared } = target.schemas;
+    if (!schemasMatch(current.schemas, targetShared)) {
+      throw new Error('host-release-schema-incompatible');
+    }
+  } else if (current.version === target.version && current.version !== 1) {
+    if (!schemasMatch(current.schemas, target.schemas)) {
+      throw new Error('host-release-schema-incompatible');
+    }
+  } else {
+    throw new Error('host-release-schema-proof-incomplete');
+  }
+  protocolCompatible(current, target);
+}
+
+export function assertRollbackCompatible(current: HostReleaseManifest, target: HostReleaseManifest): void {
+  if (current.version === 2 && target.version === 2) {
+    if (!schemasMatch(current.schemas, target.schemas)) throw new Error('host-release-schema-incompatible');
+  } else if (current.version === 3 && target.version === 3) {
+    if (!schemasMatch(current.schemas, target.schemas)) throw new Error('host-release-schema-incompatible');
+  } else {
+    // V1 lacks the full control-schema proof. Cross-manifest-version rollback is
+    // deliberately fail-closed even when the currently shared fields happen to match.
+    throw new Error('host-release-schema-proof-incomplete');
+  }
+  protocolCompatible(current, target);
 }

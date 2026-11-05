@@ -1,0 +1,16 @@
+{
+  "name": "@jiuguan/session",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "sideEffects": true,
+  "scripts": {
+    "test:nsfw-production": "node --experimental-strip-types --experimental-transform-types tests/verify-nsfw-production.ts"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./session": "./src/session.ts",
+    "./storyboard": "./src/storyboard-orchestrator.ts",
+    "./video-prompt": "./src/video-prompt-generator.ts"
+  }
+}

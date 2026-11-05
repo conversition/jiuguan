@@ -21,7 +21,7 @@ function main(): void {
     throw new Error('--purpose 只允许 replay、recovery 或 lane-traffic');
   }
   const sessionId = option(argv, '--session');
-  if (!sessionId) throw new Error('--session 必填；公开版不绑定任何私人会话');
+  if (!sessionId) throw new Error('缺少 --session：请显式指定要检查的会话 id');
   if (!/^session-[A-Za-z0-9._-]{1,220}$/u.test(sessionId)) throw new Error('--session 非法');
   const data = resolveP14OperationalDataDirectory({
     explicit: option(argv, '--dir'),
@@ -30,7 +30,7 @@ function main(): void {
     dataDir: data.path,
     sessionId,
     profileFile: option(argv, '--profile')
-      ?? resolve('tools', 'windows', 'public-safe-v0.1.env'),
+      ?? resolve('tools', 'windows', 'learning-maintenance-test-session-v1.env'),
   });
   const selectedReady = purpose === 'replay'
     ? report.readiness.syntheticReplayInfrastructure.ready

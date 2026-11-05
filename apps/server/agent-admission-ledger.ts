@@ -1,7 +1,8 @@
 import { chmodSync, existsSync, lstatSync, mkdirSync } from 'node:fs';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { types as nodeTypes } from 'node:util';
 import {
   POLICY_ROUTER_LEGACY_VERSION,
   POLICY_ROUTER_VERSION,
@@ -19,8 +20,11 @@ import {
 } from '../../packages/agent-policy/src/policy-router.ts';
 import {
   MAINTENANCE_ADMISSION_REASON_CODES,
+  MAINTENANCE_ADMISSION_POLICY_VERSION,
   MAINTENANCE_ADMISSION_TASKS,
+  LEGACY_MAINTENANCE_ADMISSION_TASKS,
   evaluateMaintenanceAdmissionBatch,
+  evaluateLegacyMaintenanceAdmissionBatch,
   MAINTENANCE_ADMISSION_POLICY_VERSIONS,
   normalizeMaintenanceAdmissionFacts,
   type MaintenanceAdmissionAudit,
@@ -54,8 +58,9 @@ import {
 import type { ProviderFailureDiagnosticCode } from '../../packages/proxy/src/provider-registry.ts';
 
 export const AGENT_ADMISSION_DB_FILE = 'agent-admission.sqlite';
-export const AGENT_ADMISSION_SCHEMA_VERSION = 7;
+export const AGENT_ADMISSION_SCHEMA_VERSION = 9;
 export const AGENT_ADMISSION_APPLICATION_ID = 0x4a474144; // JGAD
+export const MAX_MAINTENANCE_PARENT_RUN_IDS_PER_QUERY = 256;
 
 export interface AgentAdmissionRow {
   readonly decisionId: string;
@@ -153,6 +158,24 @@ export interface AgentAdmissionSessionDeleteResult {
   readonly runtimeLeaseOutcomes: number;
 }
 
+/**
+ * Durable no-ABA coordinate for Maintenance admission rows.
+ *
+ * A writable AgentAdmissionLedger open rotates generation. Revision is
+ * monotonic within that generation's database lineage and is advanced by
+ * SQLite triggers for every Maintenance INSERT, UPDATE and DELETE row.
+ */
+export interface MaintenanceAdmissionAuthorityCoordinate {
+  readonly generation: string;
+  readonly revision: number;
+}
+
+/** Frozen, read-only values exposed while the ledger's writer lock is held. */
+export interface MaintenanceAdmissionClaimFenceSnapshot {
+  readonly authority: MaintenanceAdmissionAuthorityCoordinate;
+  readonly admissions: readonly MaintenanceAdmissionRow[];
+}
+
 type Row = Record<string, unknown>;
 const DIGEST_RE = /^sha256:[a-f0-9]{64}$/u;
 const DIRECTOR_CRITIC_TABLE_SQL = `
@@ -229,6 +252,305 @@ const RUNTIME_LEASE_TABLE_SQL = `
   CREATE INDEX agent_runtime_lease_outcome_idx ON agent_runtime_lease_outcome(outcome, finished_at);
 `;
 
+const MAINTENANCE_ADMISSION_TABLE_SQL = `
+  CREATE TABLE maintenance_admission_decision (
+    decision_id TEXT PRIMARY KEY,
+    parent_run_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    round INTEGER NOT NULL CHECK(round >= 1),
+    source_revision TEXT NOT NULL,
+    task_kind TEXT NOT NULL CHECK(task_kind IN (
+      'memory_consolidation','branch_index','rolling_summary','npc_state','worldbook_repair'
+    )),
+    policy_version TEXT NOT NULL,
+    verdict TEXT NOT NULL CHECK(verdict IN ('would-admit','would-deny')),
+    reason_codes_json TEXT NOT NULL,
+    facts_digest TEXT NOT NULL,
+    source_digest TEXT NOT NULL,
+    recent_success_digest TEXT,
+    observation_digest TEXT NOT NULL,
+    has_stable_revision INTEGER NOT NULL CHECK(has_stable_revision IN (0,1)),
+    new_event_count INTEGER NOT NULL CHECK(new_event_count >= 0),
+    sample_count INTEGER NOT NULL CHECK(sample_count >= 0),
+    entity_signal_count INTEGER NOT NULL CHECK(entity_signal_count >= 0),
+    foreground_active INTEGER NOT NULL CHECK(foreground_active IN (0,1)),
+    prior_state TEXT NOT NULL CHECK(prior_state IN ('none','queued','running','succeeded','terminal')),
+    same_source_succeeded INTEGER NOT NULL CHECK(same_source_succeeded IN (0,1)),
+    cooldown_elapsed_ms INTEGER NOT NULL CHECK(cooldown_elapsed_ms >= 0),
+    cooldown_required_ms INTEGER NOT NULL CHECK(cooldown_required_ms >= 0),
+    session_budget_remaining INTEGER NOT NULL CHECK(session_budget_remaining >= 0),
+    daily_budget_remaining INTEGER NOT NULL CHECK(daily_budget_remaining >= 0),
+    created_at TEXT NOT NULL,
+    UNIQUE(parent_run_id, task_kind, source_revision, policy_version)
+  );
+  CREATE INDEX maintenance_admission_parent ON maintenance_admission_decision(parent_run_id, created_at);
+  CREATE INDEX maintenance_admission_session ON maintenance_admission_decision(session_id, created_at);
+  CREATE INDEX maintenance_admission_task ON maintenance_admission_decision(task_kind, verdict, created_at);
+`;
+
+const MAX_AUTHORITY_REVISION = Number.MAX_SAFE_INTEGER;
+const MAINTENANCE_AUTHORITY_GENERATION_RE = /^maintenance-admission:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const MAINTENANCE_AUTHORITY_TRIGGER_NAMES = Object.freeze([
+  'maintenance_admission_authority_insert',
+  'maintenance_admission_authority_update',
+  'maintenance_admission_authority_delete',
+] as const);
+type MaintenanceAuthorityOperation = 'insert' | 'update' | 'delete';
+const MAINTENANCE_AUTHORITY_TABLE_SQL = `
+  CREATE TABLE IF NOT EXISTS maintenance_admission_authority (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    generation TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK(revision >= 0 AND revision <= ${MAX_AUTHORITY_REVISION})
+  ) WITHOUT ROWID;
+`;
+function maintenanceAuthorityTriggerSql(operation: MaintenanceAuthorityOperation): string {
+  return `
+  CREATE TRIGGER IF NOT EXISTS maintenance_admission_authority_${operation}
+  AFTER ${operation.toUpperCase()} ON maintenance_admission_decision
+  BEGIN
+    UPDATE maintenance_admission_authority
+    SET revision = revision + 1
+    WHERE singleton = 1;
+    SELECT CASE WHEN changes() <> 1
+      THEN RAISE(ABORT, 'maintenance-admission-authority-invalid') END;
+  END;
+`;
+}
+const MAINTENANCE_AUTHORITY_TRIGGER_SQL = [
+  maintenanceAuthorityTriggerSql('insert'),
+  maintenanceAuthorityTriggerSql('update'),
+  maintenanceAuthorityTriggerSql('delete'),
+].join('\n');
+
+function normalizeMaintenanceAuthoritySql(value: string): string {
+  return value.trim().replace(/\s+/gu, ' ').toLowerCase().replace(/;$/u, '');
+}
+
+interface MaintenanceAuthorityExpectedTrigger {
+  readonly name: string;
+  readonly sql: string;
+}
+
+function expectedMaintenanceAuthorityTriggers(): MaintenanceAuthorityExpectedTrigger[] {
+  return (['insert', 'update', 'delete'] as const).map((operation) => ({
+    name: `maintenance_admission_authority_${operation}`,
+    sql: normalizeMaintenanceAuthoritySql(
+      maintenanceAuthorityTriggerSql(operation).replace('IF NOT EXISTS ', ''),
+    ),
+  })).sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function newMaintenanceAuthorityGeneration(): string {
+  return `maintenance-admission:${randomUUID()}`;
+}
+
+function rebuildMaintenanceAuthorityTriggers(db: DatabaseSync): void {
+  for (const name of MAINTENANCE_AUTHORITY_TRIGGER_NAMES) {
+    db.exec(`DROP TRIGGER IF EXISTS ${name};`);
+  }
+  db.exec(MAINTENANCE_AUTHORITY_TRIGGER_SQL);
+  const triggers = db.prepare(`
+    SELECT name
+    FROM sqlite_master
+    WHERE type='trigger' AND tbl_name='maintenance_admission_decision'
+    ORDER BY name
+  `).all() as Array<{ name: string }>;
+  const expected = [...MAINTENANCE_AUTHORITY_TRIGGER_NAMES].sort();
+  if (triggers.length !== expected.length
+    || triggers.some((row, index) => row.name !== expected[index])) {
+    throw new Error('maintenance-admission-authority-triggers-invalid');
+  }
+}
+
+function ensureMaintenanceAuthorityV9(db: DatabaseSync): void {
+  db.exec(MAINTENANCE_AUTHORITY_TABLE_SQL);
+  db.prepare(`
+    INSERT OR IGNORE INTO maintenance_admission_authority(singleton,generation,revision)
+    VALUES(1,?,0)
+  `).run(newMaintenanceAuthorityGeneration());
+  rebuildMaintenanceAuthorityTriggers(db);
+}
+
+function maintenanceAuthorityGeneration(value: unknown): string {
+  const generation = token(value, 'maintenance-admission-generation');
+  if (!MAINTENANCE_AUTHORITY_GENERATION_RE.test(generation)) {
+    throw new Error('maintenance-admission-generation-invalid');
+  }
+  return generation;
+}
+
+function maintenanceAuthorityCoordinate(db: DatabaseSync): MaintenanceAdmissionAuthorityCoordinate {
+  const rows = db.prepare(`
+    SELECT singleton,generation,revision
+    FROM maintenance_admission_authority
+  `).all() as Row[];
+  const row = rows[0];
+  if (rows.length !== 1 || row?.singleton !== 1) {
+    throw new Error('maintenance-admission-authority-invalid');
+  }
+  return Object.freeze({
+    generation: maintenanceAuthorityGeneration(row.generation),
+    revision: nonNegative(row.revision, 'maintenance-admission-revision'),
+  });
+}
+
+/** Claim-time validation only. This function must never repair persisted schema. */
+function inspectMaintenanceAuthoritySchema(
+  db: DatabaseSync,
+): MaintenanceAdmissionAuthorityCoordinate {
+  const table = db.prepare(`
+    SELECT type,sql FROM sqlite_master
+    WHERE name='maintenance_admission_authority' COLLATE NOCASE
+    LIMIT 1
+  `).get() as { type?: unknown; sql?: unknown } | undefined;
+  const columns = (db.prepare(
+    'PRAGMA table_info(maintenance_admission_authority)',
+  ).all() as Array<{ name?: unknown }>).map((row) => String(row.name ?? '')).join(',');
+  const expectedTableSql = normalizeMaintenanceAuthoritySql(
+    MAINTENANCE_AUTHORITY_TABLE_SQL.replace('IF NOT EXISTS ', ''),
+  );
+  if (table?.type !== 'table' || typeof table.sql !== 'string'
+    || normalizeMaintenanceAuthoritySql(table.sql) !== expectedTableSql
+    || columns !== 'singleton,generation,revision') {
+    throw new Error('maintenance-admission-authority-table-invalid');
+  }
+
+  const coordinate = maintenanceAuthorityCoordinate(db);
+  const main = db.prepare(`
+    SELECT name,tbl_name,sql FROM sqlite_master WHERE type='trigger'
+  `).all() as Array<{ name?: unknown; tbl_name?: unknown; sql?: unknown }>;
+  const temporary = db.prepare(`
+    SELECT name,tbl_name,sql FROM sqlite_temp_master WHERE type='trigger'
+  `).all() as Array<{ name?: unknown; tbl_name?: unknown; sql?: unknown }>;
+  const actual = [...main, ...temporary].flatMap((row): MaintenanceAuthorityExpectedTrigger[] => {
+    const name = typeof row.name === 'string' ? row.name : '';
+    const tableName = typeof row.tbl_name === 'string' ? row.tbl_name : '';
+    const sql = typeof row.sql === 'string' ? normalizeMaintenanceAuthoritySql(row.sql) : '';
+    return tableName.toLowerCase() === 'maintenance_admission_decision'
+      || name.startsWith('maintenance_admission_authority_')
+      || sql.includes('maintenance_admission_authority')
+      ? [{ name, sql }]
+      : [];
+  }).sort((left, right) => left.name.localeCompare(right.name));
+  const expected = expectedMaintenanceAuthorityTriggers();
+  if (actual.length !== expected.length) {
+    throw new Error('maintenance-admission-authority-trigger-set-invalid');
+  }
+  for (let index = 0; index < expected.length; index += 1) {
+    if (actual[index]?.name !== expected[index]?.name
+      || actual[index]?.sql !== expected[index]?.sql) {
+      throw new Error('maintenance-admission-authority-trigger-definition-invalid');
+    }
+  }
+  return coordinate;
+}
+
+function rotateMaintenanceAuthorityGeneration(db: DatabaseSync): void {
+  db.exec('BEGIN IMMEDIATE;');
+  try {
+    // Validate persisted identity before replacing it; corruption must not be
+    // hidden by startup rotation. Rebuild the exact schema-v9 trigger set
+    // under the same writer reservation so deleted/tampered triggers self-heal.
+    maintenanceAuthorityCoordinate(db);
+    rebuildMaintenanceAuthorityTriggers(db);
+    const result = db.prepare(`
+      UPDATE maintenance_admission_authority
+      SET generation=?
+      WHERE singleton=1
+    `).run(newMaintenanceAuthorityGeneration());
+    if (result.changes !== 1) throw new Error('maintenance-admission-authority-invalid');
+    db.exec('COMMIT;');
+  } catch (error) {
+    try { db.exec('ROLLBACK;'); } catch { /* preserve original */ }
+    throw error;
+  }
+}
+
+const INTRINSIC_PROMISE = Promise;
+const INTRINSIC_PROMISE_THEN = Promise.prototype.then;
+const INTRINSIC_PROMISE_SPECIES = Object.getOwnPropertyDescriptor(Promise, Symbol.species)?.get;
+const ASYNC_FUNCTION_PROTOTYPE = Object.getPrototypeOf(async function maintenanceFenceAsync() {});
+const GENERATOR_FUNCTION_PROTOTYPE = Object.getPrototypeOf(function* maintenanceFenceGenerator() {});
+const ASYNC_GENERATOR_FUNCTION_PROTOTYPE = Object.getPrototypeOf(
+  async function* maintenanceFenceAsyncGenerator() {},
+);
+
+/** Mark only an ordinary native Promise handled; never assimilate a foreign thenable. */
+function observeOrdinaryPromise(value: unknown): void {
+  if (!nodeTypes.isPromise(value) || nodeTypes.isProxy(value)) return;
+  const originalConstructor = Object.getOwnPropertyDescriptor(value, 'constructor');
+  const intrinsicConstructor = Object.getOwnPropertyDescriptor(
+    INTRINSIC_PROMISE.prototype,
+    'constructor',
+  );
+  const intrinsicSpecies = Object.getOwnPropertyDescriptor(INTRINSIC_PROMISE, Symbol.species);
+  if (!intrinsicConstructor || !Object.hasOwn(intrinsicConstructor, 'value')
+    || intrinsicConstructor.value !== INTRINSIC_PROMISE
+    || !intrinsicSpecies || intrinsicSpecies.get !== INTRINSIC_PROMISE_SPECIES
+    || intrinsicSpecies.set !== undefined) return;
+
+  let shadowedConstructor = false;
+  try {
+    if (!originalConstructor && Object.getPrototypeOf(value) === INTRINSIC_PROMISE.prototype) {
+      void INTRINSIC_PROMISE_THEN.call(value, () => undefined, () => undefined);
+      return;
+    }
+    if (!originalConstructor || originalConstructor.configurable
+      || (Object.hasOwn(originalConstructor, 'value') && originalConstructor.writable === true)) {
+      Object.defineProperty(value, 'constructor', {
+        configurable: originalConstructor?.configurable ?? true,
+        enumerable: originalConstructor?.enumerable ?? false,
+        value: INTRINSIC_PROMISE,
+        writable: originalConstructor && Object.hasOwn(originalConstructor, 'value')
+          ? originalConstructor.writable
+          : true,
+      });
+      shadowedConstructor = true;
+    } else if (!Object.hasOwn(originalConstructor, 'value')
+      || originalConstructor.value !== INTRINSIC_PROMISE) return;
+    void INTRINSIC_PROMISE_THEN.call(value, () => undefined, () => undefined);
+  } catch {
+    // The value is already rejected as invalid synchronous authority.
+  } finally {
+    if (shadowedConstructor) {
+      try {
+        if (originalConstructor) Object.defineProperty(value, 'constructor', originalConstructor);
+        else Reflect.deleteProperty(value, 'constructor');
+      } catch {
+        // Native non-Proxy Promises have ordinary property semantics.
+      }
+    }
+  }
+}
+
+function maintenanceFenceResultIsAsynchronous(value: unknown): boolean {
+  if ((typeof value !== 'object' && typeof value !== 'function') || value === null) return false;
+  if (nodeTypes.isProxy(value)) return true;
+  if (nodeTypes.isGeneratorObject(value)) return true;
+  if (nodeTypes.isPromise(value)) {
+    observeOrdinaryPromise(value);
+    return true;
+  }
+  let current: object | null = value;
+  while (current !== null) {
+    if (nodeTypes.isProxy(current)) return true;
+    const then = Object.getOwnPropertyDescriptor(current, 'then');
+    if (then) {
+      return !Object.hasOwn(then, 'value') || typeof then.value === 'function';
+    }
+    current = Object.getPrototypeOf(current) as object | null;
+  }
+  return false;
+}
+
+function maintenanceFenceCallbackIsDeferred(callback: (...args: never[]) => unknown): boolean {
+  if (nodeTypes.isAsyncFunction(callback) || nodeTypes.isGeneratorFunction(callback)) return true;
+  const prototype = Object.getPrototypeOf(callback);
+  return prototype === ASYNC_FUNCTION_PROTOTYPE
+    || prototype === GENERATOR_FUNCTION_PROTOTYPE
+    || prototype === ASYNC_GENERATOR_FUNCTION_PROTOTYPE;
+}
+
 function pragma(db: DatabaseSync, name: 'application_id' | 'user_version'): number {
   const value = (db.prepare(`PRAGMA ${name}`).get() as Row | undefined)?.[name];
   if (!Number.isSafeInteger(value)) throw new Error(`agent-admission-${name}-invalid`);
@@ -301,6 +623,34 @@ function rebuildRuntimeLeaseV7(db: DatabaseSync): void {
   `);
 }
 
+function rebuildMaintenanceAdmissionV8(db: DatabaseSync): void {
+  // SQLite cannot widen an existing CHECK constraint in place. Rebuild the
+  // append-only ledger without synthesizing worldbook rows for historical
+  // four-task batches; those rows remain byte-for-byte attributable.
+  db.exec(`
+    ALTER TABLE maintenance_admission_decision RENAME TO maintenance_admission_decision_v7;
+    DROP INDEX IF EXISTS maintenance_admission_parent;
+    DROP INDEX IF EXISTS maintenance_admission_session;
+    DROP INDEX IF EXISTS maintenance_admission_task;
+    ${MAINTENANCE_ADMISSION_TABLE_SQL}
+    INSERT INTO maintenance_admission_decision(
+      decision_id,parent_run_id,session_id,round,source_revision,task_kind,policy_version,
+      verdict,reason_codes_json,facts_digest,source_digest,recent_success_digest,observation_digest,
+      has_stable_revision,new_event_count,sample_count,entity_signal_count,foreground_active,
+      prior_state,same_source_succeeded,cooldown_elapsed_ms,cooldown_required_ms,
+      session_budget_remaining,daily_budget_remaining,created_at
+    )
+    SELECT
+      decision_id,parent_run_id,session_id,round,source_revision,task_kind,policy_version,
+      verdict,reason_codes_json,facts_digest,source_digest,recent_success_digest,observation_digest,
+      has_stable_revision,new_event_count,sample_count,entity_signal_count,foreground_active,
+      prior_state,same_source_succeeded,cooldown_elapsed_ms,cooldown_required_ms,
+      session_budget_remaining,daily_budget_remaining,created_at
+    FROM maintenance_admission_decision_v7;
+    DROP TABLE maintenance_admission_decision_v7;
+  `);
+}
+
 function initialize(db: DatabaseSync): void {
   const version = pragma(db, 'user_version');
   const appId = pragma(db, 'application_id');
@@ -309,11 +659,38 @@ function initialize(db: DatabaseSync): void {
     if (appId !== AGENT_ADMISSION_APPLICATION_ID) throw new Error('agent-admission-metadata-mismatch');
     return;
   }
+  if (version === 8) {
+    if (appId !== AGENT_ADMISSION_APPLICATION_ID) throw new Error('agent-admission-metadata-mismatch');
+    db.exec('BEGIN IMMEDIATE;');
+    try {
+      ensureMaintenanceAuthorityV9(db);
+      db.exec(`PRAGMA user_version = ${AGENT_ADMISSION_SCHEMA_VERSION}; COMMIT;`);
+      return;
+    } catch (error) {
+      try { db.exec('ROLLBACK;'); } catch { /* preserve original */ }
+      throw error;
+    }
+  }
+  if (version === 7) {
+    if (appId !== AGENT_ADMISSION_APPLICATION_ID) throw new Error('agent-admission-metadata-mismatch');
+    db.exec('BEGIN IMMEDIATE;');
+    try {
+      rebuildMaintenanceAdmissionV8(db);
+      ensureMaintenanceAuthorityV9(db);
+      db.exec(`PRAGMA user_version = ${AGENT_ADMISSION_SCHEMA_VERSION}; COMMIT;`);
+      return;
+    } catch (error) {
+      try { db.exec('ROLLBACK;'); } catch { /* preserve original */ }
+      throw error;
+    }
+  }
   if (version === 6) {
     if (appId !== AGENT_ADMISSION_APPLICATION_ID) throw new Error('agent-admission-metadata-mismatch');
     db.exec('BEGIN IMMEDIATE;');
     try {
       rebuildRuntimeLeaseV7(db);
+      rebuildMaintenanceAdmissionV8(db);
+      ensureMaintenanceAuthorityV9(db);
       db.exec(`PRAGMA user_version = ${AGENT_ADMISSION_SCHEMA_VERSION}; COMMIT;`);
       return;
     } catch (error) {
@@ -327,6 +704,8 @@ function initialize(db: DatabaseSync): void {
     try {
       ensureRuntimeLeaseV6Columns(db);
       rebuildRuntimeLeaseV7(db);
+      rebuildMaintenanceAdmissionV8(db);
+      ensureMaintenanceAuthorityV9(db);
       db.exec(`PRAGMA user_version = ${AGENT_ADMISSION_SCHEMA_VERSION}; COMMIT;`);
       return;
     } catch (error) {
@@ -341,6 +720,8 @@ function initialize(db: DatabaseSync): void {
       ensureRouterV2Columns(db);
       ensureRuntimeLeaseV6Columns(db);
       rebuildRuntimeLeaseV7(db);
+      rebuildMaintenanceAdmissionV8(db);
+      ensureMaintenanceAuthorityV9(db);
       db.exec(`PRAGMA user_version = ${AGENT_ADMISSION_SCHEMA_VERSION}; COMMIT;`);
       return;
     } catch (error) {
@@ -354,6 +735,8 @@ function initialize(db: DatabaseSync): void {
     try {
       db.exec(RUNTIME_LEASE_TABLE_SQL);
       ensureRouterV2Columns(db);
+      rebuildMaintenanceAdmissionV8(db);
+      ensureMaintenanceAuthorityV9(db);
       db.exec(`PRAGMA user_version = ${AGENT_ADMISSION_SCHEMA_VERSION};`);
       db.exec('COMMIT;');
       return;
@@ -368,6 +751,8 @@ function initialize(db: DatabaseSync): void {
     try {
       db.exec(`${DIRECTOR_CRITIC_TABLE_SQL} ${RUNTIME_LEASE_TABLE_SQL}`);
       ensureRouterV2Columns(db);
+      rebuildMaintenanceAdmissionV8(db);
+      ensureMaintenanceAuthorityV9(db);
       db.exec(`PRAGMA user_version = ${AGENT_ADMISSION_SCHEMA_VERSION};`);
       db.exec('COMMIT;');
       return;
@@ -387,7 +772,7 @@ function initialize(db: DatabaseSync): void {
           session_id TEXT NOT NULL,
           round INTEGER NOT NULL CHECK(round >= 1),
           source_revision TEXT NOT NULL,
-          task_kind TEXT NOT NULL CHECK(task_kind IN ('memory_consolidation','branch_index','rolling_summary','npc_state')),
+          task_kind TEXT NOT NULL CHECK(task_kind IN ('memory_consolidation','branch_index','rolling_summary','npc_state','worldbook_repair')),
           policy_version TEXT NOT NULL,
           verdict TEXT NOT NULL CHECK(verdict IN ('would-admit','would-deny')),
           reason_codes_json TEXT NOT NULL,
@@ -416,6 +801,7 @@ function initialize(db: DatabaseSync): void {
         ${RUNTIME_LEASE_TABLE_SQL}
       `);
       ensureRouterV2Columns(db);
+      ensureMaintenanceAuthorityV9(db);
       db.exec(`PRAGMA user_version = ${AGENT_ADMISSION_SCHEMA_VERSION};`);
       db.exec('COMMIT;');
       return;
@@ -474,7 +860,7 @@ function initialize(db: DatabaseSync): void {
         session_id TEXT NOT NULL,
         round INTEGER NOT NULL CHECK(round >= 1),
         source_revision TEXT NOT NULL,
-        task_kind TEXT NOT NULL CHECK(task_kind IN ('memory_consolidation','branch_index','rolling_summary','npc_state')),
+        task_kind TEXT NOT NULL CHECK(task_kind IN ('memory_consolidation','branch_index','rolling_summary','npc_state','worldbook_repair')),
         policy_version TEXT NOT NULL,
         verdict TEXT NOT NULL CHECK(verdict IN ('would-admit','would-deny')),
         reason_codes_json TEXT NOT NULL,
@@ -501,8 +887,9 @@ function initialize(db: DatabaseSync): void {
       CREATE INDEX maintenance_admission_task ON maintenance_admission_decision(task_kind, verdict, created_at);
       ${DIRECTOR_CRITIC_TABLE_SQL}
       ${RUNTIME_LEASE_TABLE_SQL}
-      PRAGMA user_version = ${AGENT_ADMISSION_SCHEMA_VERSION};
     `);
+    ensureMaintenanceAuthorityV9(db);
+    db.exec(`PRAGMA user_version = ${AGENT_ADMISSION_SCHEMA_VERSION};`);
     db.exec('COMMIT;');
   } catch (error) {
     try { db.exec('ROLLBACK;'); } catch { /* preserve original */ }
@@ -658,7 +1045,8 @@ const RUNTIME_LEASE_REASON_CODES = new Set<string>([
   'gateway-cost-budget-exhausted', 'gateway-wall-budget-exhausted',
   'gateway-provider-usage-unavailable', 'gateway-provider-usage-invalid',
   'gateway-provider-call-failed', 'gateway-provider-call-cancelled',
-  'gateway-lease-audit-failed',
+  'gateway-request-completion-failed',
+  'gateway-lease-audit-failed', 'gateway-dispatch-authority-denied',
 ]);
 const PROVIDER_DIAGNOSTIC_CODES = new Set<string>([
   'provider-not-configured', 'provider-authentication-failed', 'provider-request-invalid',
@@ -762,8 +1150,14 @@ function maintenanceDecisionIdentity(audit: MaintenanceAdmissionAudit): string {
   ].join('\0'), 'utf8').digest('hex')}`;
 }
 
-function validateMaintenanceBatch(input: readonly MaintenanceAdmissionAudit[]): readonly MaintenanceAdmissionAudit[] {
-  if (!Array.isArray(input) || input.length !== MAINTENANCE_ADMISSION_TASKS.length) {
+function validateMaintenanceBatch(
+  input: readonly MaintenanceAdmissionAudit[],
+  options: Readonly<{ allowHistoricalFourTaskBatch?: boolean }> = {},
+): readonly MaintenanceAdmissionAudit[] {
+  const historicalFourTaskBatch = Array.isArray(input)
+    && input.length === LEGACY_MAINTENANCE_ADMISSION_TASKS.length;
+  if (!Array.isArray(input) || (input.length !== MAINTENANCE_ADMISSION_TASKS.length
+    && !(options.allowHistoricalFourTaskBatch && historicalFourTaskBatch))) {
     throw new Error('maintenance-audit-batch-invalid');
   }
   const normalized = input.map((audit) => {
@@ -790,11 +1184,22 @@ function validateMaintenanceBatch(input: readonly MaintenanceAdmissionAudit[]): 
     || !MAINTENANCE_ADMISSION_POLICY_VERSIONS.includes(policyVersions[0] as never)) {
     throw new Error('maintenance-policy-version-mismatch');
   }
-  const expected = evaluateMaintenanceAdmissionBatch(
-    first.round,
-    normalized.map((audit) => audit.facts),
-    policyVersions[0] as (typeof MAINTENANCE_ADMISSION_POLICY_VERSIONS)[number],
-  );
+  const version = policyVersions[0] as (typeof MAINTENANCE_ADMISSION_POLICY_VERSIONS)[number];
+  // v3 is the first policy whose signed batch contract contains
+  // worldbook_repair. Bind shape to policy in both directions: v1/v2 are
+  // exactly four rows and v3 is exactly five. Otherwise a newly written v2
+  // five-row batch could later lose its worldbook row and masquerade as legacy.
+  if ((historicalFourTaskBatch && version === MAINTENANCE_ADMISSION_POLICY_VERSION)
+    || (!historicalFourTaskBatch && version !== MAINTENANCE_ADMISSION_POLICY_VERSION)) {
+    throw new Error('maintenance-audit-batch-invalid');
+  }
+  const expected = historicalFourTaskBatch
+    ? evaluateLegacyMaintenanceAdmissionBatch(
+      first.round, normalized.map((audit) => audit.facts), version,
+    )
+    : evaluateMaintenanceAdmissionBatch(
+      first.round, normalized.map((audit) => audit.facts), version,
+    );
   const expectedByTask = new Map(expected.map((decision) => [decision.taskKind, decision]));
   for (const audit of normalized) {
     const actual = audit.decision;
@@ -865,7 +1270,7 @@ function listMaintenanceRows(db: DatabaseSync, filters: MaintenanceAdmissionFilt
     validateMaintenanceBatch(group.map((row) => ({
       parentRunId: row.parentRunId, sessionId: row.sessionId, round: row.round,
       sourceRevision: row.sourceRevision, facts: row.facts, decision: row.decision, createdAt: row.createdAt,
-    })));
+    })), { allowHistoricalFourTaskBatch: true });
   }
   let filtered = rows;
   if (filters.taskKind !== undefined) filtered = filtered.filter((row) => row.facts.taskKind === maintenanceTask(filters.taskKind));
@@ -873,6 +1278,87 @@ function listMaintenanceRows(db: DatabaseSync, filters: MaintenanceAdmissionFilt
   const limit = filters.limit === undefined ? 1_000 : nonNegative(filters.limit, 'limit');
   if (limit < 1 || limit > 10_000) throw new Error('limit-invalid');
   return filtered.slice(0, limit);
+}
+
+/**
+ * Reads every persisted audit row for the requested Maintenance parent runs in
+ * one exact-session query. Unlike listMaintenance(), this is an execution
+ * cursor lookup rather than a paginated report, so it must never truncate a
+ * relevant batch behind older session history.
+ */
+function listMaintenanceRowsForParentRuns(
+  db: DatabaseSync,
+  sessionIdValue: string,
+  parentRunIdValues: readonly string[],
+): MaintenanceAdmissionRow[] {
+  const sessionId = token(sessionIdValue, 'session-id');
+  if (!Array.isArray(parentRunIdValues)
+    || parentRunIdValues.length > MAX_MAINTENANCE_PARENT_RUN_IDS_PER_QUERY) {
+    throw new Error('maintenance-parent-run-ids-invalid');
+  }
+  const parentRunIds = [...new Set(parentRunIdValues.map((value) => token(value, 'parent-run-id')))];
+  if (parentRunIds.length === 0) return [];
+  const placeholders = parentRunIds.map(() => '?').join(',');
+  const rows = (db.prepare(`
+    SELECT * FROM maintenance_admission_decision
+    WHERE session_id=? AND parent_run_id IN (${placeholders})
+    ORDER BY created_at,decision_id
+  `).all(sessionId, ...parentRunIds) as Row[]).map(parseMaintenanceRow);
+  const groups = new Map<string, MaintenanceAdmissionRow[]>();
+  for (const row of rows) {
+    const key = `${row.parentRunId}\0${row.sessionId}\0${row.round}\0${row.sourceRevision}\0${row.createdAt}`;
+    const group = groups.get(key) ?? [];
+    group.push(row);
+    groups.set(key, group);
+  }
+  for (const group of groups.values()) {
+    validateMaintenanceBatch(group.map((row) => ({
+      parentRunId: row.parentRunId, sessionId: row.sessionId, round: row.round,
+      sourceRevision: row.sourceRevision, facts: row.facts, decision: row.decision,
+      createdAt: row.createdAt,
+    })), { allowHistoricalFourTaskBatch: true });
+  }
+  return rows;
+}
+
+/**
+ * Reads only the newest complete Maintenance admission batch for one session.
+ *
+ * The anchor ordering intentionally matches the historical public projection:
+ * newest created_at wins and decision_id breaks timestamp ties. Selecting the
+ * envelope in SQL avoids parsing an unbounded session history merely to render
+ * the latest status.
+ */
+function latestMaintenanceBatchRows(
+  db: DatabaseSync,
+  sessionIdValue: string,
+): MaintenanceAdmissionRow[] {
+  const sessionId = token(sessionIdValue, 'session-id');
+  const rows = (db.prepare(`
+    WITH latest AS (
+      SELECT parent_run_id,session_id,round,source_revision,created_at
+      FROM maintenance_admission_decision
+      WHERE session_id=?
+      ORDER BY created_at DESC,decision_id DESC
+      LIMIT 1
+    )
+    SELECT maintenance_admission_decision.*
+    FROM maintenance_admission_decision
+    INNER JOIN latest
+      ON maintenance_admission_decision.parent_run_id=latest.parent_run_id
+      AND maintenance_admission_decision.session_id=latest.session_id
+      AND maintenance_admission_decision.round=latest.round
+      AND maintenance_admission_decision.source_revision=latest.source_revision
+      AND maintenance_admission_decision.created_at=latest.created_at
+    ORDER BY maintenance_admission_decision.created_at,maintenance_admission_decision.decision_id
+  `).all(sessionId) as Row[]).map(parseMaintenanceRow);
+  if (rows.length === 0) return rows;
+  validateMaintenanceBatch(rows.map((row) => ({
+    parentRunId: row.parentRunId, sessionId: row.sessionId, round: row.round,
+    sourceRevision: row.sourceRevision, facts: row.facts,
+    decision: row.decision, createdAt: row.createdAt,
+  })), { allowHistoricalFourTaskBatch: true });
+  return rows;
 }
 
 function directorVerdict(value: unknown): DirectorVerdict {
@@ -1108,6 +1594,7 @@ function listRuntimeLeaseRows(
   db: DatabaseSync,
   filters: AgentRuntimeLeaseFilters,
   schemaVersion = AGENT_ADMISSION_SCHEMA_VERSION,
+  window: 'oldest' | 'latest' = 'oldest',
 ): AgentRuntimeLeaseRow[] {
   const where: string[] = [];
   const params: Array<string | number> = [];
@@ -1128,9 +1615,17 @@ function listRuntimeLeaseRows(
   ` : schemaVersion === 6
     ? '*,model_calls_used AS authorization_calls_used,0 AS provider_error_attempts_used,NULL AS provider_diagnostic_code'
     : '*';
-  return (db.prepare(
-    `SELECT ${projection} FROM agent_runtime_lease_outcome${where.length ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY finished_at,lease_id_digest LIMIT ?`,
-  ).all(...params) as Row[]).map(parseRuntimeLeaseRow);
+  const select = `SELECT ${projection} FROM agent_runtime_lease_outcome${
+    where.length ? ` WHERE ${where.join(' AND ')}` : ''
+  }`;
+  // Reports retain their historical oldest-first page. Operational read models
+  // need the opposite window: select newest-N in SQL so rows beyond the cap do
+  // not make "recent" status freeze, then restore stable chronological order.
+  const sql = window === 'latest'
+    ? `SELECT * FROM (${select} ORDER BY finished_at DESC,lease_id_digest DESC LIMIT ?)
+       ORDER BY finished_at,lease_id_digest`
+    : `${select} ORDER BY finished_at,lease_id_digest LIMIT ?`;
+  return (db.prepare(sql).all(...params) as Row[]).map(parseRuntimeLeaseRow);
 }
 
 /**
@@ -1151,7 +1646,7 @@ export function readAgentAdmissionFile(file: string): AgentAdmissionFileRows {
     const applicationId = pragma(db, 'application_id');
     const schemaVersion = pragma(db, 'user_version');
     if (applicationId !== AGENT_ADMISSION_APPLICATION_ID
-      || ![AGENT_ADMISSION_SCHEMA_VERSION, 6, 5].includes(schemaVersion)) {
+      || ![AGENT_ADMISSION_SCHEMA_VERSION, 8, 7, 6, 5].includes(schemaVersion)) {
       throw new Error('agent-admission-metadata-mismatch');
     }
     return Object.freeze({
@@ -1163,6 +1658,16 @@ export function readAgentAdmissionFile(file: string): AgentAdmissionFileRows {
   } finally {
     db.close();
   }
+}
+
+const AGENT_ADMISSION_LEDGER_INSTANCES = new WeakSet<object>();
+
+/** Internal exact-instance seal used by production claim composition. */
+export function isAgentAdmissionLedgerInstanceInternal(
+  value: unknown,
+): value is AgentAdmissionLedger {
+  return typeof value === 'object' && value !== null
+    && AGENT_ADMISSION_LEDGER_INSTANCES.has(value);
 }
 
 export class AgentAdmissionLedger {
@@ -1184,11 +1689,16 @@ export class AgentAdmissionLedger {
       this.#db.exec(`PRAGMA busy_timeout=${options.busyTimeoutMs ?? 5_000};`);
       initialize(this.#db);
       this.#db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
+      // A new writable process/instance must never continue an old restored
+      // database generation. The persisted revision remains monotonic for the
+      // current lineage; the fresh generation distinguishes snapshot ABA.
+      rotateMaintenanceAuthorityGeneration(this.#db);
       try { chmodSync(path, 0o600); } catch { /* Windows ACL handled by the parent directory. */ }
     } catch (error) {
       this.#db.close();
       throw error;
     }
+    AGENT_ADMISSION_LEDGER_INSTANCES.add(this);
   }
 
   record(input: PolicyRouterAudit): AgentAdmissionRow {
@@ -1314,6 +1824,71 @@ export class AgentAdmissionLedger {
     return listMaintenanceRows(this.#db, filters);
   }
 
+  listMaintenanceForParentRuns(
+    sessionId: string,
+    parentRunIds: readonly string[],
+  ): readonly MaintenanceAdmissionRow[] {
+    this.#assertOpen();
+    return Object.freeze(listMaintenanceRowsForParentRuns(this.#db, sessionId, parentRunIds));
+  }
+
+  /**
+   * Point-in-time observation only. It carries no lock or claim authority
+   * after return; only withMaintenanceClaimFence's callback dynamic scope is
+   * protected by the SQLite writer reservation.
+   */
+  readMaintenanceAuthority(): MaintenanceAdmissionAuthorityCoordinate {
+    this.#assertOpen();
+    return maintenanceAuthorityCoordinate(this.#db);
+  }
+
+  /**
+   * Holds this ledger's SQLite writer reservation while exposing only a
+   * frozen authority coordinate and the exact requested Admission rows.
+   * The callback is strictly synchronous; Proxy callbacks, async functions,
+   * Promise/thenable results and Proxy results are rejected fail-closed. The
+   * transaction always rolls back before return, so same-connection callback
+   * re-entry cannot smuggle unrelated writes into the fence commit.
+   */
+  withMaintenanceClaimFence<T>(
+    sessionId: string,
+    parentRunIds: readonly string[],
+    callback: (snapshot: MaintenanceAdmissionClaimFenceSnapshot) => T,
+  ): T {
+    this.#assertOpen();
+    if (typeof callback !== 'function' || nodeTypes.isProxy(callback)
+      || maintenanceFenceCallbackIsDeferred(callback)) {
+      throw new Error('maintenance-claim-fence-callback-invalid');
+    }
+    inspectMaintenanceAuthoritySchema(this.#db);
+    this.#db.exec('BEGIN IMMEDIATE;');
+    try {
+      const authority = inspectMaintenanceAuthoritySchema(this.#db);
+      const snapshot: MaintenanceAdmissionClaimFenceSnapshot = Object.freeze({
+        authority,
+        admissions: Object.freeze(listMaintenanceRowsForParentRuns(
+          this.#db,
+          sessionId,
+          parentRunIds,
+        )),
+      });
+      const result = callback(snapshot);
+      if (maintenanceFenceResultIsAsynchronous(result)) {
+        throw new Error('maintenance-claim-fence-result-async');
+      }
+      this.#db.exec('ROLLBACK;');
+      return result;
+    } catch (error) {
+      try { this.#db.exec('ROLLBACK;'); } catch { /* preserve original */ }
+      throw error;
+    }
+  }
+
+  latestMaintenanceBatch(sessionId: string): readonly MaintenanceAdmissionRow[] {
+    this.#assertOpen();
+    return Object.freeze(latestMaintenanceBatchRows(this.#db, sessionId));
+  }
+
   listDirectorCritic(filters: DirectorCriticAdmissionFilters = {}): DirectorCriticAdmissionRow[] {
     this.#assertOpen();
     return listDirectorCriticRows(this.#db, filters);
@@ -1322,6 +1897,12 @@ export class AgentAdmissionLedger {
   listRuntimeLeases(filters: AgentRuntimeLeaseFilters = {}): AgentRuntimeLeaseRow[] {
     this.#assertOpen();
     return listRuntimeLeaseRows(this.#db, filters);
+  }
+
+  /** Latest bounded window for live operational projections, returned in stable chronological order. */
+  listLatestRuntimeLeases(filters: AgentRuntimeLeaseFilters = {}): AgentRuntimeLeaseRow[] {
+    this.#assertOpen();
+    return listRuntimeLeaseRows(this.#db, filters, AGENT_ADMISSION_SCHEMA_VERSION, 'latest');
   }
 
   /** Deletes only audit rows whose persisted session identity exactly matches. */

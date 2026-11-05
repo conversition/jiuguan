@@ -123,3 +123,59 @@ export function worldbookRepairDigest(value: unknown): string {
   const proposal = normalizeWorldbookRepairProposal(value);
   return `sha256:${createHash('sha256').update(JSON.stringify(proposal), 'utf8').digest('hex')}`;
 }
+
+/**
+ * 服务端提供的证据上下文。模型**不得自造** entryUid 或 digest —— 只能引用这里列出的条目。
+ * 由 harness 构造任务时从绑定的世界书文件读出（`readRevisionedAsset` + `stableEntryUid`）。
+ */
+/** 单个绑定世界书的可改证据：当前版本 + 条目白名单（稳定 uid 与逐条 digest）。 */
+export interface WorldbookRepairFileEvidence {
+  readonly file: string;
+  readonly expectedRevision: string;
+  readonly evidenceSetDigest: string;
+  readonly entries: readonly {
+    readonly entryUid: string;
+    readonly digest: string;
+  }[];
+}
+
+export interface WorldbookRepairProposalContext {
+  readonly sessionId: string;
+  readonly files: readonly WorldbookRepairFileEvidence[];
+}
+
+export function isWorldbookRepairProposalContext(
+  value: unknown,
+): value is WorldbookRepairProposalContext {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return typeof record.sessionId === 'string' && Array.isArray(record.files)
+    && record.files.every((item) => item !== null && typeof item === 'object'
+      && typeof (item as Record<string, unknown>).file === 'string'
+      && typeof (item as Record<string, unknown>).expectedRevision === 'string'
+      && typeof (item as Record<string, unknown>).evidenceSetDigest === 'string'
+      && Array.isArray((item as Record<string, unknown>).entries));
+}
+
+/**
+ * 严格校验：提案必须落在上下文绑定的文件与条目上，revision 与 digest 都必须与证据一致。
+ * 与 `npc_state` 的 `normalizeNpcMaintenanceProposal` 同构 —— 拒绝一切"自造证据"。
+ */
+export function normalizeWorldbookRepairProposalWithContext(
+  value: unknown,
+  context: WorldbookRepairProposalContext,
+): WorldbookRepairProposal {
+  const proposal = normalizeWorldbookRepairProposal(value);
+  if (proposal.sessionId !== context.sessionId) throw new TypeError('worldbook-repair-session-mismatch');
+  const evidence = context.files.find((item) => item.file === proposal.file);
+  if (!evidence) throw new TypeError('worldbook-repair-file-not-bound');
+  if (proposal.expectedRevision !== evidence.expectedRevision) throw new TypeError('worldbook-repair-revision-mismatch');
+  if (proposal.evidenceSetDigest !== evidence.evidenceSetDigest) throw new TypeError('worldbook-repair-evidence-mismatch');
+  const byUid = new Map(evidence.entries.map((entry) => [entry.entryUid, entry.digest]));
+  for (const change of proposal.changes) {
+    const expected = byUid.get(change.entryUid);
+    if (expected === undefined) throw new TypeError('worldbook-repair-entry-not-in-context');
+    if (expected !== change.expectedEntryDigest) throw new TypeError('worldbook-repair-entry-digest-mismatch');
+  }
+  return proposal;
+}

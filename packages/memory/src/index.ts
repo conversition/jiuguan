@@ -4,7 +4,14 @@ export {
   StateEpochStaleError, StatePredecessorStaleError, diffPaths, flatPaths, setPath, deletePath,
 } from './state-store.ts';
 export type { StateScope, StateSnapshot, CommitInput, CommitResult, PredecessorRef } from './state-store.ts';
-export { CharacterStore, SYMMETRIC_RELATION_TYPES, promoteHits, DEFAULT_PROMOTE_HITS } from './character.ts';
+export {
+  CharacterStore,
+  SYMMETRIC_RELATION_TYPES,
+  promoteHits,
+  DEFAULT_PROMOTE_HITS,
+  isEligibleNpcMentionCandidate,
+  isPlausibleNpcIdentityName,
+} from './character.ts';
 export type {
   CharacterProjection, CharacterFact, CharacterRelationship, CharacterCandidate, CharacterChangeCandidate,
   CharacterRelationshipCandidate, AdmitContext, AdmitResult, MentionResolution, FactBlock, FactKind, FactStatus,
@@ -31,3 +38,11 @@ export { HashEmbeddingProvider, TransformersEmbeddingProvider, createEmbeddingPr
 export type { EmbeddingProvider } from './embedding.ts';
 export { Vectorizer } from './vectorize.ts';
 export type { VectorizeOptions, VectorizeResult, VecSource } from './vectorize.ts';
+export { retrieveNsfwPgCandidates } from './nsfw-pg-candidates.ts';
+export type {
+  NsfwPgCandidateInput,
+  NsfwPgCandidatePorts,
+  NsfwPgCandidateRef,
+  NsfwPgCandidateResult,
+} from './nsfw-pg-candidates.ts';
+export type { PgLoreRef, PgLoreRefQueryResult } from './pg-vector.ts';

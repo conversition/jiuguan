@@ -1,5 +1,5 @@
 /**
- * 外部引擎页渲染（卡自带完整前端页，如 external-page/index.html）
+ * 外部引擎页渲染（卡自带完整前端页，如 sample-phone-host/index.html）
  * 流程：服务端 /api/assets/page 代理抓页（免浏览器跨域）→ 沙箱 srcdoc iframe（allow-scripts allow-modals，不透明源）
  *      → 注入 __jgSafeParent/存储 shim/JGF 交互 helper + 测高；页内脚本调 __jgfhChoice 即可把互动回传聊天（同一协议）
  * 备选路径：资源/内网依赖可能残缺（作者原版依赖"酒馆助手"+外网可达），此为可访问性兜底，默认仍走原生引擎。

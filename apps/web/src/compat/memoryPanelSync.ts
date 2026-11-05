@@ -238,7 +238,7 @@ export class MemoryPanelSync {
     };
     const d = routePanelEvent(sub, ev);
     if (!d.deliver) return;
-    this.onCommitted({ sessionId: ev.sessionId, purpose: ev.purpose });
+    this.onCommitted({ sessionId: ev.sessionId, headVersion: ev.headVersion, purpose: ev.purpose });
   }
 
   // ── 读取（唯一入口：首开 / 再次打开 / 手动刷新 / 提交后同步都走它） ──

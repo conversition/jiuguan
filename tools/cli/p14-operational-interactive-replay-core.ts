@@ -1,9 +1,16 @@
 import { createHash } from 'node:crypto';
 import { evaluateDirectorPrelude, type DirectorPreludeDecision } from '../../packages/agent-policy/src/director-prelude.ts';
 import { evaluatePolicyRouter, type AdmissionFacts } from '../../packages/agent-policy/src/policy-router.ts';
-import { evaluatePrecommitCritic } from '../../packages/agent-policy/src/precommit-critic.ts';
+import {
+  evaluatePrecommitCritic,
+  PLAYER_SOVEREIGNTY_POLICY_REVISION,
+} from '../../packages/agent-policy/src/precommit-critic.ts';
 import { agentBudgetProfileDigest, normalizeAgentBudgetProfile } from '../../packages/agent-policy/src/budget-profile.ts';
-import { interactiveBudgetSnapshot, runInteractivePrelude } from '../../packages/harness/src/interactive-turn-runner.ts';
+import {
+  INTERACTIVE_FINAL_MODEL_CALL_RESERVE,
+  interactiveBudgetSnapshot,
+  runInteractivePrelude,
+} from '../../packages/harness/src/interactive-turn-runner.ts';
 import { INTERACTIVE_NATIVE_TOOLS } from '../../packages/harness/src/interactive-tools.ts';
 import {
   buildPrecommitCriticModelRequest,
@@ -64,6 +71,13 @@ export function classifyOperationalProviderFailure(
   const code = error && typeof error === 'object'
     ? (error as { code?: unknown }).code
     : undefined;
+  if (code === 'OP_REPLAY_RATE_LIMIT') return 'rate-limit';
+  if (code === 'OP_REPLAY_TIMEOUT') return 'upstream-timeout';
+  if (code === 'OP_REPLAY_UPSTREAM_5XX') return 'upstream-5xx';
+  if (code === 'OP_REPLAY_UPSTREAM_4XX') return 'upstream-4xx';
+  if (code === 'OP_REPLAY_AUTHENTICATION' || code === 'OP_REPLAY_REQUEST_INVALID') return 'upstream-4xx';
+  if (code === 'OP_REPLAY_TRANSPORT') return 'transport';
+  if (code === 'OP_REPLAY_PROTOCOL') return 'protocol';
   if (typeof code === 'string' && /^(?:E[A-Z]+|UND_ERR_[A-Z_]+)$/u.test(code)) return 'transport';
   if (error instanceof TypeError) return 'transport';
   return 'unknown';
@@ -109,12 +123,20 @@ const TARGET_SCENARIOS = new Set([
   ...Object.keys(PRELUDE_TOOLS),
   'q9-15-player-sovereignty-v1',
   'q9-16-player-sovereignty-v2',
+  'q9-35-player-sovereignty-action-v1',
+  'q9-36-player-sovereignty-current-action-v1',
   ...CRITIC_REPAIR_SCENARIOS,
   'q9-25-critic-unrepairable-v1',
   'q9-26-critic-unrepairable-v2',
 ]);
 export const P14_INTERACTIVE_OPERATIONAL_MAX_PROVIDER_CALLS =
-  Object.keys(PRELUDE_TOOLS).length * 2 + CRITIC_REPAIR_SCENARIOS.size;
+  Object.keys(PRELUDE_TOOLS).filter((scenarioId) => (
+    DIRECTOR_SCENARIOS.has(scenarioId) || scenarioId.includes('distant-fact')
+  )).length * 2
+  + Object.keys(PRELUDE_TOOLS).filter((scenarioId) => (
+    !DIRECTOR_SCENARIOS.has(scenarioId) && !scenarioId.includes('distant-fact')
+  )).length
+  + CRITIC_REPAIR_SCENARIOS.size;
 const MAX_CONSECUTIVE_PROVIDER_ERRORS = 3;
 
 function digest(value: unknown): string {
@@ -146,7 +168,9 @@ function operationalBudget(maxCostMicrousd: number, maxWallMs = 15_000) {
     autonomyProfile: 'quality-beta',
     lane: 'interactive',
     maxSteps: 2,
-    maxModelCalls: 2,
+    // The production runner reserves two final-turn attempts. Replay exercises
+    // up to two Prelude calls, so its local profile must include both portions.
+    maxModelCalls: INTERACTIVE_FINAL_MODEL_CALL_RESERVE + 2,
     maxToolCalls: 4,
     maxWrites: 0,
     agentInputBudgetTokens: 16_000,
@@ -228,6 +252,7 @@ function operationalSuite(
       toolSetDigest: digest({
         interactive: INTERACTIVE_NATIVE_TOOLS,
         critic: PRECOMMIT_CRITIC_MODEL_CONTRACT_VERSION,
+        sovereigntyPolicy: PLAYER_SOVEREIGNTY_POLICY_REVISION,
       }),
     },
     scenarios: fixture.scenarios.map((scenario, index) => ({
@@ -391,7 +416,7 @@ function directorDecision(scenarioId: string): DirectorPreludeDecision {
 function gameTurn(input: {
   readonly prose: string;
   readonly referenceSources?: readonly string[];
-  readonly sovereigntyViolation?: boolean;
+  readonly protagonistStateField?: string;
   readonly knowledgeConflict?: boolean;
 }): GameTurn {
   const raw = {
@@ -420,10 +445,10 @@ function gameTurn(input: {
     },
     memory_delta: {
       delta_summary: 'Synthetic verification only.',
-      state_changes: input.sovereigntyViolation ? [{
+      state_changes: input.protagonistStateField ? [{
         entity_type: 'protagonist',
         entity_id: 'player',
-        field: 'decision',
+        field: input.protagonistStateField,
         value: 'forced',
         action: 'upsert',
       }] : [],
@@ -485,13 +510,27 @@ function deterministicResult(scenario: P14ReplayScenario): P14ReplayResult {
         });
   }
   if (scenario.labels.includes('player-sovereignty')) {
+    const expectedToPass = scenario.typedOutcome.verdict === 'valid';
+    const protagonistStateField = scenario.scenarioId.includes('current-action')
+      ? '当前行动'
+      : scenario.scenarioId.includes('sovereignty-action') ? 'action' : 'decision';
     const decision = evaluatePrecommitCritic({
-      turn: gameTurn({ prose: 'Synthetic unsafe candidate.', sovereigntyViolation: true }),
+      turn: gameTurn({
+        prose: expectedToPass
+          ? 'Synthetic already-revealed current action.'
+          : 'Synthetic unsafe candidate.',
+        referenceSources: ['memory:verified'],
+        protagonistStateField,
+      }),
       duplicateOutput: false,
       contractIssueCount: 0,
     });
-    return decision.severity === 'hard-deny'
-      && decision.hardDenyCodes.includes('player-sovereignty-violation')
+    const valid = expectedToPass
+      ? decision.severity === 'pass'
+        && !decision.hardDenyCodes.includes('player-sovereignty-violation')
+      : decision.severity === 'hard-deny'
+        && decision.hardDenyCodes.includes('player-sovereignty-violation');
+    return valid
       ? validResult(scenario)
       : invalidResult(scenario, 'deterministic-gate-invalid', {
           ...zeroMetrics(), safetyViolations: 1, invalidCalls: 1,

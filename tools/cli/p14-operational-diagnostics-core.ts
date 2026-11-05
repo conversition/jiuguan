@@ -1,4 +1,8 @@
 import type { AgentRuntimeLeaseRow } from '../../apps/server/agent-admission-ledger.ts';
+import {
+  agentRuntimeExecutionSource,
+  type AgentRuntimeExecutionSource,
+} from '../../apps/server/agent-runtime-source.ts';
 import type { ModelUsageRow } from '../../apps/server/model-usage-ledger.ts';
 
 export interface DiagnosticMaintenanceJob {
@@ -23,6 +27,18 @@ function percentile(values: readonly number[], fraction: number): number | null 
   if (values.length === 0) return null;
   const sorted = [...values].sort((a, b) => a - b);
   return sorted[Math.max(0, Math.ceil(sorted.length * fraction) - 1)]!;
+}
+
+function leaseMetrics(rows: readonly AgentRuntimeLeaseRow[]) {
+  return Object.freeze({
+    leases: rows.length,
+    outcomes: counts(rows.map((row) => row.outcome)),
+    reasonCodes: counts(rows.flatMap((row) => row.reasonCode ? [row.reasonCode] : [])),
+    modelCalls: rows.reduce((sum, row) => sum + row.modelCallsUsed, 0),
+    inputTokens: rows.reduce((sum, row) => sum + row.inputTokensUsed, 0),
+    outputTokens: rows.reduce((sum, row) => sum + row.outputTokensUsed, 0),
+    costMicrousd: rows.reduce((sum, row) => sum + row.costMicrousdUsed, 0),
+  });
 }
 
 export function buildP14OperationalDiagnostics(input: {
@@ -56,15 +72,15 @@ export function buildP14OperationalDiagnostics(input: {
   const leasesByLane = Object.freeze(Object.fromEntries(leaseLanes.map((lane) => {
     const rows = input.leases.filter((row) => row.lane === lane);
     return [lane, Object.freeze({
-      leases: rows.length,
-      outcomes: counts(rows.map((row) => row.outcome)),
-      reasonCodes: counts(rows.flatMap((row) => row.reasonCode ? [row.reasonCode] : [])),
-      modelCalls: rows.reduce((sum, row) => sum + row.modelCallsUsed, 0),
-      inputTokens: rows.reduce((sum, row) => sum + row.inputTokensUsed, 0),
-      outputTokens: rows.reduce((sum, row) => sum + row.outputTokensUsed, 0),
-      costMicrousd: rows.reduce((sum, row) => sum + row.costMicrousdUsed, 0),
+      ...leaseMetrics(rows),
+      executionSources: counts(rows.map(agentRuntimeExecutionSource)),
     })] as const;
   })));
+  const executionSources = [...new Set(input.leases.map(agentRuntimeExecutionSource))].sort();
+  const leasesByExecutionSource = Object.freeze(Object.fromEntries(executionSources.map((source) => [
+    source,
+    leaseMetrics(input.leases.filter((row) => agentRuntimeExecutionSource(row) === source)),
+  ])) as Partial<Record<AgentRuntimeExecutionSource, ReturnType<typeof leaseMetrics>>>);
 
   const taskKinds = [...new Set(input.maintenanceJobs.map((row) => row.taskKind))].sort();
   const maintenanceByTask = Object.freeze(Object.fromEntries(taskKinds.map((taskKind) => {
@@ -88,10 +104,11 @@ export function buildP14OperationalDiagnostics(input: {
       riskFlags.push(`${lane}:${row.calls >= 20 ? 'provider-error-rate-exceeded' : 'provider-error-rate-watch'}`);
     }
   }
-  for (const [lane, row] of Object.entries(leasesByLane)) {
-    if ((row.outcomes.provider_error ?? 0) > 0) riskFlags.push(`${lane}:lease-provider-error`);
-    if ((row.outcomes.budget_exhausted ?? 0) > 0) riskFlags.push(`${lane}:lease-budget-exhausted`);
-    if ((row.outcomes.usage_unavailable ?? 0) > 0) riskFlags.push(`${lane}:lease-usage-unavailable`);
+  for (const [source, row] of Object.entries(leasesByExecutionSource)) {
+    if (!row) continue;
+    if ((row.outcomes.provider_error ?? 0) > 0) riskFlags.push(`${source}:lease-provider-error`);
+    if ((row.outcomes.budget_exhausted ?? 0) > 0) riskFlags.push(`${source}:lease-budget-exhausted`);
+    if ((row.outcomes.usage_unavailable ?? 0) > 0) riskFlags.push(`${source}:lease-usage-unavailable`);
   }
   for (const [taskKind, row] of Object.entries(maintenanceByTask)) {
     if (row.modelInvokedJobs > 0 && row.proposalJobs === 0) {
@@ -106,7 +123,13 @@ export function buildP14OperationalDiagnostics(input: {
     sessionId: input.sessionId,
     privacy: Object.freeze({ contentIncluded: false, identifiersIncluded: false }),
     modelCalls: Object.freeze({ total: input.usage.length, byLane: modelByLane }),
-    runtimeLeases: Object.freeze({ total: input.leases.length, byLane: leasesByLane }),
+    runtimeLeases: Object.freeze({
+      total: input.leases.length,
+      // byLane is the persisted physical lane. byExecutionSource separates the
+      // foreground chat compactor from actual background Maintenance jobs.
+      byLane: leasesByLane,
+      byExecutionSource: leasesByExecutionSource,
+    }),
     maintenance: Object.freeze({ totalJobs: input.maintenanceJobs.length, byTask: maintenanceByTask }),
     riskFlags: Object.freeze(riskFlags.sort()),
   });

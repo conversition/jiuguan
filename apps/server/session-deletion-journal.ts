@@ -347,6 +347,60 @@ export function sessionDeletionJournalPath(dataDir: string): string {
   return join(sessionDeletionPrivacyDirectory(dataDir), SESSION_DELETION_JOURNAL_DB_FILE);
 }
 
+/** Read the original deletion fence without opening a writable Journal or exposing its metadata. */
+export function readSessionDeletionBlockedFile(file: string, rawSessionId: string): boolean {
+  if (!isSafeOpaqueId(rawSessionId, 160)) throw new Error('session-deletion-session-id-invalid');
+  let db: DatabaseSync | undefined;
+  try {
+    if (typeof file !== 'string' || file.trim() === '') throw new Error('invalid-file');
+    const path = resolve(file);
+    const parent = dirname(path);
+    let directory: ReturnType<typeof lstatSync>;
+    try { directory = lstatSync(parent); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      throw error;
+    }
+    if (!directory.isDirectory() || directory.isSymbolicLink()) throw new Error('invalid-directory');
+    let original: ReturnType<typeof lstatSync>;
+    try { original = lstatSync(path); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      throw error;
+    }
+    if (!original.isFile() || original.isSymbolicLink()) throw new Error('invalid-file');
+    db = new DatabaseSync(path, { readOnly: true });
+    db.exec('PRAGMA query_only=ON; PRAGMA busy_timeout=0; BEGIN;');
+    if (pragma(db, 'application_id') !== SESSION_DELETION_JOURNAL_APPLICATION_ID
+      || pragma(db, 'user_version') !== SESSION_DELETION_JOURNAL_SCHEMA_VERSION) {
+      throw new Error('invalid-header');
+    }
+    inspectExactSchema(db);
+    const row = db.prepare('SELECT * FROM session_deletion WHERE session_id=?')
+      .get(rawSessionId) as SqlRow | undefined;
+    // Match Journal.isBlocked: every retained phase, including prepared, is a fence.
+    const blocked = row === undefined ? false : parseDeletionRow(row).sessionId === rawSessionId;
+    const current = lstatSync(path);
+    const currentDirectory = lstatSync(parent);
+    if (!current.isFile() || current.isSymbolicLink()
+      || current.dev !== original.dev || current.ino !== original.ino
+      || !currentDirectory.isDirectory() || currentDirectory.isSymbolicLink()
+      || currentDirectory.dev !== directory.dev || currentDirectory.ino !== directory.ino) {
+      throw new Error('source-drift');
+    }
+    return blocked;
+  } catch {
+    throw new Error('session-deletion-read-unavailable');
+  } finally {
+    if (db) {
+      let failed = false;
+      try { if (db.isTransaction) db.exec('ROLLBACK;'); } catch { failed = true; }
+      try { db.close(); } catch { failed = true; }
+      if (failed) throw new Error('session-deletion-read-unavailable');
+    }
+  }
+}
+
 export class SessionDeletionJournal {
   readonly #db: DatabaseSync;
   readonly #now: () => string;

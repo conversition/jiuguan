@@ -5,7 +5,23 @@
  * 真正提交必须由调用方在合法 game_turn、revision fence 与会话事务内完成。
  */
 import { createHash } from 'node:crypto';
+import { rememberInteractiveFailureCode } from './interactive-failure-contract.ts';
 import type { HarnessBudgetPolicy, HarnessTool, ToolContext, ToolOutcome } from './types.ts';
+import {
+  INTERACTIVE_TOOL_OUTPUT_INVALID,
+  validateInteractiveHintOutput,
+  validateInteractivePatchOutput,
+  validateInteractiveReadOutput,
+  validateInteractiveSandboxOutput,
+  validateInteractiveVariablesOutput,
+} from './interactive-tool-output.ts';
+import {
+  buildInteractiveToolContractCatalog,
+  INTERACTIVE_TOOL_VERSION,
+  type InteractiveToolContract,
+  type InteractiveToolContractBinding,
+} from './interactive-tool-contracts.ts';
+export { INTERACTIVE_VARIABLE_OUTPUT_VALIDATOR_VERSION } from './interactive-output-contract.ts';
 
 export const INTERACTIVE_POLICY_VERSION = 'p13c-v1';
 export const INTERACTIVE_FINAL_TOKEN_RESERVE_RATIO = 0.20;
@@ -43,7 +59,7 @@ export interface InteractiveCallAudit {
   readonly argsHash: string;
   readonly inputRevision: string;
   readonly toolName: string;
-  readonly toolVersion: '1';
+  readonly toolVersion: typeof INTERACTIVE_TOOL_VERSION;
   readonly effect: InteractiveToolEffect;
   readonly status: 'ok' | 'rejected' | 'failed';
   readonly resultChars: number;
@@ -77,9 +93,7 @@ export interface AdvisoryVariableHint {
   readonly rationale: string;
 }
 
-interface ToolDefinition<T> {
-  readonly name: string;
-  readonly effect: InteractiveToolEffect;
+interface ToolDefinition<T> extends InteractiveToolContractBinding {
   validate(value: unknown): { ok: true; value: T } | { ok: false; error: string };
   execute(value: T, context: ToolContext): Promise<ToolOutcome>;
 }
@@ -181,6 +195,24 @@ export const INTERACTIVE_NATIVE_TOOLS: readonly Readonly<Record<string, unknown>
   },
 ]);
 
+/**
+ * Return the exact Provider-native allowlist for one Interactive Prelude.
+ *
+ * `propose_variable_patch` is authority-bearing, so an empty effective variable policy
+ * must remove it before both admission binding and Provider dispatch. Keep this as the
+ * single projection used by the host and runner; independently filtering either side
+ * makes the signed tool-set digest diverge before the first Provider call.
+ */
+export function effectiveInteractiveNativeTools(
+  variableSpecs: readonly InteractiveVariableSpec[],
+): readonly Readonly<Record<string, unknown>>[] {
+  if (variableSpecs.length > 0) return INTERACTIVE_NATIVE_TOOLS;
+  return Object.freeze(INTERACTIVE_NATIVE_TOOLS.filter((tool) => {
+    const name = (tool.function as { name?: unknown } | undefined)?.name;
+    return name !== 'propose_variable_patch';
+  }));
+}
+
 function record(value: unknown): Record<string, unknown> | null {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -225,27 +257,28 @@ function validatePatchValue(spec: InteractiveVariableSpec, value: unknown): bool
   return Number.isSafeInteger(spec.maxLength) && spec.maxLength! > 0 && value.length <= spec.maxLength!;
 }
 
-function patchValidator(specs: ReadonlyMap<string, InteractiveVariableSpec>) {
-  return (value: unknown): { ok: true; value: StagedVariablePatch } | { ok: false; error: string } => {
+export function validateInteractiveVariablePatch(
+    value: unknown,
+    specs: ReadonlyMap<string, InteractiveVariableSpec>,
+): { ok: true; value: StagedVariablePatch } | { ok: false; error: string } {
     const r = record(value);
     if (!r || !exactKeys(r, ['operationKey', 'patches'])
-      || typeof r.operationKey !== 'string' || r.operationKey.length < 1 || r.operationKey.length > 160
-      || !Array.isArray(r.patches) || r.patches.length < 1 || r.patches.length > 16) {
-      return { ok: false, error: 'variable-patch-invalid' };
+        || typeof r.operationKey !== 'string' || r.operationKey.length < 1 || r.operationKey.length > 160
+        || !Array.isArray(r.patches) || r.patches.length < 1 || r.patches.length > 16) {
+        return { ok: false, error: 'variable-patch-invalid' };
     }
     const seen = new Set<string>();
     const patches: Array<{ path: string; value: string | number | boolean }> = [];
     for (const item of r.patches) {
-      const p = record(item);
-      if (!p || !exactKeys(p, ['path', 'value']) || typeof p.path !== 'string'
-        || !validPath(p.path) || seen.has(p.path)) return { ok: false, error: 'variable-patch-invalid' };
-      const spec = specs.get(p.path);
-      if (!spec || !validatePatchValue(spec, p.value)) return { ok: false, error: 'variable-patch-not-allowed' };
-      seen.add(p.path);
-      patches.push({ path: p.path, value: p.value as string | number | boolean });
+        const p = record(item);
+        if (!p || !exactKeys(p, ['path', 'value']) || typeof p.path !== 'string'
+            || !validPath(p.path) || seen.has(p.path)) return { ok: false, error: 'variable-patch-invalid' };
+        const spec = specs.get(p.path);
+        if (!spec || !validatePatchValue(spec, p.value)) return { ok: false, error: 'variable-patch-not-allowed' };
+        seen.add(p.path);
+        patches.push({ path: p.path, value: p.value as string | number | boolean });
     }
     return { ok: true, value: { operationKey: r.operationKey, patches } };
-  };
 }
 
 function variableHintValidator(value: unknown):
@@ -311,69 +344,153 @@ function sandboxExecute(args: SandboxArgs): unknown {
   };
 }
 
+function variableKeysValidator(value: unknown):
+  { ok: true; value: { keys?: string[] } } | { ok: false; error: string } {
+  const r = record(value);
+  if (!r || !exactKeys(r, ['keys'])
+    || (r.keys !== undefined && (!Array.isArray(r.keys) || r.keys.length > 100
+      || r.keys.some((key) => typeof key !== 'string' || !validPath(key))))) {
+    return { ok: false, error: 'variable-keys-invalid' };
+  }
+  return { ok: true, value: { keys: r.keys as string[] | undefined } };
+}
+
+function stagedPatchResult(): string {
+  return 'variable-patch-staged';
+}
+
+/** Registry and catalog bind the same local validator and result codec source. */
+function interactiveToolBindings(
+  variableSpecs: readonly InteractiveVariableSpec[],
+): Readonly<Record<InteractiveToolContractBinding['name'], InteractiveToolContractBinding>> {
+  const specs = new Map(variableSpecs.map((spec) => [spec.path, spec]));
+  return {
+    query_memory: {
+      name: 'query_memory', effect: 'read', validate: boundedQuery, encodeResult: json,
+      validatorRef: 'interactive-tools:boundedQuery', codecRef: 'interactive-tools:json',
+      outputValidatorRef: 'interactive-tool-output:validateInteractiveReadOutput',
+      outputCoverage: 'envelope-opaque-hits', validateOutput: validateInteractiveReadOutput,
+    },
+    get_worldbook: {
+      name: 'get_worldbook', effect: 'read', validate: boundedQuery, encodeResult: json,
+      validatorRef: 'interactive-tools:boundedQuery', codecRef: 'interactive-tools:json',
+      outputValidatorRef: 'interactive-tool-output:validateInteractiveReadOutput',
+      outputCoverage: 'envelope-opaque-hits', validateOutput: validateInteractiveReadOutput,
+    },
+    get_variables: {
+      name: 'get_variables', effect: 'read', validate: variableKeysValidator, encodeResult: json,
+      validatorRef: 'interactive-tools:variableKeysValidator', codecRef: 'interactive-tools:json',
+      outputValidatorRef: 'interactive-tool-output:validateInteractiveVariablesOutput',
+      outputCoverage: 'typed-variables', validateOutput: validateInteractiveVariablesOutput,
+    },
+    propose_variable_patch: {
+      name: 'propose_variable_patch', effect: 'proposal', encodeResult: stagedPatchResult,
+      validate: (value) => validateInteractiveVariablePatch(value, specs),
+      validatorRef: 'interactive-tools:validateInteractiveVariablePatch',
+      codecRef: 'interactive-tools:stagedPatchResult',
+      outputValidatorRef: 'interactive-tool-output:validateInteractivePatchOutput',
+      outputCoverage: 'typed-ack', validateOutput: validateInteractivePatchOutput,
+    },
+    propose_variable_hint: {
+      name: 'propose_variable_hint', effect: 'proposal', validate: variableHintValidator, encodeResult: json,
+      validatorRef: 'interactive-tools:variableHintValidator', codecRef: 'interactive-tools:json',
+      outputValidatorRef: 'interactive-tool-output:validateInteractiveHintOutput',
+      outputCoverage: 'typed-ack', validateOutput: validateInteractiveHintOutput,
+    },
+    run_sandbox_action: {
+      name: 'run_sandbox_action', effect: 'deterministic-compute', validate: sandboxValidator, encodeResult: json,
+      validatorRef: 'interactive-tools:sandboxValidator', codecRef: 'interactive-tools:json',
+      outputValidatorRef: 'interactive-tool-output:validateInteractiveSandboxOutput',
+      outputCoverage: 'typed-compute', validateOutput: validateInteractiveSandboxOutput,
+    },
+  };
+}
+
+/** The catalog follows the same five/six-tool projection as admission and Provider dispatch. */
+export function effectiveInteractiveToolContracts(
+  variableSpecs: readonly InteractiveVariableSpec[],
+): readonly InteractiveToolContract[] {
+  return buildInteractiveToolContractCatalog(
+    effectiveInteractiveNativeTools(variableSpecs),
+    Object.values(interactiveToolBindings(variableSpecs)),
+    INTERACTIVE_POLICY.maxToolResultChars,
+  );
+}
+
+function validatedToolResult(
+  binding: InteractiveToolContractBinding,
+  input: unknown,
+  source: unknown,
+  context: ToolContext,
+): ToolOutcome {
+  const result = binding.encodeResult(source);
+  try {
+    const checked = binding.validateOutput(result, { input, source, state: context.state });
+    return checked.ok ? { ok: true, result } : checked;
+  } catch {
+    return { ok: false, error: INTERACTIVE_TOOL_OUTPUT_INVALID };
+  }
+}
+
 function definitions(options: InteractiveToolRegistryOptions): ToolDefinition<unknown>[] {
-  const specs = new Map(options.variableSpecs.map((spec) => [spec.path, spec]));
+  const bindings = interactiveToolBindings(options.variableSpecs);
   return [
     {
-      name: 'query_memory', effect: 'read', validate: boundedQuery,
-      execute: async (args, context) => ({
-        ok: true,
-        result: json({ query: (args as { query: string }).query,
-          hits: await options.readMemory((args as { query: string }).query, context.signal) }),
-      }),
+      ...bindings.query_memory,
+      execute: async (args, context) => validatedToolResult(bindings.query_memory, args, {
+        query: (args as { query: string }).query,
+        hits: await options.readMemory((args as { query: string }).query, context.signal),
+      }, context),
     },
     {
-      name: 'get_worldbook', effect: 'read', validate: boundedQuery,
-      execute: async (args, context) => ({
-        ok: true,
-        result: json({ query: (args as { query: string }).query,
-          hits: await options.readWorldbook((args as { query: string }).query, context.signal) }),
-      }),
+      ...bindings.get_worldbook,
+      execute: async (args, context) => validatedToolResult(bindings.get_worldbook, args, {
+        query: (args as { query: string }).query,
+        hits: await options.readWorldbook((args as { query: string }).query, context.signal),
+      }, context),
     },
     {
-      name: 'get_variables', effect: 'read',
-      validate(value) {
-        const r = record(value);
-        if (!r || !exactKeys(r, ['keys'])
-          || (r.keys !== undefined && (!Array.isArray(r.keys) || r.keys.length > 100
-            || r.keys.some((key) => typeof key !== 'string' || !validPath(key))))) {
-          return { ok: false, error: 'variable-keys-invalid' };
-        }
-        return { ok: true, value: { keys: r.keys as string[] | undefined } };
-      },
-      async execute(args) {
+      ...bindings.get_variables,
+      async execute(args, context) {
         const keys = (args as { keys?: string[] }).keys;
         const values = keys === undefined
           ? options.variables
           : Object.fromEntries(keys.filter((key) => Object.hasOwn(options.variables, key))
             .map((key) => [key, options.variables[key]]));
-        return { ok: true, result: json(values) };
+        return validatedToolResult(bindings.get_variables, args, values, context);
       },
     },
     {
-      name: 'propose_variable_patch', effect: 'proposal', validate: patchValidator(specs),
+      ...bindings.propose_variable_patch,
       async execute(args, context) {
         if (context.state.stagedVariablePatch !== undefined) {
           return { ok: false, error: 'variable-patch-already-staged' };
         }
-        context.state.stagedVariablePatch = structuredClone(args);
-        return { ok: true, result: 'variable-patch-staged' };
+        const staged = structuredClone(args);
+        context.state.stagedVariablePatch = staged;
+        const result = validatedToolResult(bindings.propose_variable_patch, args, args, context);
+        if (!result.ok && context.state.stagedVariablePatch === staged) delete context.state.stagedVariablePatch;
+        return result;
       },
     },
     {
-      name: 'propose_variable_hint', effect: 'proposal', validate: variableHintValidator,
+      ...bindings.propose_variable_hint,
       async execute(args, context) {
         if (context.state.advisoryVariableHint !== undefined) {
           return { ok: false, error: 'variable-hint-already-recorded' };
         }
-        context.state.advisoryVariableHint = structuredClone(args);
-        return { ok: true, result: json({ effect: 'advisory-only', proposal: args }) };
+        const staged = structuredClone(args);
+        context.state.advisoryVariableHint = staged;
+        const result = validatedToolResult(bindings.propose_variable_hint, args,
+          { effect: 'advisory-only', proposal: args }, context);
+        if (!result.ok && context.state.advisoryVariableHint === staged) delete context.state.advisoryVariableHint;
+        return result;
       },
     },
     {
-      name: 'run_sandbox_action', effect: 'deterministic-compute', validate: sandboxValidator,
-      async execute(args) {
-        return { ok: true, result: json(sandboxExecute(args as SandboxArgs)) };
+      ...bindings.run_sandbox_action,
+      async execute(args, context) {
+        return validatedToolResult(bindings.run_sandbox_action, args, sandboxExecute(args as SandboxArgs), context);
       },
     },
   ];
@@ -387,15 +504,16 @@ export function createInteractiveToolRegistry(
   for (const definition of definitions(options)) {
     const tool: HarnessTool<unknown> = {
       name: definition.name,
-      description: `${definition.effect}:p13c:${definition.name}:v1`,
+      description: `${definition.effect}:p13c:${definition.name}:v${INTERACTIVE_TOOL_VERSION}`,
       validate: definition.validate,
       async execute(value, context) {
         const started = now();
         let outcome: ToolOutcome;
         try {
           outcome = await definition.execute(value, context);
-        } catch {
+        } catch (error) {
           outcome = { ok: false, error: 'tool-execution-failed' };
+          rememberInteractiveFailureCode(outcome, error);
         }
         const resultChars = outcome.ok ? outcome.result.length : 0;
         try {
@@ -406,7 +524,7 @@ export function createInteractiveToolRegistry(
             argsHash: argsHash(value),
             inputRevision: context.call?.inputRevision ?? '',
             toolName: definition.name,
-            toolVersion: '1',
+            toolVersion: INTERACTIVE_TOOL_VERSION,
             effect: definition.effect,
             status: outcome.ok ? 'ok' : outcome.error.includes('not-allowed') || outcome.error.includes('invalid')
               ? 'rejected' : 'failed',

@@ -1,4 +1,10 @@
-import type { MaintenanceProposal, MaintenanceTaskKind } from './maintenance-types.ts';
+import type {
+  MaintenanceProposal,
+  MaintenanceStrictProposalContext,
+  MaintenanceTaskKind,
+} from './maintenance-types.ts';
+import type { MaintenanceMemoryDirectPreparation } from './maintenance-memory-direct-proposal.ts';
+import type { MaintenanceSummaryDirectPreparation } from './maintenance-summary-skill-source.ts';
 
 export interface MaintenanceCommitRequest {
   readonly runId: string;
@@ -6,10 +12,28 @@ export interface MaintenanceCommitRequest {
   readonly taskKind: MaintenanceTaskKind;
   readonly expectedRevision: string;
   readonly proposal: MaintenanceProposal;
+  /**
+   * P16 E2：领域提案上下文（来自 harness 快照的 proposalContext）。
+   * memory/summary 的 typed committer 靠它做历史纪元/证据集/输入摘要校验。
+   */
+  readonly context?: MaintenanceStrictProposalContext;
+  /** Internal current-claim binding, never a model or HTTP argument. */
+  readonly executionClaim?: Readonly<{ ownerInstanceId: string; attempt: number }>;
+  readonly signal?: AbortSignal;
+  /** A persisted preparation is not sufficient: the Manager's one-shot process brand is required at commit. */
+  readonly directPreparation?: MaintenanceMemoryDirectPreparation;
+  /** Summary authority is independent of the Memory handle, even under a shared control profile. */
+  readonly summaryPreparation?: MaintenanceSummaryDirectPreparation;
 }
 
 export type MaintenanceCommitResult =
-  | { readonly status: 'committed'; readonly revision: string; readonly diff: Record<string, unknown> }
+  | {
+    readonly status: 'committed';
+    readonly revision: string;
+    readonly diff: Record<string, unknown>;
+    /** Internal domain receipt only; never persisted in a public job or its diff. */
+    readonly receipt?: Readonly<Record<string, unknown>>;
+  }
   | { readonly status: 'stale'; readonly actualRevision: string; readonly diff: Record<string, unknown> };
 
 /**
@@ -25,6 +49,7 @@ export function shadowDiff(proposal: MaintenanceProposal): Record<string, unknow
   if (proposal.taskKind === 'rolling_summary') {
     return {
       taskKind: proposal.taskKind,
+      itemCount: 1,
       summaryChars: String(payload.summary ?? '').length,
       throughRound: payload.throughRound,
     };

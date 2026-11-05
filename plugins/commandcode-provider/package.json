@@ -20,6 +20,9 @@
     }
   },
   "scripts": {
-    "build": "node build.mjs"
+    "build": "node build.mjs",
+    "test:types": "tsc -p tsconfig.json",
+    "test:server": "node --experimental-strip-types --experimental-transform-types tests/verify-server.ts",
+    "test": "pnpm run build && pnpm run test:types && node tests/verify-bundle.mjs && node --experimental-strip-types --experimental-transform-types tests/verify-runtime-config.ts && node --experimental-strip-types --experimental-transform-types tests/verify-migrate-config.ts && node --experimental-strip-types --experimental-transform-types tests/verify-install.ts && pnpm run test:server"
   }
 }

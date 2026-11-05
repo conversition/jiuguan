@@ -17,7 +17,22 @@ importers:
       react-dom:
         specifier: ^18.3.1
         version: 18.3.1(react@18.3.1)
+      sharp:
+        specifier: 0.34.5
+        version: 0.34.5
     devDependencies:
+      '@jiuguan/agent-loop-contract':
+        specifier: workspace:*
+        version: link:packages/agent-loop-contract
+      '@jiuguan/mobile-contracts':
+        specifier: workspace:*
+        version: link:packages/mobile-contracts
+      '@jiuguan/prompt':
+        specifier: workspace:*
+        version: link:packages/prompt
+      '@jiuguan/skill-hub':
+        specifier: workspace:*
+        version: link:packages/skill-hub
       '@types/node':
         specifier: ^26.2.0
         version: 26.2.0
@@ -76,7 +91,15 @@ importers:
         specifier: ^4.0.1
         version: 4.0.1
 
-  packages/agent-policy: {}
+  packages/agent-closure: {}
+
+  packages/agent-loop-contract: {}
+
+  packages/agent-policy:
+    dependencies:
+      '@jiuguan/skill-hub':
+        specifier: workspace:*
+        version: link:../skill-hub
 
   packages/assets: {}
 
@@ -110,10 +133,15 @@ importers:
 
   packages/mobile-contracts: {}
 
+  packages/operational-replay-contract: {}
+
   packages/plugin: {}
 
   packages/prompt:
     dependencies:
+      '@jiuguan/skill-hub':
+        specifier: workspace:*
+        version: link:../skill-hub
       zod:
         specifier: ^4.4.3
         version: 4.4.3
@@ -123,6 +151,10 @@ importers:
   packages/sandbox: {}
 
   packages/server-auth: {}
+
+  packages/session: {}
+
+  packages/skill-hub: {}
 
   packages/variable: {}
 

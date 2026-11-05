@@ -8,6 +8,8 @@
  *   - 每回合 beginTurn(focus) 依依赖求值做激活转换：新满足 → activate（build 产片段 +
  *     注册提供项 + 累积逐步骤逆操作）；不再满足 → deactivate（**consumer 先退、provider 后撤**，
  *     逐步骤逆操作 LIFO 逆序跑，最后根 teardown）——保证上下文干净进出、无残留、不串线。
+ *   - 数据随回合变化的 provider 可声明 refresh: 'turn'；运行时会先按同一撤销语义回收旧激活，
+ *     再从本轮固定输入重新 build。默认仍只在激活边沿 build，避免改变插件/资源型 fiber 的生命周期。
  *
  * 只解决「哪些进、哪些出、怎么干净出」；成本/优先级/全局预算属 L2 调度层，不在本文件。
  */
@@ -42,6 +44,13 @@ export interface ContextProviderFiber {
   provide?: ProvideMap;
   /** 附加条件（provide 满足之外的自定义判断，如 bars 阈值/场景匹配） */
   deps?: (focus: TurnFocus, provides: ProvideMap) => boolean;
+  /**
+   * 片段刷新策略。默认 `activation`：只在 inactive → active 时 build；`turn`：只要本轮仍满足，
+   * 也会先完整 deactivate 再 activate，确保 build 读取到本轮快照而不是首次激活时的旧值。
+   * `turn` 目前只适用于纯同步快照 provider；带异步 effect/teardown 的资源型 provider 应保持
+   * `activation`，直到运行时具备可等待的异步生命周期，避免回收与重建竞态。
+   */
+  refresh?: 'activation' | 'turn';
   /** 激活时产出注入片段（在 build 内调 accum.effect 逐步骤累积逆操作） */
   build(focus: TurnFocus, provides: ProvideMap, accum: FiberEffectCtx): string;
   /** 根逆操作（整体回收，执行于所有逐步骤逆操作之后） */
@@ -82,7 +91,11 @@ export class ContextProviderRuntime {
 
   /** 当前激活块的注入片段（id → 片段） */
   activeFragments(): { id: string; fragment: string }[] {
-    return [...this.fragments.entries()].map(([id, fragment]) => ({ id, fragment }));
+    // 以注册序输出，而不是 fragments 的插入序；逐回合 refresh 会 delete → set，不能因此改变装配顺序。
+    return [...this.fibers.values()].flatMap((fiber) => {
+      if (this.states.get(fiber.id) !== 'active' || !this.fragments.has(fiber.id)) return [];
+      return [{ id: fiber.id, fragment: this.fragments.get(fiber.id)! }];
+    });
   }
 
   /** 已激活块的对外提供项（供依赖求值读取） */
@@ -95,11 +108,13 @@ export class ContextProviderRuntime {
     return this.states.get(id);
   }
 
-  /** 回合开始：依 focus 做全量激活转换（先撤销失效，再激活新满足） */
+  /** 回合开始：依 focus 做全量激活转换（先撤销失效/需逐回合刷新的块，再激活本轮满足项） */
   beginTurn(focus: TurnFocus): void {
     const ids = [...this.fibers.keys()];
     for (const id of ids) {
-      if (this.states.get(id) === 'active' && !this.satisfied(this.fibers.get(id)!, focus)) this.deactivate(id);
+      const fiber = this.fibers.get(id)!;
+      if (this.states.get(id) === 'active'
+        && (fiber.refresh === 'turn' || !this.satisfied(fiber, focus))) this.deactivate(id);
     }
     for (const id of ids) {
       if (this.states.get(id) === 'inactive' && this.satisfied(this.fibers.get(id)!, focus)) this.activate(id, focus);

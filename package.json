@@ -12,22 +12,35 @@
     "plugins/*"
   ],
   "scripts": {
-    "typecheck": "pnpm --filter @jiuguan/mobile-contracts build && tsc -p tsconfig.typecheck.json",
-    "build:runtime": "tsc -p tsconfig.build.json",
+    "skill:real-preflight": "node --experimental-strip-types --experimental-transform-types tools/cli/skill-real-preflight.ts",
+    "skill:real-acceptance": "node --experimental-strip-types --experimental-transform-types tools/cli/skill-real-acceptance.ts",
+    "embed:pull": "node --experimental-strip-types --experimental-transform-types tools/cli/embed-model-pull.ts",
+    "build:runtime-deps": "pnpm --filter @jiuguan/mobile-contracts build && pnpm --filter @jiuguan/prompt build",
+    "typecheck": "pnpm build:runtime-deps && pnpm check:imports && tsc -p tsconfig.typecheck.json",
+    "check:imports": "node --experimental-strip-types --experimental-transform-types tools/architecture/check-import-boundaries.ts",
+    "build:runtime": "pnpm build:runtime-deps && node --experimental-strip-types --experimental-transform-types tools/build/clean-runtime-output.ts && tsc -p tsconfig.build.json",
     "build:web": "pnpm --filter @jiuguan/web build",
     "build:plugins": "pnpm --filter commandcode-provider build",
     "build": "pnpm typecheck && pnpm build:runtime && pnpm build:web && pnpm build:plugins",
+    "rp:template-governance": "node --experimental-strip-types --experimental-transform-types tools/cli/rp-template-governance.ts",
+    "skill:package-apply": "node --experimental-strip-types --experimental-transform-types tools/cli/skill-package-apply.ts",
+    "skill:package-migrate": "node --experimental-strip-types --experimental-transform-types tools/cli/skill-package-migrate.ts",
+    "skill:package-verify": "node --experimental-strip-types --experimental-transform-types tools/cli/skill-package-verify.ts",
+    "skill:package-propose": "node --experimental-strip-types --experimental-transform-types tools/cli/skill-package-propose.ts",
     "p14:report": "node --experimental-strip-types --experimental-transform-types tools/cli/p14-shadow-report.ts",
+    "p16:closure-report": "node --experimental-strip-types --experimental-transform-types tools/cli/agent-closure-report.ts",
     "p14:diagnose": "node --experimental-strip-types --experimental-transform-types tools/cli/p14-operational-diagnostics.ts",
     "p14:preflight": "node --experimental-strip-types --experimental-transform-types tools/cli/p14-operational-preflight.ts",
     "p14:replay": "node --experimental-strip-types --experimental-transform-types tools/cli/p14-replay-evidence.ts",
     "p14:replay:maintenance": "node --experimental-strip-types --experimental-transform-types tools/cli/p14-operational-maintenance-replay.ts",
+    "p14:replay:maintenance:v3": "node --experimental-strip-types --experimental-transform-types tools/cli/p14-operational-maintenance-replay-v3.ts",
     "p14:replay:interactive": "node --experimental-strip-types --experimental-transform-types tools/cli/p14-operational-interactive-replay.ts",
     "p14:replay:learning": "node --experimental-strip-types --experimental-transform-types tools/cli/p14-operational-learning-replay.ts",
     "p14:evidence:import": "node --experimental-strip-types --experimental-transform-types tools/cli/p14-operational-evidence-import.ts",
     "p14:evaluate": "node --experimental-strip-types --experimental-transform-types tools/cli/p14-lane-evaluation.ts",
     "p14:lane": "node --experimental-strip-types --experimental-transform-types tools/cli/agent-lane-control.ts",
     "p14:canary": "node --experimental-strip-types --experimental-transform-types tools/cli/p14-maintenance-canary.ts",
+    "p14:npc:activate": "node --experimental-strip-types --experimental-transform-types tools/cli/npc-maintenance-activate.ts",
     "p10:verify": "pnpm --filter @jiuguan/mobile-shell p10:verify",
     "p10:verify:release": "pnpm --filter @jiuguan/mobile-shell p10:verify:release",
     "p10:verify:device": "pnpm --filter @jiuguan/mobile-shell p10:verify:device",
@@ -39,6 +52,7 @@
     "mobile:install": "node --experimental-strip-types --experimental-transform-types tools/release/adb-install.ts",
     "mobile:smoke": "node --experimental-strip-types --experimental-transform-types tools/release/mobile-smoke.ts",
     "mobile:quick": "pnpm mobile:apk:debug && pnpm mobile:install && pnpm mobile:smoke",
+    "mobile:verify": "pnpm test:p10 && pnpm test:p11",
     "release:host": "node --experimental-strip-types --experimental-transform-types tools/release/host-release.ts",
     "auth:bootstrap": "node --experimental-strip-types --experimental-transform-types tools/cli/auth-bootstrap.ts",
     "snapshot:restore": "node --experimental-strip-types --experimental-transform-types tools/cli/snapshot-restore.ts",
@@ -46,7 +60,7 @@
     "session": "node --experimental-strip-types --experimental-transform-types tools/cli/session.ts",
     "repair:story-index": "node --experimental-strip-types --experimental-transform-types tools/cli/repair-story-index-fallback.ts",
     "migrate-characters": "node --experimental-strip-types --experimental-transform-types tools/cli/migrate-characters.ts",
-    "web:server": "node --experimental-strip-types --experimental-transform-types apps/server/server.ts",
+    "web:server": "node --use-system-ca --experimental-strip-types --experimental-transform-types apps/server/server.ts",
     "web:dev": "pnpm --filter @jiuguan/web dev",
     "web:prod": "pnpm build:web && pnpm web:server",
     "private:start": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/windows/jiuguan-private.ps1 -Action start",
@@ -61,6 +75,8 @@
     "analyze-quality": "node --experimental-strip-types --experimental-transform-types tools/cli/analyze-quality.ts",
     "style:import": "node --experimental-strip-types --experimental-transform-types tools/cli/import-style.ts",
     "style:proposal": "node --experimental-strip-types --experimental-transform-types tools/cli/style-proposal.ts",
+    "style:pilot": "node --experimental-strip-types --experimental-transform-types tools/cli/style-compile-pilot.ts",
+    "skill:package-ci": "pnpm --filter @jiuguan/prompt build && node --experimental-strip-types --experimental-transform-types tools/cli/skill-package-ci.ts",
     "public:verify": "node tools/release/verify-public-clean.mjs",
     "release:verify-clean": "pnpm public:verify"
   },
@@ -69,6 +85,10 @@
     "pnpm": "10.33.0"
   },
   "devDependencies": {
+    "@jiuguan/agent-loop-contract": "workspace:*",
+    "@jiuguan/mobile-contracts": "workspace:*",
+    "@jiuguan/prompt": "workspace:*",
+    "@jiuguan/skill-hub": "workspace:*",
     "@types/node": "^26.2.0",
     "@types/react": "^18.3.31",
     "@types/react-dom": "^18.3.7",
@@ -80,6 +100,7 @@
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "sharp": "0.34.5"
   }
 }

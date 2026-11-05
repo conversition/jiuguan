@@ -9,6 +9,8 @@
  */
 import type { EvaluationScenario, ScenarioOutcome } from './evaluator.ts';
 import type { SuiteMetrics } from './evaluator.ts';
+import { createHash } from 'node:crypto';
+import { gameTurnTool } from '../../prompt/public/turn.ts';
 
 export const REAL_PROVIDER_AB_ENABLED = false;
 
@@ -139,7 +141,13 @@ export function parseSingleTurnReplay(
   });
 }
 
+/** Check contract freshness only: this does not establish the origin or quality of metrics.
+ * Historical replay may be inspected, but never used as a current baseline. */
 export function metricsFromSingleTurnReplay(artifact: SingleTurnReplayArtifact): ExecutorMetrics {
+  const currentToolDigest = createHash('sha256').update(JSON.stringify(gameTurnTool())).digest('hex');
+  if (artifact.sourceArtifactDigest !== currentToolDigest) {
+    throw new Error('single-turn-replay-stale');
+  }
   const total = artifact.cases.length;
   const factChecks = artifact.cases.reduce((sum, row) => sum + row.factChecks, 0);
   const factFailures = artifact.cases.reduce((sum, row) => sum + row.factFailures, 0);

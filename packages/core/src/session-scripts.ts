@@ -2,7 +2,7 @@
  * 会话脚本清单与能力描述（FE-B1/B3 · 通用核心）
  *
  * ── 设计约束（FE-B 通用性要求）────────────────────────────────────────────
- * 1. 示例卡 是**首个真实验收样本**，不是宿主的业务模型。本文件（通用核心）不得内置
+ * 1. WuWa 是**首个真实验收样本**，不是宿主的业务模型。本文件（通用核心）不得内置
  *    卡名、剧情列表、世界书 UID、变量初值或任何卡专属业务算法。
  * 2. 通用核心只处理：脚本身份 / 启用状态 / 原始顺序 / 执行方式 / 所需能力 / 导出能力 /
  *    明确依赖 / 执行环境 / 权限 / 初始化状态 / 错误 / 清理与恢复。
@@ -120,7 +120,7 @@ export interface OperationRequirement {
 /**
  * 各业务操作的能力要求。
  *
- * **取证**：示例卡 开局页自身的 `useMvu = !!MvuObj`（只判 `getMvuData` 是否为函数），
+ * **取证**：WuWa 开局页自身的 `useMvu = !!MvuObj`（只判 `getMvuData` 是否为函数），
  * 走的是 `getMvuData` / `replaceMvuData` 的 `stat_data` 读写 —— **不经过 schema 校验**；
  * schema（变量结构）作用于**回合内** AI 产出的变量更新。故：
  *  - `commit-variables`（正式变量型开局）需要：世界书写入 + 权威状态仓库 + 变量写入路径；
@@ -302,7 +302,7 @@ function globalProvides(code: string): string[] {
   return [...out];
 }
 
-/** 从全局读取的符号（赋值除外）：`target.CardShared.STORY_MAP` */
+/** 从全局读取的符号（赋值除外）：`target.WuWaShared.STORY_MAP` */
 function globalReads(code: string, candidates: string[]): string[] {
   const out: string[] = [];
   for (const name of candidates) {
@@ -434,10 +434,38 @@ export interface CardScriptAdapter {
 }
 
 /**
- * 公开版不内置针对私人角色卡或第三方远程页面的特化适配器。
- * 调用方仍可通过 opts.adapters 注入自己的 CardScriptAdapter。
+ * 已核验的卡片适配器（独立配置）。
+ * WuWa 适配器：依据 data/cards/WuWa_Solaris-3_MVU_Edition_14.json 逐条核验（6 脚本）。
+ * 标签仅用于报告与选型提示 —— 调度不依赖它们。
  */
-export const BUILTIN_CARD_ADAPTERS: CardScriptAdapter[] = [];
+export const BUILTIN_CARD_ADAPTERS: CardScriptAdapter[] = [
+  {
+    id: 'wuwa-solaris3-mvu',
+    appliesTo: 'WuWa Solaris-3 MVU Edition（tavern_helper 6 脚本版本，2026-09 核验）',
+    match: (m) => /WuWa|鸣潮/i.test(m.cardName),
+    tagRules: [
+      { tag: 'mvu-loader', reason: '远程 import 变量更新内核 bundle', test: (c) => c.capabilities.includes('mvu-kernel') },
+      { tag: 'schema', reason: '调用 registerMvuSchema 注册变量结构', test: (c) => c.capabilities.includes('mvu-schema') },
+      { tag: 'story-data', reason: '生产者：挂载共享剧情数据命名空间供其它脚本读取', test: (c) => c.provides.some((p) => /Shared/.test(p)) && c.dependsOnCount === 0 },
+      { tag: 'story-logic', reason: '消费者：读取共享剧情数据并导出剧情计算函数', test: (c) => c.dependsOnCount > 0 || /calculateStoryLogic/.test(c.code) },
+      { tag: 'worldbook-control', reason: '世界书控制悬浮界面', test: (c) => /wb-float-monitor|wb-switcher-list/.test(c.code) },
+      { tag: 'plugin', reason: '持久插件（跨消息实例，本轮不加载）', test: (c) => /飞讯/.test(c.name) || /is_feixun_record/.test(c.code) },
+    ],
+  },
+  {
+    id: 'external-phone-frontend',
+    appliesTo: '外部手机前端适配（脚本为一行远程 import，按卡片名或内容哈希登记）',
+    match: (m) => /-phone\b/i.test(m.cardName) || /mobile-frontend/i.test(m.contentHash ?? ''),
+    tagRules: [],
+    hints: {
+      // 手机 UI = 会话面板（FE-05 范围）。其远程实现依赖尚未支持的运行时（z/Vue），
+      // 本批**不装载**：既不重复执行，也不假装"手机已迁移"。
+      defer: [
+        { pattern: /手机(?!-测试)/, reason: '手机 UI 属 FE-05（会话面板与动作桥）；其远程实现依赖未支持运行时，本批不装载', appliesTo: '外部手机前端（FE-05 前）' },
+      ],
+    },
+  },
+];
 
 function classify(manifest: CardImportManifest, ctx: AdapterContext, adapters: CardScriptAdapter[]): { tags: string[]; reasons: string[]; adapterIds: string[] } {
   const tags: string[] = [];

@@ -216,8 +216,14 @@ export class AssetIdentityRegistry {
     const current = this.byStorage.get(key);
     if (current) {
       if (current.displayName !== displayName) {
+        const previousDisplayName = current.displayName;
         current.displayName = displayName;
-        this.persist();
+        try {
+          this.persist();
+        } catch (error) {
+          current.displayName = previousDisplayName;
+          throw error;
+        }
       }
       return clone(current);
     }
@@ -228,7 +234,13 @@ export class AssetIdentityRegistry {
       displayName,
     };
     this.index(record);
-    this.persist();
+    try {
+      this.persist();
+    } catch (error) {
+      this.byId.delete(record.assetId);
+      this.byStorage.delete(key);
+      throw error;
+    }
     return clone(record);
   }
 
@@ -239,26 +251,36 @@ export class AssetIdentityRegistry {
   ensureDiscovered(
     entries: readonly { kind: AssetKind; storageKey: string; displayName: string }[],
   ): LocalAssetIdentity[] {
-    let changed = false;
+    const added: LocalAssetIdentity[] = [];
     const out: LocalAssetIdentity[] = [];
     for (const entry of entries) {
       if (!isSafeAssetFileName(entry.storageKey)) throw new TypeError('storageKey 非法');
       if (!safeDisplayName(entry.displayName)) throw new TypeError('displayName 非法');
-      const key = this.storageIndex(entry.kind, entry.storageKey);
-      let record = this.byStorage.get(key);
-      if (!record) {
-        record = {
-          assetId: this.newId(),
-          kind: entry.kind,
-          storageKey: entry.storageKey,
-          displayName: entry.displayName,
-        };
-        this.index(record);
-        changed = true;
-      }
-      out.push(clone(record));
     }
-    if (changed) this.persist();
+    try {
+      for (const entry of entries) {
+        const key = this.storageIndex(entry.kind, entry.storageKey);
+        let record = this.byStorage.get(key);
+        if (!record) {
+          record = {
+            assetId: this.newId(),
+            kind: entry.kind,
+            storageKey: entry.storageKey,
+            displayName: entry.displayName,
+          };
+          this.index(record);
+          added.push(record);
+        }
+        out.push(clone(record));
+      }
+      if (added.length > 0) this.persist();
+    } catch (error) {
+      for (const record of added) {
+        this.byId.delete(record.assetId);
+        this.byStorage.delete(this.storageIndex(record.kind, record.storageKey));
+      }
+      throw error;
+    }
     return out;
   }
 

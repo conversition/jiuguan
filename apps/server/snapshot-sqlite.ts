@@ -1,6 +1,10 @@
+import { WORLDBOOK_REPAIR_APPLICATION_ID, inspectWorldbookRepairSchema } from './worldbook-repair-control.ts';
+import { DIRECTOR_CREATIVE_APPLICATION_ID, inspectDirectorCreativeSchema } from './director-creative-store.ts';
 import { DatabaseSync } from 'node:sqlite';
-import { existsSync, lstatSync, rmSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { inspectToolResultBodyStorage } from '../../packages/memory/public/tool-result-body.ts';
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import {
   AUTH_DB_APPLICATION_ID,
   AUTH_SCHEMA_VERSION,
@@ -8,13 +12,33 @@ import {
 } from '../../packages/server-auth/src/index.ts';
 import { SCHEMA_VERSION as SESSION_SCHEMA_VERSION } from '../../packages/memory/src/schema.ts';
 import {
+  MemoryDb,
+  SESSION_DIRECTOR_STORAGE_REQUIRED_COLUMNS,
+  SESSION_STORAGE_PREDECESSOR_VERSION,
+  SESSION_V16_STORAGE_REQUIRED_COLUMNS,
+  inspectSessionAuthoritySchema,
+  inspectRpChildAnalysisStorage,
+  inspectSessionPredecessorV16Storage,
+} from '../../packages/memory/public/session-database.ts';
+import {
   TURN_JOB_APPLICATION_ID,
   TURN_JOB_SCHEMA_VERSION,
 } from './turn-job-manager.ts';
 import {
   MAINTENANCE_JOB_APPLICATION_ID,
   MAINTENANCE_JOB_SCHEMA_VERSION,
+  inspectMaintenanceProductionRouteReceiptSchema,
 } from './maintenance-job-manager.ts';
+import { MAINTENANCE_MEMORY_SKILL_OUTBOX_TABLE,
+  MAINTENANCE_MEMORY_SKILL_OUTBOX_COLUMNS } from './maintenance-memory-skill-outbox.ts';
+import { inspectMaintenanceMemoryDirectProposalSchema,
+  MAINTENANCE_MEMORY_DIRECT_PROPOSAL_TABLE,
+  MAINTENANCE_MEMORY_DIRECT_PROPOSAL_COLUMNS } from './maintenance-memory-direct-proposal.ts';
+import {
+  inspectMaintenanceSummarySkillSourceSchema,
+  MAINTENANCE_SUMMARY_SKILL_SOURCE_TABLE,
+  MAINTENANCE_SUMMARY_SKILL_SOURCE_COLUMNS,
+} from './maintenance-summary-skill-source.ts';
 import {
   INTERACTIVE_LEDGER_APPLICATION_ID,
   INTERACTIVE_LEDGER_SCHEMA_VERSION,
@@ -36,44 +60,44 @@ import {
   ARC_PROJECTION_SCHEMA_VERSION,
 } from './arc-projection-store.ts';
 import {
+  AGENT_LOOP_PROJECTION_DB_FILE,
+  AGENT_LOOP_PROJECTION_APPLICATION_ID,
+  AGENT_LOOP_PROJECTION_SCHEMA_VERSION,
+  inspectAgentLoopProjectionSchemaExact,
+  inspectAgentLoopProjectionSchemaV7Exact,
+  inspectAgentLoopProjectionSchemaV8Exact,
+} from './agent-loop-projection-store.ts';
+import {
   AGENT_CONTROL_APPLICATION_ID,
   AGENT_CONTROL_SCHEMA_VERSION,
 } from './agent-control-store.ts';
+import { inspectAgentControlAuthoritySchema } from './agent-control-authority.ts';
+import {
+  AGENT_CLOSURE_APPLICATION_ID,
+  AGENT_CLOSURE_SCHEMA_VERSION,
+} from './agent-closure-store.ts';
+import {
+    AGENT_EVIDENCE_APPLICATION_ID,
+    inspectAgentEvidenceSchema,
+} from './agent-evidence-ledger.ts';
+import {
+    AGENT_SKILL_CANDIDATE_APPLICATION_ID, inspectAgentSkillCandidateSchema,
+} from './agent-skill-candidate-store.ts';
+import { SKILL_COMPILE_APPLICATION_ID, inspectSkillCompileSchema } from './skill-compile-store.ts';
+import { SKILL_EVALUATE_APPLICATION_ID, inspectSkillEvaluateSchema } from './skill-evaluate-store.ts';
+import { SKILL_SAMPLE_APPLICATION_ID, inspectSkillSampleSchema } from './skill-sample-store.ts';
+import { SKILL_QUALITY_APPLICATION_ID, inspectSkillQualitySchema } from './skill-quality-store.ts';
+import { SKILL_PACKAGE_PIN_APPLICATION_ID, inspectSkillPackagePinSchema } from './skill-package-pin-store.ts';
+import { STYLE_COMPILE_JOB_APPLICATION_ID, STYLE_COMPILE_JOB_SCHEMA_VERSION } from './skill-hub/style-compile-job-store.ts';
 import {
   SnapshotCoordinatorError,
   type SnapshotComponentPlan,
   type SnapshotSqliteCaptureAdapter,
 } from './snapshot-coordinator.ts';
 
-const SESSION_REQUIRED_COLUMNS: Readonly<Record<string, readonly string[]>> = Object.freeze({
-  memory_meta: ['id', 'arc_id', 'stage', 'plot_round', 'bars', 'config'],
-  chat_log: ['id', 'round', 'role', 'content'],
-  memory_arc: ['id', 'code', 'chapter', 'title', 'summary', 'status', 'seq'],
-  memory_summary: ['id', 'code', 'round', 'delta', 'scene'],
-  memory_event: ['id', 'code', 'description', 'characters', 'refs', 'resolved'],
-  memory_parallel: ['id', 'kind', 'countdown_min', 'actor', 'location', 'action', 'next_stage'],
-  memory_state: ['id', 'entity_type', 'entity_id', 'name', 'state_json', 'updated_round'],
-  lorebook_entry: ['id', 'uid', 'book', 'key', 'comment', 'content'],
-  state_snapshot: ['scope', 'scope_key', 'branch_key', 'state_json', 'state_version'],
-  session_control: ['session_key', 'control_key', 'value'],
-  character_registry: ['session_key', 'character_id', 'name', 'kind'],
-  character_alias: ['session_key', 'alias', 'character_id', 'explicit'],
-  character_fact_log: ['session_key', 'character_id', 'field', 'value_json', 'history_epoch'],
-  character_mention_pool: ['session_key', 'mention_key', 'rounds_json', 'pending_json'],
-  turn_job_outcome: ['run_id', 'session_id', 'action', 'round', 'revision'],
-  turn_observation: [
-    'observation_id', 'run_id', 'session_id', 'round', 'assistant_message_id',
-    'source_revision', 'query_plan_version', 'routing_digest', 'recall_hit_count',
-    'recall_codes_json', 'worldbook_hit_count', 'resolved_entity_count',
-    'ambiguous_entity_count', 'skill_ids_json', 'skill_body_hashes_json',
-    'skill_tokens', 'assembled_prompt_tokens', 'harness_lane',
-    'harness_evidence_count', 'model_attempts', 'payload_digest', 'created_at',
-  ],
-  learning_outbox: [
-    'event_id', 'run_id', 'session_id', 'card_id', 'content_mode', 'event_kind',
-    'round', 'user_message_id', 'assistant_message_id', 'source_revision',
-    'subject_digest', 'features_json', 'payload_digest', 'created_at', 'delivered_at',
-  ],
+const SESSION_V17_REQUIRED_COLUMNS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  ...SESSION_V16_STORAGE_REQUIRED_COLUMNS,
+  ...SESSION_DIRECTOR_STORAGE_REQUIRED_COLUMNS,
 });
 
 const TURN_JOB_EXACT_COLUMNS: Readonly<Record<string, readonly string[]>> = Object.freeze({
@@ -90,7 +114,7 @@ const TURN_JOB_EXACT_COLUMNS: Readonly<Record<string, readonly string[]>> = Obje
   ],
 });
 
-const MAINTENANCE_JOB_EXACT_COLUMNS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+const MAINTENANCE_JOB_V4_EXACT_COLUMNS: Readonly<Record<string, readonly string[]>> = Object.freeze({
   maintenance_settings: ['singleton', 'global_enabled', 'default_mode', 'updated_at'],
   maintenance_session_settings: ['session_id', 'enabled', 'updated_at'],
   maintenance_job: [
@@ -105,6 +129,28 @@ const MAINTENANCE_JOB_EXACT_COLUMNS: Readonly<Record<string, readonly string[]>>
     'proposal_digest', 'proposal_json', 'context_json', 'diff_json', 'status', 'revision',
     'created_at', 'updated_at', 'decided_at', 'decision_reason', 'receipt_json',
     'rollback_anchor_json',
+  ],
+});
+
+const MAINTENANCE_JOB_V5_EXACT_COLUMNS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  ...MAINTENANCE_JOB_V4_EXACT_COLUMNS,
+  maintenance_job: [...MAINTENANCE_JOB_V4_EXACT_COLUMNS.maintenance_job, 'executor_route'],
+});
+
+const MAINTENANCE_JOB_V6_EXACT_COLUMNS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  ...MAINTENANCE_JOB_V5_EXACT_COLUMNS,
+  maintenance_pending_proposal: [...MAINTENANCE_JOB_V5_EXACT_COLUMNS.maintenance_pending_proposal, 'agent_loop_preparation_json'],
+});
+
+const MAINTENANCE_JOB_V7_EXACT_COLUMNS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  ...MAINTENANCE_JOB_V6_EXACT_COLUMNS,
+  maintenance_pending_proposal: [...MAINTENANCE_JOB_V6_EXACT_COLUMNS.maintenance_pending_proposal, 'agent_loop_publication_json'],
+});
+
+const MAINTENANCE_JOB_EXACT_COLUMNS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  ...MAINTENANCE_JOB_V7_EXACT_COLUMNS,
+  maintenance_production_route_receipt: [
+    'run_id', 'claimed_at', 'receipt_digest', 'receipt_json',
   ],
 });
 
@@ -127,6 +173,7 @@ const MODEL_USAGE_EXACT_COLUMNS: Readonly<Record<string, readonly string[]>> = O
 });
 
 const AGENT_ADMISSION_EXACT_COLUMNS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  maintenance_admission_authority: ['singleton', 'generation', 'revision'],
   agent_admission_decision: [
     'decision_id', 'run_id', 'session_id', 'round', 'source_revision', 'policy_version',
     'verdict', 'score', 'hard_signals_json', 'reason_codes_json', 'routing_digest',
@@ -165,6 +212,78 @@ const AGENT_ADMISSION_EXACT_COLUMNS: Readonly<Record<string, readonly string[]>>
   ],
 });
 
+function normalizeAgentAdmissionAuthorityTriggerSql(value: string): string {
+  return value.trim().replace(/\s+/gu, ' ').toLowerCase();
+}
+
+function agentAdmissionAuthorityTriggerSql(
+  name: string,
+  operation: 'DELETE' | 'INSERT' | 'UPDATE',
+): string {
+  // sqlite_master removes IF NOT EXISTS and the final statement semicolon,
+  // while preserving the trigger body. Compare the complete normalized text
+  // so a disabled predicate or unreachable RAISE cannot masquerade as exact.
+  return normalizeAgentAdmissionAuthorityTriggerSql(`
+    CREATE TRIGGER ${name}
+    AFTER ${operation} ON maintenance_admission_decision
+    BEGIN
+      UPDATE maintenance_admission_authority
+      SET revision = revision + 1
+      WHERE singleton = 1;
+      SELECT CASE WHEN changes() <> 1
+        THEN RAISE(ABORT, 'maintenance-admission-authority-invalid') END;
+    END
+  `);
+}
+
+const AGENT_ADMISSION_AUTHORITY_TRIGGERS = Object.freeze({
+  maintenance_admission_authority_delete: agentAdmissionAuthorityTriggerSql(
+    'maintenance_admission_authority_delete',
+    'DELETE',
+  ),
+  maintenance_admission_authority_insert: agentAdmissionAuthorityTriggerSql(
+    'maintenance_admission_authority_insert',
+    'INSERT',
+  ),
+  maintenance_admission_authority_update: agentAdmissionAuthorityTriggerSql(
+    'maintenance_admission_authority_update',
+    'UPDATE',
+  ),
+} as const);
+
+function inspectAgentAdmissionAuthoritySchema(db: DatabaseSync): void {
+  const rows = db.prepare(`
+    SELECT singleton,generation,revision FROM maintenance_admission_authority
+  `).all() as Array<{ singleton: unknown; generation: unknown; revision: unknown }>;
+  if (rows.length !== 1 || rows[0]?.singleton !== 1
+    || typeof rows[0].generation !== 'string'
+    || !/^maintenance-admission:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u
+      .test(rows[0].generation)
+    || !Number.isSafeInteger(rows[0].revision) || Number(rows[0].revision) < 0) {
+    throw new Error('agent admission authority 坐标不匹配');
+  }
+  const triggers = db.prepare(`
+    SELECT name,sql FROM sqlite_master
+    WHERE type='trigger' AND tbl_name='maintenance_admission_decision'
+    ORDER BY name
+  `).all() as Array<{ name: string; sql: string | null }>;
+  const expected = Object.entries(AGENT_ADMISSION_AUTHORITY_TRIGGERS);
+  if (triggers.length !== expected.length) {
+    throw new Error('agent admission authority trigger 集合不匹配');
+  }
+  for (let index = 0; index < expected.length; index += 1) {
+    const [name, expectedSql] = expected[index]!;
+    const trigger = triggers[index];
+    const sql = trigger?.sql
+      ? normalizeAgentAdmissionAuthorityTriggerSql(trigger.sql)
+      : '';
+    if (trigger?.name !== name
+      || sql !== expectedSql) {
+      throw new Error('agent admission authority trigger 定义不匹配');
+    }
+  }
+}
+
 const AGENT_LEARNING_EXACT_COLUMNS: Readonly<Record<string, readonly string[]>> = Object.freeze({
   learning_event: [
     'event_id', 'payload_digest', 'run_id', 'session_id', 'card_id', 'content_mode',
@@ -185,6 +304,12 @@ const ARC_PROJECTION_EXACT_COLUMNS: Readonly<Record<string, readonly string[]>> 
 });
 
 const AGENT_CONTROL_EXACT_COLUMNS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  agent_control_authority: ['singleton', 'generation', 'revision'],
+  agent_maintenance_route_control: [
+    'singleton', 'cohort_generation', 'state', 'target_session_id', 'evidence_digest',
+    'revision', 'updated_at',
+  ],
+  agent_asset_mutation_pending: ['singleton', 'mutation_id', 'started_at'],
   agent_lane_control: ['lane', 'desired_state', 'killed_reason', 'updated_at'],
   agent_capability_control: ['capability_id', 'killed_reason', 'updated_at'],
   agent_lane_evaluation: [
@@ -220,6 +345,55 @@ const AGENT_CONTROL_EXACT_COLUMNS: Readonly<Record<string, readonly string[]>> =
     'request_digest', 'lane_control_revision', 'reserved_provider_calls',
     'settled_provider_calls', 'status', 'created_at', 'deadline_at', 'started_at', 'settled_at',
   ],
+  agent_lane_known_defect_correction: [
+    'defect_id', 'lane', 'killed_reason', 'fixed_policy_revision',
+    'source_control_revision', 'source_window_sequence', 'source_observation_version',
+    'source_day', 'corrected_player_sovereignty_violations', 'evidence_digest', 'created_at',
+  ],
+  maintenance_invalid_tool_diagnostic: [
+    'window_sequence', 'task_kind', 'run_id', 'tool', 'rejection_code', 'run_failed',
+    'occurrence_count', 'occurred_at',
+  ],
+  maintenance_protocol_run_outcome: [
+    'event_sequence', 'window_sequence', 'incident_group', 'task_kind', 'run_id', 'outcome',
+    'occurred_at',
+  ],
+});
+
+const AGENT_CLOSURE_EXACT_COLUMNS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  agent_closure_run: [
+    'operation_id', 'contract_version', 'run_id', 'parent_run_id', 'session_id',
+    'capability', 'lane', 'closure_kind', 'execution_class', 'source_revision',
+    'policy_version', 'evidence_digest', 'current_stage', 'status',
+    'next_required_event', 'consumed_count', 'production_closed', 'latest_reason_code',
+    'revision', 'admitted_at', 'created_at', 'updated_at',
+  ],
+  agent_closure_event: [
+    'event_id', 'operation_id', 'sequence', 'event_type', 'idempotency_key',
+    'occurred_at', 'artifact_digest', 'evidence_ref', 'source_revision',
+    'target_revision', 'consumer_run_id', 'context_block', 'reason_code',
+    'item_count', 'token_count', 'effect_outcome', 'skill_attribution_json',
+  ],
+});
+
+const STYLE_COMPILE_JOB_LEGACY_EXACT_COLUMNS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+    style_compile_job: [
+        'job_id', 'session_id', 'content_mode', 'style_skill_id', 'round', 'source_revision',
+        'explicit_request', 'state', 'attempts', 'owner', 'lease_expires_at', 'reason_code',
+        'created_at', 'updated_at', 'availability_deferrals', 'not_before', 'run_id',
+        'intent_packet_digest', 'execution_started_at', 'result_json',
+    ],
+    style_compile_job_schema: ['id', 'version'],
+});
+
+const STYLE_COMPILE_JOB_EXACT_COLUMNS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+    ...STYLE_COMPILE_JOB_LEGACY_EXACT_COLUMNS,
+    style_compile_pilot_budget: [
+        'pilot_id_digest', 'policy_digest', 'max_calls', 'max_cost_microusd', 'expires_at', 'halted',
+    ],
+    style_compile_pilot_permit: [
+        'reservation_digest', 'pilot_id_digest', 'reserved_cost_microusd', 'created_at',
+    ],
 });
 
 function pragmaInteger(db: DatabaseSync, name: 'application_id' | 'user_version'): number {
@@ -240,23 +414,54 @@ function tableColumns(db: DatabaseSync, table: string): string[] {
     .map((row) => String(row.name ?? ''));
 }
 
-function inspectSessionSchema(db: DatabaseSync): void {
-  for (const [table, columns] of Object.entries(SESSION_REQUIRED_COLUMNS)) {
+function sessionOrdinaryTableExists(db: DatabaseSync, table: string): boolean {
+  const schema = db.prepare(
+    'SELECT type,sql FROM sqlite_master WHERE name=? COLLATE NOCASE LIMIT 1',
+  ).get(table) as { type?: unknown; sql?: unknown } | undefined;
+  const listed = db.prepare(
+    "SELECT type FROM pragma_table_list WHERE schema='main' AND name=? COLLATE NOCASE LIMIT 1",
+  ).get(table) as { type?: unknown } | undefined;
+  return schema?.type === 'table'
+    && typeof schema.sql === 'string'
+    && listed?.type === 'table'
+    && !/^\s*CREATE\s+VIRTUAL\s+TABLE\b/iu.test(schema.sql);
+}
+
+function inspectSessionSchema(db: DatabaseSync, version: number): void {
+  inspectRpChildAnalysisStorage(db);
+  inspectToolResultBodyStorage(db);
+  if (version === SESSION_STORAGE_PREDECESSOR_VERSION) {
+    inspectSessionPredecessorV16Storage(db);
+    return;
+  }
+  if (version !== SESSION_SCHEMA_VERSION) throw new Error('session DB schema 版本不受支持');
+  for (const [table, columns] of Object.entries(SESSION_V17_REQUIRED_COLUMNS)) {
+    if (!sessionOrdinaryTableExists(db, table)) {
+      throw new Error('session schema 缺少 ' + table + ' 必需普通表');
+    }
     const actual = new Set(tableColumns(db, table));
     if (columns.some((column) => !actual.has(column))) {
       throw new Error('session schema 缺少 ' + table + ' 必需列');
     }
   }
+  inspectSessionAuthoritySchema(db);
 }
 
-function inspectExactSchema(db: DatabaseSync, exact: Readonly<Record<string, readonly string[]>>, label: string): void {
+function inspectExactSchema(
+  db: DatabaseSync,
+  exact: Readonly<Record<string, readonly string[]>>,
+  label: string,
+  orderedColumns = true,
+): void {
   const tables = (db.prepare(
     "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
   ).all() as Array<{ name?: unknown }>).map((row) => String(row.name ?? ''));
   const expectedTables = Object.keys(exact).sort();
   if (tables.join(',') !== expectedTables.join(',')) throw new Error(label + ' 表集合不一致');
   for (const [table, expected] of Object.entries(exact)) {
-    if (tableColumns(db, table).join(',') !== expected.join(',')) {
+    const actual = tableColumns(db, table);
+    if ((orderedColumns ? actual : actual.sort()).join(',')
+      !== (orderedColumns ? expected : [...expected].sort()).join(',')) {
       throw new Error(label + ' 表列不一致：' + table);
     }
   }
@@ -271,21 +476,82 @@ function inspectRole(
     throw new Error('SQLite 副本 user_version 与 inventory 不一致');
   }
   const applicationId = pragmaInteger(db, 'application_id');
+  // This reserved component cannot be replaced by another otherwise valid control/Session DB.
+  if (component.sourceRelativePath.replace(/\\/gu, '/').toLowerCase() === `agent-loop-projection/${AGENT_LOOP_PROJECTION_DB_FILE}`
+    && (component.role !== 'control-db' || applicationId !== AGENT_LOOP_PROJECTION_APPLICATION_ID)) {
+    throw new Error('agent loop projection 路径必须绑定 JGLP control-db');
+  }
   if (component.role === 'session-db') {
     if (applicationId !== 0) throw new Error('session DB application_id 必须是 0');
-    if (version !== SESSION_SCHEMA_VERSION) throw new Error('session DB schema 不是当前版本');
-    inspectSessionSchema(db);
+    if (version !== SESSION_STORAGE_PREDECESSOR_VERSION && version !== SESSION_SCHEMA_VERSION) {
+      throw new Error('session DB schema 版本不受支持');
+    }
+    inspectSessionSchema(db, version);
     return;
   }
   if (component.role === 'control-db') {
+    if (applicationId === WORLDBOOK_REPAIR_APPLICATION_ID) {
+      inspectWorldbookRepairSchema(db);
+      return;
+    }
+    if (applicationId === AGENT_LOOP_PROJECTION_APPLICATION_ID) {
+      // Preserve released AL7/AL8 backups without granting a backup reader migration authority.
+      if (version === 7) inspectAgentLoopProjectionSchemaV7Exact(db);
+      else if (version === 8) inspectAgentLoopProjectionSchemaV8Exact(db);
+      else if (version === AGENT_LOOP_PROJECTION_SCHEMA_VERSION) inspectAgentLoopProjectionSchemaExact(db);
+      else throw new Error('agent loop projection schema 不是受支持版本');
+      if (db.prepare('PRAGMA foreign_key_check').all().length !== 0) {
+        throw new Error('agent loop projection foreign key 不完整');
+      }
+      return;
+    }
+    if (applicationId === STYLE_COMPILE_JOB_APPLICATION_ID) {
+      if (version !== 4 && version !== STYLE_COMPILE_JOB_SCHEMA_VERSION) {
+        throw new Error('style compile job schema 不是受支持版本');
+      }
+      // Legacy upgrades append columns; identical closed column sets need not share physical order.
+      const exact = version === 4 ? STYLE_COMPILE_JOB_LEGACY_EXACT_COLUMNS : STYLE_COMPILE_JOB_EXACT_COLUMNS;
+      inspectExactSchema(db, exact, 'style compile job', false);
+      const schema = db.prepare('SELECT id,version FROM style_compile_job_schema LIMIT 2').all();
+      if (schema.length !== 1 || schema[0]?.id !== 1 || schema[0]?.version !== version) {
+        throw new Error('style compile job schema 元数据不匹配');
+      }
+      return;
+    }
     if (applicationId === TURN_JOB_APPLICATION_ID) {
       if (version !== TURN_JOB_SCHEMA_VERSION) throw new Error('turn job schema 不是当前版本');
       inspectExactSchema(db, TURN_JOB_EXACT_COLUMNS, 'turn job');
       return;
     }
     if (applicationId === MAINTENANCE_JOB_APPLICATION_ID) {
-      if (version !== MAINTENANCE_JOB_SCHEMA_VERSION) throw new Error('maintenance job schema 不是当前版本');
-      inspectExactSchema(db, MAINTENANCE_JOB_EXACT_COLUMNS, 'maintenance job');
+      if (![4, 5, 6, 7, MAINTENANCE_JOB_SCHEMA_VERSION].includes(version)) throw new Error('maintenance job schema 不是受支持版本');
+      const hasSkillOutbox = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?")
+        .get(MAINTENANCE_MEMORY_SKILL_OUTBOX_TABLE);
+      const hasDirectProposal = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?")
+        .get(MAINTENANCE_MEMORY_DIRECT_PROPOSAL_TABLE);
+      const hasSummarySource = db.prepare('SELECT 1 FROM sqlite_master WHERE name=?')
+        .get(MAINTENANCE_SUMMARY_SKILL_SOURCE_TABLE);
+      inspectExactSchema(db, {
+        ...(version === 4 ? MAINTENANCE_JOB_V4_EXACT_COLUMNS
+          : version === 5 ? MAINTENANCE_JOB_V5_EXACT_COLUMNS
+            : version === 6 ? MAINTENANCE_JOB_V6_EXACT_COLUMNS
+              : version === 7 ? MAINTENANCE_JOB_V7_EXACT_COLUMNS
+                : MAINTENANCE_JOB_EXACT_COLUMNS),
+        ...(hasSkillOutbox ? {
+          [MAINTENANCE_MEMORY_SKILL_OUTBOX_TABLE]: MAINTENANCE_MEMORY_SKILL_OUTBOX_COLUMNS,
+        } : {}),
+        ...(hasDirectProposal ? {
+          [MAINTENANCE_MEMORY_DIRECT_PROPOSAL_TABLE]: MAINTENANCE_MEMORY_DIRECT_PROPOSAL_COLUMNS,
+        } : {}),
+        ...(hasSummarySource ? {
+          [MAINTENANCE_SUMMARY_SKILL_SOURCE_TABLE]: MAINTENANCE_SUMMARY_SKILL_SOURCE_COLUMNS,
+        } : {}),
+      }, 'maintenance job');
+      if (hasDirectProposal) inspectMaintenanceMemoryDirectProposalSchema(db);
+      if (hasSummarySource) inspectMaintenanceSummarySkillSourceSchema(db);
+      if (version === MAINTENANCE_JOB_SCHEMA_VERSION) {
+        inspectMaintenanceProductionRouteReceiptSchema(db);
+      }
       return;
     }
     if (applicationId === INTERACTIVE_LEDGER_APPLICATION_ID) {
@@ -301,6 +567,7 @@ function inspectRole(
     if (applicationId === AGENT_ADMISSION_APPLICATION_ID) {
       if (version !== AGENT_ADMISSION_SCHEMA_VERSION) throw new Error('agent admission schema 不是当前版本');
       inspectExactSchema(db, AGENT_ADMISSION_EXACT_COLUMNS, 'agent admission');
+      inspectAgentAdmissionAuthoritySchema(db);
       return;
     }
     if (applicationId === AGENT_LEARNING_APPLICATION_ID) {
@@ -316,7 +583,58 @@ function inspectRole(
     if (applicationId === AGENT_CONTROL_APPLICATION_ID) {
       if (version !== AGENT_CONTROL_SCHEMA_VERSION) throw new Error('agent control schema 不是当前版本');
       inspectExactSchema(db, AGENT_CONTROL_EXACT_COLUMNS, 'agent control');
+      inspectAgentControlAuthoritySchema(db);
       return;
+    }
+    if (applicationId === AGENT_CLOSURE_APPLICATION_ID) {
+      if (version !== 1 && version !== AGENT_CLOSURE_SCHEMA_VERSION) throw new Error('agent closure schema 版本不支持');
+      const columns = version === 1 ? Object.fromEntries(Object.entries(AGENT_CLOSURE_EXACT_COLUMNS)
+        .map(([table, fields]) => [table, fields.filter((field) => field !== 'skill_attribution_json')]))
+        : AGENT_CLOSURE_EXACT_COLUMNS;
+      inspectExactSchema(db, columns, 'agent closure');
+      const foreignKeys = db.prepare('PRAGMA foreign_key_list(agent_closure_event)')
+        .all() as Array<Record<string, unknown>>;
+      if (foreignKeys.length !== 1
+        || foreignKeys[0]?.table !== 'agent_closure_run'
+        || foreignKeys[0]?.from !== 'operation_id'
+        || foreignKeys[0]?.to !== 'operation_id'
+        || String(foreignKeys[0]?.on_delete).toUpperCase() !== 'CASCADE') {
+        throw new Error('agent closure foreign key 不匹配');
+      }
+      return;
+    }
+    if (applicationId === DIRECTOR_CREATIVE_APPLICATION_ID) {
+        inspectDirectorCreativeSchema(db);
+        return;
+    }
+    if (applicationId === AGENT_EVIDENCE_APPLICATION_ID) {
+        // The ledger owns its append-only checks and deletion fences, not just column names.
+        inspectAgentEvidenceSchema(db);
+        return;
+    }
+    if (applicationId === AGENT_SKILL_CANDIDATE_APPLICATION_ID) {
+        inspectAgentSkillCandidateSchema(db);
+        return;
+    }
+    if (applicationId === SKILL_COMPILE_APPLICATION_ID) {
+        inspectSkillCompileSchema(db);
+        return;
+    }
+    if (applicationId === SKILL_EVALUATE_APPLICATION_ID) {
+        inspectSkillEvaluateSchema(db);
+        return;
+    }
+    if (applicationId === SKILL_SAMPLE_APPLICATION_ID) {
+        inspectSkillSampleSchema(db);
+        return;
+    }
+    if (applicationId === SKILL_QUALITY_APPLICATION_ID) {
+        inspectSkillQualitySchema(db);
+        return;
+    }
+    if (applicationId === SKILL_PACKAGE_PIN_APPLICATION_ID) {
+        inspectSkillPackagePinSchema(db);
+        return;
     }
     throw new Error('control-db application_id 不匹配');
   }
@@ -328,6 +646,43 @@ function inspectRole(
     return;
   }
   throw new Error('SQLite adapter 只接受数据库 role');
+}
+
+/**
+ * Prove that a frozen v16 artifact can be taken over by the current Session
+ * owner without mutating the artifact itself. Column checks cannot cover every
+ * SQLite object collision or virtual-table restriction exercised by real DDL.
+ */
+function probeSessionPredecessorOwnerMigration(sourcePath: string): void {
+  let probeRoot: string | undefined;
+  let migrated: MemoryDb | undefined;
+  let primaryError: unknown;
+  try {
+    probeRoot = mkdtempSync(join(tmpdir(), 'jg-session-v16-owner-probe-'));
+    const probePath = join(probeRoot, 'session.db');
+    copyFileSync(sourcePath, probePath);
+    // copyFile preserves a read-only source mode on Windows. The probe is an
+    // isolated disposable owner candidate, so make only that copy writable.
+    chmodSync(probePath, 0o600);
+    migrated = new MemoryDb({ path: probePath });
+    if (migrated.userVersion() !== SESSION_SCHEMA_VERSION) {
+      throw new Error('session v16 owner probe 未迁移到当前版本');
+    }
+    inspectSessionAuthoritySchema(migrated.db);
+  } catch (error) {
+    primaryError = error;
+  }
+
+  // Close before recursive cleanup so Windows never retains the probe file.
+  if (migrated?.db.isOpen) {
+    try { migrated.close(); } catch (error) { primaryError ??= error; }
+  }
+  if (probeRoot !== undefined) {
+    try { rmSync(probeRoot, { recursive: true, force: true }); } catch (error) {
+      primaryError ??= error;
+    }
+  }
+  if (primaryError !== undefined) throw primaryError;
 }
 
 /** 对已落盘的恢复/快照 SQLite 单文件执行只读完整性与角色结构验证。 */
@@ -354,6 +709,18 @@ export function verifySnapshotSqliteFile(
   } finally {
     db.close();
   }
+  if (component.role === 'session-db'
+    && component.schemaVersion === SESSION_STORAGE_PREDECESSOR_VERSION) {
+    try {
+      probeSessionPredecessorOwnerMigration(absolute);
+    } catch (cause) {
+      throw new SnapshotCoordinatorError(
+        'snapshot-invalid',
+        'Session v16 副本无法由当前 owner 完整迁移',
+        { cause },
+      );
+    }
+  }
 }
 
 function sqlString(value: string): string {
@@ -364,6 +731,22 @@ function cleanupOutput(destinationPath: string): void {
   rmSync(destinationPath, { force: true });
   rmSync(destinationPath + '-wal', { force: true });
   rmSync(destinationPath + '-shm', { force: true });
+}
+
+/** Snapshot copies are recovery artifacts, never reusable authorization windows. Source stays read-only. */
+function sealStylePilotBudgetSnapshot(component: SnapshotComponentPlan, destinationPath: string): void {
+    if (component.role !== 'control-db') return;
+    const copy = new DatabaseSync(destinationPath);
+    try {
+        if (pragmaInteger(copy, 'application_id') !== STYLE_COMPILE_JOB_APPLICATION_ID) return;
+        if (pragmaInteger(copy, 'user_version') !== STYLE_COMPILE_JOB_SCHEMA_VERSION) return;
+        copy.exec('UPDATE style_compile_pilot_budget SET halted=1');
+        if (copy.prepare('SELECT 1 FROM style_compile_pilot_budget WHERE halted IS NOT 1 LIMIT 1').get()) {
+            throw new Error('style compile pilot snapshot seal failed');
+        }
+    } finally {
+        copy.close();
+    }
 }
 
 export class SqliteOnlineSnapshotAdapter implements SnapshotSqliteCaptureAdapter {
@@ -402,6 +785,8 @@ export class SqliteOnlineSnapshotAdapter implements SnapshotSqliteCaptureAdapter
       }
       const outputStats = lstatSync(destinationPath);
       if (!outputStats.isFile() || outputStats.isSymbolicLink()) throw new Error('SQLite 在线副本不是普通文件');
+      verifySnapshotSqliteFile(input.component, destinationPath);
+      sealStylePilotBudgetSnapshot(input.component, destinationPath);
       verifySnapshotSqliteFile(input.component, destinationPath);
     } catch (cause) {
       try { source?.close(); } catch { /* 保留原始错误。 */ }

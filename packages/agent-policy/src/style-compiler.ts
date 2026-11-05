@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto';
 
 export const STYLE_COMPILER_POLICY_VERSION = 'p14-q7-style-compiler-v1' as const;
+export const LEARNED_STYLE_OUTPUT_VALIDATOR_VERSION =
+  'learned-style-output-validator-v1' as const;
 export const STYLE_DRAFT_TOOL_NAME = 'submit_learned_style_draft' as const;
 export const STYLE_SKILL_REQUIRED_SECTIONS = Object.freeze([
   '适用条件', '完整步骤', '禁止项', '例子', '校验规则',
@@ -25,7 +27,8 @@ export interface LearnedStyleDraft {
   readonly bodyDigest: string;
 }
 
-const SAFE_NAME = /^[\w一-鿿-]{1,80}$/u;
+export const STYLE_DRAFT_NAME_PATTERN = String.raw`^[\w一-鿿-]{1,80}$`;
+const SAFE_NAME = new RegExp(STYLE_DRAFT_NAME_PATTERN, 'u');
 export const STYLE_MODEL_OUTPUT_MAX_CHARS = 32_768;
 
 export type LearnedStyleDraftDiagnosticCode =
@@ -68,6 +71,8 @@ export type StyleProposalRequestOutcome =
 export type StyleProposalBusinessOutcomeCode =
   | 'style-proposal-created'
   | 'style-provider-call-failed'
+  | 'style-job-enqueue-failed'
+  | 'style-job-queued'
   | Extract<StyleProposalRequestOutcome, { status: 'rejected' }>['reasonCode']
   | Extract<StyleProposalRequestOutcome, { status: 'skipped' }>['reasonCode'];
 

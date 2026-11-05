@@ -1,7 +1,65 @@
 import { createHash } from 'node:crypto';
+import { types } from 'node:util';
 
 export const AGENT_BUDGET_PROFILE_VERSION = 'p14-agent-budget-v2' as const;
+export const AGENT_GATEWAY_BUDGET_PROFILE_V3 = 'p14-agent-gateway-budget-v3' as const;
 
+/** Per-call context bounds and cumulative lease ceilings are deliberately independent. */
+export interface AgentGatewayBudgetProfileV3 {
+  readonly version: typeof AGENT_GATEWAY_BUDGET_PROFILE_V3;
+  readonly lane: AgentBudgetLane;
+  readonly maxModelCalls: number;
+  readonly maxToolCalls: number;
+  readonly agentInputBudgetTokens: number;
+  readonly agentOutputBudgetTokens: number;
+  readonly maxCostMicrousd: number;
+  readonly maxWallMs: number;
+  readonly providerContextWindowTokens: number;
+  readonly maxRequestInputTokens: number;
+  readonly maxRequestOutputTokens: number;
+  readonly requestSafetyMarginTokens: number;
+}
+
+const GATEWAY_V3_KEYS = ['version', 'lane', 'maxModelCalls', 'maxToolCalls', 'agentInputBudgetTokens',
+  'agentOutputBudgetTokens', 'maxCostMicrousd', 'maxWallMs', 'providerContextWindowTokens',
+  'maxRequestInputTokens', 'maxRequestOutputTokens', 'requestSafetyMarginTokens'] as const;
+
+/** Host-issued V3 never changes the historical V2 parser or digest. */
+export function normalizeAgentGatewayBudgetProfileV3(input: AgentGatewayBudgetProfileV3): AgentGatewayBudgetProfileV3 {
+  if (!input || typeof input !== 'object' || types.isProxy(input) || Array.isArray(input)
+    || ![Object.prototype, null].includes(Object.getPrototypeOf(input))) throw new TypeError('gateway-budget-v3-invalid');
+  const descriptors = Object.getOwnPropertyDescriptors(input);
+  if (Reflect.ownKeys(descriptors).length !== GATEWAY_V3_KEYS.length
+    || GATEWAY_V3_KEYS.some(key => !descriptors[key]?.enumerable || !Object.hasOwn(descriptors[key]!, 'value'))) {
+    throw new TypeError('gateway-budget-v3-invalid');
+  }
+  if (input.version !== AGENT_GATEWAY_BUDGET_PROFILE_V3) throw new TypeError('gateway-budget-v3-version-invalid');
+  const profile: AgentGatewayBudgetProfileV3 = {
+    version: AGENT_GATEWAY_BUDGET_PROFILE_V3,
+    lane: enumValue(input.lane, AGENT_BUDGET_LANES, 'lane'),
+    maxModelCalls: safeInteger(input.maxModelCalls, 'maxModelCalls', 1),
+    maxToolCalls: safeInteger(input.maxToolCalls, 'maxToolCalls'),
+    agentInputBudgetTokens: safeInteger(input.agentInputBudgetTokens, 'agentInputBudgetTokens', 1),
+    agentOutputBudgetTokens: safeInteger(input.agentOutputBudgetTokens, 'agentOutputBudgetTokens', 1),
+    maxCostMicrousd: safeInteger(input.maxCostMicrousd, 'maxCostMicrousd'),
+    maxWallMs: safeInteger(input.maxWallMs, 'maxWallMs', 1),
+    providerContextWindowTokens: safeInteger(input.providerContextWindowTokens, 'providerContextWindowTokens', 1),
+    maxRequestInputTokens: safeInteger(input.maxRequestInputTokens, 'maxRequestInputTokens', 1),
+    maxRequestOutputTokens: safeInteger(input.maxRequestOutputTokens, 'maxRequestOutputTokens', 1),
+    requestSafetyMarginTokens: safeInteger(input.requestSafetyMarginTokens, 'requestSafetyMarginTokens'),
+  };
+  if (profile.maxRequestInputTokens > profile.agentInputBudgetTokens
+    || profile.maxRequestOutputTokens > profile.agentOutputBudgetTokens
+    || safeAdd(profile.maxRequestInputTokens, profile.requestSafetyMarginTokens, 'gateway input') >= profile.providerContextWindowTokens
+    || safeAdd(profile.maxRequestOutputTokens, profile.requestSafetyMarginTokens, 'gateway output') >= profile.providerContextWindowTokens) {
+    throw new TypeError('gateway-budget-v3-window-invalid');
+  }
+  return Object.freeze(profile);
+}
+
+export function agentGatewayBudgetProfileDigestV3(input: AgentGatewayBudgetProfileV3): string {
+  return `sha256:${createHash('sha256').update(JSON.stringify(normalizeAgentGatewayBudgetProfileV3(input)), 'utf8').digest('hex')}`;
+}
 export const AGENT_AUTONOMY_PROFILES = Object.freeze([
   'legacy',
   'balanced',
@@ -15,6 +73,7 @@ export const AGENT_BUDGET_LANES = Object.freeze([
   'arc',
   'npc',
   'critic',
+  'worldbook',
 ] as const);
 
 export type AgentAutonomyProfile = (typeof AGENT_AUTONOMY_PROFILES)[number];

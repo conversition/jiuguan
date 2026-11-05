@@ -5,8 +5,14 @@ import {
 } from './skill-admission.ts';
 import {
   normalizeAgentBudgetProfile,
+  normalizeAgentGatewayBudgetProfileV3,
+  type AgentGatewayBudgetProfileV3,
   type AgentBudgetProfileInput,
 } from './budget-profile.ts';
+
+// Compatibility facade for the server's established agent-policy boundary.
+// New consumers should use the package's public nsfw-agent-generator export.
+export { parseNsfwAgentState } from './nsfw-agent-generator.ts';
 
 export const ADMISSION_TICKET_VERSION = 'p14-admission-ticket-v2' as const;
 
@@ -17,12 +23,18 @@ export const AGENT_TASK_KINDS = Object.freeze([
   'branch_index',
   'rolling_summary',
   'npc_state',
+  'worldbook_repair',
   'preference_extract',
   'style_compile',
+  'skill_compile',
+  'skill_evaluate',
+  'skill_sample',
+  'skill_quality',
   'arc_maintenance',
   'npc_maintenance',
   'critic_revision',
   'aql_replan',
+  'rp_child_analysis',
 ] as const);
 
 export type AgentTaskKind = (typeof AGENT_TASK_KINDS)[number];
@@ -38,7 +50,8 @@ export type ExpectedBenefit =
   | 'arc-coherence'
   | 'npc-consistency'
   | 'draft-correction'
-  | 'context-recovery';
+  | 'context-recovery'
+  | 'worldbook-consistency';
 export type AdmissionFallback =
   | 'continue-deterministic'
   | 'skip-optional-agent'
@@ -73,6 +86,7 @@ export interface AdmissionRequest {
   readonly limits: AdmissionLimits;
   readonly deadlineMs: number;
   readonly allowedTools: readonly string[];
+  /** Legacy matcher snapshots already present in this run; not authority for Profile SkillHub. */
   readonly fullSkillSnapshots: readonly SkillAdmissionSnapshot[];
   readonly cooldownKey: string;
   readonly idempotencyKey: string;
@@ -85,6 +99,8 @@ export interface AdmissionTicket extends AdmissionRequest {
   readonly requestDigest: string;
   /** Server-generated digest of durable Provider-call authority; never a user/content identity. */
   readonly quotaReservationDigest?: string;
+  /** Authorization window that owns the durable reservation. */
+  readonly quotaWindowSequence?: number;
   readonly issuedAtMs: number;
   readonly expiresAtMs: number;
 }
@@ -94,6 +110,7 @@ export interface AdmissionLease {
   readonly ticketId: string;
   readonly requestDigest: string;
   readonly quotaReservationDigest?: string;
+  readonly quotaWindowSequence?: number;
   readonly runId: string;
   readonly parentRunId: string;
   readonly sessionId: string;
@@ -109,6 +126,7 @@ export interface AdmissionLease {
   readonly evidenceDigests: readonly string[];
   readonly limits: AdmissionLimits;
   readonly allowedTools: readonly string[];
+  /** Legacy matcher snapshots only. New Profile consumption requires a server-only Lease purpose. */
   readonly fullSkillSnapshots: readonly SkillAdmissionSnapshot[];
   readonly consumedAtMs: number;
   readonly expiresAtMs: number;
@@ -128,9 +146,14 @@ const LIMIT_KEYS = new Set<keyof AdmissionLimits>([
 ]);
 const LANE_TASKS: Readonly<Record<AgentLane, ReadonlySet<AgentTaskKind>>> = Object.freeze({
   interactive: new Set<AgentTaskKind>(['interactive_prelude', 'context_compiler', 'aql_replan']),
-  maintenance: new Set<AgentTaskKind>(['memory_consolidation', 'branch_index', 'rolling_summary', 'npc_state', 'arc_maintenance', 'npc_maintenance']),
-  learning: new Set<AgentTaskKind>(['preference_extract', 'style_compile']),
-  critic: new Set<AgentTaskKind>(['critic_revision']),
+  maintenance: new Set<AgentTaskKind>([
+    'memory_consolidation', 'branch_index', 'rolling_summary', 'npc_state',
+    'worldbook_repair', 'arc_maintenance', 'npc_maintenance',
+  ]),
+  learning: new Set<AgentTaskKind>([
+    'preference_extract', 'style_compile', 'skill_compile', 'skill_evaluate', 'skill_sample', 'skill_quality',
+  ]),
+  critic: new Set<AgentTaskKind>(['critic_revision', 'rp_child_analysis']),
 });
 
 function assertPlainRecord(value: unknown, label: string): asserts value is Record<string, unknown> {
@@ -201,6 +224,13 @@ export function admissionLimitsFromBudgetProfile(input: AgentBudgetProfileInput)
   });
 }
 
+export function admissionLimitsFromGatewayBudgetProfileV3(input: AgentGatewayBudgetProfileV3): AdmissionLimits {
+  const profile = normalizeAgentGatewayBudgetProfileV3(input);
+  return normalizeAdmissionLimits({ maxModelCalls: profile.maxModelCalls, maxToolCalls: profile.maxToolCalls,
+    maxInputTokens: profile.agentInputBudgetTokens, maxOutputTokens: profile.agentOutputBudgetTokens,
+    maxCostMicrousd: profile.maxCostMicrousd, maxWallMs: profile.maxWallMs });
+}
+
 function canonicalToolContract(value: unknown, depth = 0): string {
   if (depth > 32) throw new TypeError('tool contract nesting is too deep');
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value);
@@ -252,6 +282,12 @@ export function normalizeAdmissionRequest(input: AdmissionRequest): AdmissionReq
   const fullSkillSnapshots = Object.freeze(input.fullSkillSnapshots.map(normalizeSkillAdmissionSnapshot));
   const identities = fullSkillSnapshots.map((snapshot) => `${snapshot.sourceHash}\0${snapshot.version}\0${snapshot.bodyHash}`);
   if (new Set(identities).size !== identities.length) throw new TypeError('fullSkillSnapshots must not contain duplicates');
+  // This is a distinct, opt-in read-only identity, not a Maintenance/Skill authority alias.
+  if (taskKind === 'rp_child_analysis' && (input.mode !== 'nsf' || input.limits.maxModelCalls !== 1
+    || input.limits.maxToolCalls !== 0 || allowedTools.length !== 0 || fullSkillSnapshots.length !== 0
+    || toolSetDigest !== agentToolSetDigest([]))) {
+    throw new TypeError('rp-child-analysis requires one NSF model call without Provider tools or Skills');
+  }
   return Object.freeze({
     runId: token(input.runId, 'runId'),
     parentRunId: token(input.parentRunId, 'parentRunId'),
@@ -270,7 +306,7 @@ export function normalizeAdmissionRequest(input: AdmissionRequest): AdmissionReq
     expectedBenefit: enumValue(input.expectedBenefit, [
       'fact-verification', 'state-correctness', 'memory-quality', 'branch-relevance',
       'preference-learning', 'style-learning', 'arc-coherence', 'npc-consistency', 'draft-correction',
-      'context-recovery',
+      'context-recovery', 'worldbook-consistency',
     ] as const, 'expectedBenefit'),
     limits: normalizeAdmissionLimits(input.limits),
     deadlineMs: safeInteger(input.deadlineMs, 'deadlineMs', 1),

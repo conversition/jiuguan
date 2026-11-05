@@ -1,6 +1,7 @@
 import type { PrecommitCriticDecision } from '../../agent-policy/src/precommit-critic.ts';
-import { parseStoryIndexSeed, type GameTurn } from '../../prompt/src/turn.ts';
+import type { GameTurn } from '../../prompt/public/turn.ts';
 import type { ChatRequest } from '../../proxy/src/client.ts';
+import { createCriticInput, parseCriticInput, type CriticInputV1 } from './critic-input.ts';
 
 export const PRECOMMIT_CRITIC_MODEL_CONTRACT_VERSION = 'p14-precommit-critic-model-v2' as const;
 
@@ -19,29 +20,12 @@ export function buildPrecommitCriticModelRequest(input: {
   readonly fullSkills: readonly PrecommitCriticSkill[];
   readonly maxOutputTokens: number;
 }): ChatRequest {
-  if (input.decision.severity !== 'repairable'
-    || input.decision.hardDenyCodes.length !== 0
-    || input.decision.repairableCodes.length === 0) {
-    throw new Error('critic-model-request-not-repairable');
-  }
-  if (!Number.isSafeInteger(input.maxOutputTokens)
-    || input.maxOutputTokens < 256 || input.maxOutputTokens > 100_000) {
-    throw new Error('critic-model-output-budget-invalid');
-  }
-  if (!Array.isArray(input.fullSkills) || input.fullSkills.length > 64
-    || input.fullSkills.some((skill) => (
-      !skill || typeof skill !== 'object' || typeof skill.body !== 'string'
-      || skill.body.length > 1_000_000
-    ))) {
-    throw new Error('critic-model-skills-invalid');
-  }
-  const storyIndexSeed = parseStoryIndexSeed(input.draft.story_index_seed);
-  const sanitizedDraft = {
-    plan: input.draft.plan,
-    memory_delta: input.draft.memory_delta,
-    ...(storyIndexSeed ? { story_index_seed: storyIndexSeed } : {}),
-    prose: input.draft.prose,
-  };
+  return buildPrecommitCriticRequestFromInput(createCriticInput(input));
+}
+
+/** The server captures once; provenance and Provider bytes share this frozen input. */
+export function buildPrecommitCriticRequestFromInput(value: CriticInputV1): ChatRequest {
+  const input = parseCriticInput(value);
   return Object.freeze({
     messages: [
       {
@@ -53,18 +37,19 @@ export function buildPrecommitCriticModelRequest(input: {
           '若 draft 含合法 story_index_seed，必须保留并使其动作与修订后的最终正文一致；缺失或坏值可省略。',
           'story_index_seed 只能包含玩家此刻可执行的动作，禁止行动结果、内部 plan、未来事实或 NPC 私有知识。',
           'memory_delta.delta_summary 只能描述最终正文已经向玩家揭示的变化。',
+          '除按 issueCodes 修复外，只做以下最小清洗：',
+          '- 删除未替换的模板占位符（如 {{...}}、<%...%>），删除不属于正文的内部结构标记（【建议分支】【当前局势】【未解决伏笔】）。',
+          '- 保留 HTML 时必须开闭配对；若 HTML 状态栏/面板只有一两个标签，前端不会按 HTML 渲染、玩家会看到原始标签 —— 要么补足为可识别结构（不少于三个富标签），要么降级为纯文本并去掉标签。',
+          '- 清洗只允许删噪音、修标记、补配对与让状态栏内容自洽；禁止增删情节、改写人物言行或已发生的既定事实。',
           '不得调用工具，不得输出 Markdown 围栏或思维链。',
         ].join('\n'),
       },
       {
         role: 'user' as const,
         content: JSON.stringify({
-          issueCodes: input.decision.repairableCodes,
-          draft: sanitizedDraft,
-          fullSkills: input.fullSkills.map((skill) => ({
-            snapshot: skill.snapshot,
-            body: skill.body,
-          })),
+          issueCodes: input.issueCodes,
+          draft: input.draft,
+          fullSkills: input.fullSkills,
         }),
       },
     ],

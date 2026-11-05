@@ -1,7 +1,12 @@
 import type { HarnessTool, ToolContext, ToolOutcome } from '../../packages/harness/src/types.ts';
 import {
+  arcMaintenanceProposalRejectionCode,
+  maintenanceProposalRejectionCode,
+  npcMaintenanceProposalRejectionCode,
+  normalizeNpcMaintenanceNoopTerminal,
   validateMaintenanceProposal,
   type MaintenanceProposal,
+  type NpcMaintenanceNoopTerminal,
   type MaintenanceStrictProposalContext,
   type MaintenanceTaskKind,
 } from './maintenance-types.ts';
@@ -18,7 +23,9 @@ interface ToolDefinition<T> {
   readonly capability: MaintenanceCapability;
   readonly effect: MaintenanceToolEffect;
   readonly taskKinds: readonly MaintenanceTaskKind[];
-  validate(value: unknown): { ok: true; value: T } | { ok: false; error: string };
+  validate(value: unknown):
+    | { ok: true; value: T }
+    | { ok: false; error: string; rejectionCode?: string };
   execute(value: T, context: ToolContext, taskKind: MaintenanceTaskKind): Promise<ToolOutcome>;
 }
 
@@ -26,6 +33,8 @@ export interface MaintenanceToolRegistryOptions {
   readonly capabilities: ReadonlySet<MaintenanceCapability>;
   readonly maxResultChars: number;
   readonly timeoutMs: number;
+  /** Task-specific backend read-attempt cap; exceeding it never performs another backend read. */
+  readonly maxEvidenceReads: number;
   /**
    * 会话绑定的只读混合检索端口。生产环境由 ChatSession 注入，PG/pgvector
    * 可用时参与召回；未注入时保留确定性快照搜索，供测试与降级路径使用。
@@ -69,7 +78,7 @@ function searchRows(value: unknown, query: string, maxItems = 50): unknown[] {
 }
 
 const ALL_TASKS = [
-  'memory_consolidation', 'branch_index', 'rolling_summary', 'npc_state',
+  'memory_consolidation', 'branch_index', 'rolling_summary', 'npc_state', 'worldbook_repair',
 ] as const;
 
 function definitions(
@@ -139,16 +148,57 @@ function definitions(
         try {
           const proposal = validateMaintenanceProposal(taskKind, value, proposalContext);
           return { ok: true, value: proposal };
-        } catch {
-          return { ok: false, error: 'proposal-schema-invalid' };
+        } catch (error) {
+          const rejectionCode = taskKind === 'npc_state'
+            ? npcMaintenanceProposalRejectionCode(error)
+            : taskKind === 'branch_index'
+              ? arcMaintenanceProposalRejectionCode(error)
+              : maintenanceProposalRejectionCode(error);
+          return {
+            ok: false,
+            error: 'proposal-schema-invalid',
+            ...(rejectionCode ? { rejectionCode } : {}),
+          };
         }
       },
       execute: async (value, context) => {
-        if (context.state.proposal !== undefined) return { ok: false, error: 'proposal-already-exists' };
+        if (context.state.proposal !== undefined || context.state.maintenanceNoop !== undefined) {
+          return { ok: false, error: 'maintenance-terminal-already-exists' };
+        }
         context.state.proposal = structuredClone(value as MaintenanceProposal);
         return { ok: true, result: 'proposal-accepted' };
       },
     })),
+    {
+      name: 'complete_npc_state_noop',
+      capability: 'maintenance.propose',
+      effect: 'proposal',
+      taskKinds: ['npc_state'],
+      validate(value) {
+        if (!proposalContext || !('allowedCharacterIds' in proposalContext)) {
+          return { ok: false, error: 'npc-noop-context-unavailable', rejectionCode: 'proposal-context-invalid' };
+        }
+        try {
+          return {
+            ok: true,
+            value: normalizeNpcMaintenanceNoopTerminal(value, proposalContext),
+          };
+        } catch (error) {
+          return {
+            ok: false,
+            error: 'npc-noop-schema-invalid',
+            rejectionCode: npcMaintenanceProposalRejectionCode(error) ?? 'proposal-shape-invalid',
+          };
+        }
+      },
+      execute: async (value, context) => {
+        if (context.state.proposal !== undefined || context.state.maintenanceNoop !== undefined) {
+          return { ok: false, error: 'maintenance-terminal-already-exists' };
+        }
+        context.state.maintenanceNoop = structuredClone(value as NpcMaintenanceNoopTerminal);
+        return { ok: true, result: 'npc-noop-accepted' };
+      },
+    },
   ];
 }
 
@@ -170,6 +220,8 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, signal: AbortSig
 
 export class MaintenanceToolRegistry {
   readonly #definitions: ToolDefinition<unknown>[];
+  #evidenceReadsUsed = 0;
+  #evidenceReadLimitExceeded = false;
 
   constructor(private readonly options: MaintenanceToolRegistryOptions) {
     if (!Number.isInteger(options.maxResultChars) || options.maxResultChars < 1 || options.maxResultChars > 65_536) {
@@ -178,7 +230,21 @@ export class MaintenanceToolRegistry {
     if (!Number.isInteger(options.timeoutMs) || options.timeoutMs < 1 || options.timeoutMs > 30_000) {
       throw new Error('timeoutMs invalid');
     }
+    if (!Number.isInteger(options.maxEvidenceReads)
+      || options.maxEvidenceReads < 0 || options.maxEvidenceReads > 8) {
+      throw new Error('maxEvidenceReads invalid');
+    }
     this.#definitions = definitions(options.readMemory, options.proposalContext);
+  }
+
+  diagnostics(): Readonly<{
+    evidenceReadsUsed: number;
+    evidenceReadLimitExceeded: boolean;
+  }> {
+    return Object.freeze({
+      evidenceReadsUsed: this.#evidenceReadsUsed,
+      evidenceReadLimitExceeded: this.#evidenceReadLimitExceeded,
+    });
   }
 
   toolsFor(taskKind: MaintenanceTaskKind): ReadonlyMap<string, HarnessTool<never>> {
@@ -190,6 +256,21 @@ export class MaintenanceToolRegistry {
         description: `${definition.effect}:${definition.capability}`,
         validate: definition.validate,
         execute: async (value, context) => {
+          if (definition.effect === 'read') {
+            if (this.#evidenceReadsUsed >= this.options.maxEvidenceReads) {
+              this.#evidenceReadLimitExceeded = true;
+              // A fixed internal redirect gives the model one bounded chance to
+              // submit its proposal without performing another DB/vector read.
+              return {
+                ok: true,
+                result: JSON.stringify({
+                  status: 'evidence-read-limit-reached',
+                  next: `propose_${taskKind}`,
+                }),
+              };
+            }
+            this.#evidenceReadsUsed += 1;
+          }
           const outcome = await withTimeout(
             definition.execute(value, context, taskKind),
             this.options.timeoutMs,

@@ -161,6 +161,11 @@ export interface PanelEvent {
   target?: ViewTarget;
   sessionId?: string;
   sessionRunId?: string;
+  /**
+   * 会话记忆作用域的提交后头版本。只有真实 commit 事件携带；
+   * 面板用它拒绝旧/重复通知，不能用正文流结束事件伪造。
+   */
+  headVersion?: number;
 }
 
 /**

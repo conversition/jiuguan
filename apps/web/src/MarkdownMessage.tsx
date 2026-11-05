@@ -4,13 +4,19 @@ import remarkGfm from 'remark-gfm';
 import remarkBreaks from 'remark-breaks';
 import rehypeHighlight from 'rehype-highlight';
 import 'highlight.js/styles/github-dark.css';
+import { displayMessageNewlines } from './messageText.ts';
+
+interface MessageTextProps {
+  text: string;
+  displayEscapedNewlines?: boolean;
+}
 
 /** 正文 Markdown 渲染
  *  - remarkGfm：GFM（表格/删除线/任务列表）
  *  - remarkBreaks：单换行 → <br>（酒馆正文习惯，避免被折叠成空格）
  *  - rehypeHighlight：代码块语法高亮（github-dark）
  */
-export function MarkdownMessage({ text }: { text: string }) {
+export function MarkdownMessage({ text, displayEscapedNewlines = false }: MessageTextProps) {
   if (!text || !text.trim()) return null;
   return (
     <div className="md-body">
@@ -21,7 +27,7 @@ export function MarkdownMessage({ text }: { text: string }) {
           a: ({ children, ...props }) => <a {...props} target="_blank" rel="noopener noreferrer">{children}</a>,
         }}
       >
-        {text}
+        {displayEscapedNewlines ? displayMessageNewlines(text) : text}
       </ReactMarkdown>
     </div>
   );
@@ -33,10 +39,10 @@ export function MarkdownMessage({ text }: { text: string }) {
  *  回合结束（done / 历史回填）后由调用方切回完整 MarkdownMessage / HtmlMessage。
  *  打字机光标由外层 .bubble.streaming::after 提供（见 style.css）。
  */
-export function StreamText({ text }: { text: string }) {
+export function StreamText({ text, displayEscapedNewlines = false }: MessageTextProps) {
   return (
     <div className="stream-text">
-      <span>{text}</span>
+      <span>{displayEscapedNewlines ? displayMessageNewlines(text) : text}</span>
     </div>
   );
 }

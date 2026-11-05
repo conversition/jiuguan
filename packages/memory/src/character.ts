@@ -130,6 +130,43 @@ export interface CharacterMaintenanceRollbackResult {
   }[];
 }
 
+/** Content-free control-plane anchor for one approved Maintenance alias write. */
+export interface CharacterMaintenanceAliasRollbackAnchor {
+  readonly characterId: string;
+  readonly operationId: string;
+  readonly aliasDigest: string;
+  readonly expectedEntityVersion: number;
+  readonly rollbackEntityVersion: number;
+  readonly createdAlias: boolean;
+  readonly provenanceDigest: string;
+}
+
+export interface CharacterMaintenanceAliasApplyResult {
+  readonly characterId: string;
+  readonly operationId: string;
+  readonly added: boolean;
+  readonly deduped: boolean;
+  readonly anchor: CharacterMaintenanceAliasRollbackAnchor;
+}
+
+export interface CharacterMaintenanceAliasInput {
+  readonly sessionKey: string;
+  readonly characterId: string;
+  readonly operationId: string;
+  readonly alias: string;
+  readonly mentionKey: string;
+  readonly expectedEntityVersion: number;
+  readonly rollbackEntityVersion: number;
+  readonly sourceRefs: readonly SourceRef[];
+  readonly provenanceDigest: string;
+}
+
+export interface CharacterMaintenanceAliasRollbackResult {
+  readonly deduped: boolean;
+  readonly removedAliases: number;
+  readonly operationIds: readonly string[];
+}
+
 // ────────────────────────── 候选（子 Agent 只产候选） ──────────────────────────
 
 export interface CharacterChangeCandidate {
@@ -226,7 +263,7 @@ export interface StageMentionInput {
 }
 
 export interface StageMentionResult {
-  /** 归一后的累计键（`npc_entity_alpha` → `entity_alpha`）；调用方记账/打日志应使用它 */
+  /** 归一后的累计键（`npc_sample_name` → `sample_name`）；调用方记账/打日志应使用它 */
   key: string;
   /** 本轮是否计入（同一轮重复写同一键 → false，避免一轮写 5 条就触发阈值） */
   counted: boolean;
@@ -296,6 +333,59 @@ export const SYMMETRIC_RELATION_TYPES = new Set(['companion', 'sibling', 'spouse
 const AMBIGUOUS_MENTION_RE = /^(他|她|它|祂|你|您|我|俺|咱|老师|先生|小姐|大人|阁下|哥哥|姐姐|妹妹|弟弟|老大|老板|医生|教授|会长|社长|同学|对方|那个人|这个人)$/;
 /** 字段名白名单形态（防原型污染与超长字段） */
 const FIELD_RE = /^[\w.\u4e00-\u9fff-]{1,64}$/;
+
+/**
+ * 人物状态的**标准字段**。
+ *
+ * 背景（2026-10-07 实测）：模型每轮会给同一概念换名字写 —— 主角 38 个字段里
+ * state / status / 状态 / 当前状态 / 身体状态 / 肉体状态 / 心境状态 / 认知状态 … 并存，
+ * 于是每个字段只有 1–2 条记录，人物事实永远聚不成「稳定的当前事实」，
+ * `factBlock` 也只能零散地取到其中几条。
+ */
+export const CANONICAL_CHARACTER_FIELDS = Object.freeze([
+  'status', 'location', 'action', 'condition', 'mental_state', 'items', 'goal', 'appearance',
+] as const);
+
+/**
+ * 同义词 → 标准字段。**原则：只归并白名单内的同义写法，表外一律原样保留** ——
+ * 尤其角色卡专属变量（`侵蚀解析度` / `魔力回路` / `伪装身份` / `下体状态` …）
+ * 承载卡语义，绝不能被改写或合并。
+ */
+const FIELD_ALIASES: Readonly<Record<string, string>> = Object.freeze({
+  // 状态 / 处境
+  state: 'status', current_state: 'status', system_status: 'status', status: 'status',
+  状态: 'status', 当前状态: 'status', 系统状态: 'status', 处境: 'status',
+  // 位置
+  location: 'location', 位置: 'location', 当前位置: 'location',
+  // 当前行动
+  action: 'action', 当前行动: 'action', action_goal: 'action', 行动目标: 'action', 当前行为: 'action',
+  // 身体 / 健康
+  condition: 'condition', physical_state: 'condition', 身体状态: 'condition', 肉体状态: 'condition',
+  健康状况: 'condition',
+  // 心理 / 认知
+  mental_state: 'mental_state', mental: 'mental_state', 心理状态: 'mental_state',
+  心境状态: 'mental_state', 认知状态: 'mental_state', 心境: 'mental_state', 精神状态: 'mental_state',
+  // 持有物
+  items: 'items', item: 'items', 持有物: 'items', 随身物品: 'items', 持有物品: 'items',
+  // 目标 / 意图
+  goal: 'goal', 意图: 'goal', 目标: 'goal', 目的: 'goal',
+  // 外观
+  appearance: 'appearance', 外观: 'appearance', 外貌: 'appearance', 穿着: 'appearance', 服装: 'appearance',
+});
+
+/**
+ * 把 `scope.field` 或裸字段名归并到标准字段；表外原样返回，前缀（`fact.`/`profile.`）保持不变。
+ * 命中大小写不敏感（`State` / `STATE` 同样归并）。
+ */
+export function normalizeCharacterField(field: string): string {
+  const dot = field.indexOf('.');
+  const prefix = dot < 0 ? '' : field.slice(0, dot + 1);
+  const name = (dot < 0 ? field : field.slice(dot + 1)).trim();
+  if (!name) return field;
+  const mapped = FIELD_ALIASES[name] ?? FIELD_ALIASES[name.toLowerCase()];
+  return mapped ? `${prefix}${mapped}` : field;
+}
+
 const MAX_CHANGES = 64;
 const MAX_VALUE_BYTES = 4096;
 
@@ -335,8 +425,8 @@ const PLACE_SUFFIXES = ['学园', '学院', '学校', '大学', '会社', '公�
 /**
  * 内部标识形态（**绝不能**当人物名）：
  *  - `char_003` 这类本模块自己分配的 ID
- *  - 卡引擎的复合实体键（`char_001|角色甲`、`char_001:角色甲`）
- *  - 纯 ASCII/下划线/连字符键（`entity_alpha`、`example-name`）
+ *  - 卡引擎的复合实体键（`char_001|示例角色B`、`char_001:示例角色B`）
+ *  - 纯 ASCII 拼音/下划线/连字符键（`sample_alias`、`nightingale`）
  *  - 纯数字 / UUID
  *
  * 旧链路把 `state_changes.entity_id` 直接当人物名用，于是注册表里出现了一批
@@ -357,7 +447,56 @@ export function isPlausibleCharacterName(raw: string): boolean {
 }
 
 /**
- * 从卡引擎实体键里取**可读名**：`char_001|角色甲` → 角色甲，`char_001:角色甲` → 角色甲。
+ * NPC 稳定身份名的额外安全门。
+ *
+ * `isPlausibleCharacterName` 只排除内部 ID，它仍会把「旁白」、「玩家」或「路人们」
+ * 视为人类可读字符串。这些词可以出现在剧情中，但不能因为连续几轮被模型上报就
+ * 获得 CharacterStore 稳定 ID。高置信 `newEntity=true` 也复用同一道门，避免
+ * 主模型把玩家/旁白/群体泛称直接建档。
+ */
+const GENERIC_NPC_IDENTITY_RE = /^(?:主角|玩家|用户|旁白|叙述者|观众|众人|大家|人群|群众|路人|陌生人|某人|神秘人|守卫|士兵|村民|学生|老师|同学|店员|服务员|医生|护士|工作人员|他们|她们|它们|她|他|它|npc|player|user|narrator)$/iu;
+const GENERIC_NPC_GROUP_RE = /(?:们|人群|群体|人员|众|一行人|一群人)$/u;
+
+function isForbiddenNpcIdentityTerm(raw: string): boolean {
+  const name = String(raw ?? '').normalize('NFKC').replace(/\s+/gu, ' ').trim();
+  return !name || GENERIC_NPC_IDENTITY_RE.test(name) || GENERIC_NPC_GROUP_RE.test(name)
+    || FIELD_SUFFIXES.some((suffix) => name.endsWith(suffix))
+    || PLACE_SUFFIXES.some((suffix) => name.endsWith(suffix));
+}
+
+export function isPlausibleNpcIdentityName(raw: string): boolean {
+  const name = String(raw ?? '').normalize('NFKC').replace(/\s+/gu, ' ').trim();
+  return isPlausibleCharacterName(name) && !isForbiddenNpcIdentityTerm(name);
+}
+
+const NON_NPC_ENTITY_TYPE_RE = /^(?:protagonist|player|user|main|narrator|location|place|scene|setting|organization|org|item|object|主角|玩家|用户|旁白|地点|场景|机构|组织|物品)$/iu;
+
+/**
+ * One shared, value-free identity gate for the temporary NPC pool and the
+ * Maintenance snapshot. Internal entity keys may wait in the pool for a later
+ * readable name, but an explicit player/narrator/generic/place hint may not.
+ */
+export function isEligibleNpcMentionCandidate(input: {
+  readonly mentionKey: string;
+  readonly entityType?: string;
+  readonly nameHints?: readonly (string | undefined)[];
+}): boolean {
+  const key = canonicalMentionKey(String(input.mentionKey ?? '').trim());
+  if (!key || NON_NPC_ENTITY_TYPE_RE.test(String(input.entityType ?? '').normalize('NFKC').trim())) {
+    return false;
+  }
+  if (isForbiddenNpcIdentityTerm(key)) return false;
+  const hints = [
+    ...(input.nameHints ?? []),
+    readableNameFromKey(String(input.mentionKey ?? '')),
+  ].map((value) => String(value ?? '').normalize('NFKC').replace(/\s+/gu, ' ').trim())
+    .filter(Boolean);
+  const readableHints = hints.filter(isPlausibleCharacterName);
+  return readableHints.length === 0 || readableHints.some(isPlausibleNpcIdentityName);
+}
+
+/**
+ * 从卡引擎实体键里取**可读名**：`char_001|示例角色B` → 示例角色B，`char_001:示例角色B` → 示例角色B。
  * 这是零成本的名字来源 —— 复合键本身就把显示名带上了，只是以前没人去拆。
  */
 function readableNameFromKey(key: string): string | undefined {
@@ -373,15 +512,15 @@ function readableNameFromKey(key: string): string | undefined {
  *
  * 为什么必须做：池子按 `mention_key` 唯一，计数按"同一键在几个不同轮次出现"。
  * 若模型对同一实体换键写法，计数就被拆散、永远攒不满阈值 ——
- * 匿名回归样本中，同一个「角色乙」被写成 `npc_entity_alpha`
- * 与 `char_entity_alpha` 两个键，池子里成了两行（1/3 与 0/3），谁都到不了 3。
+ * 实测某会话 round 27：同一个「示例名」被写成 `npc_sample_name`
+ * 与 `char_sample_name` 两个键，池子里成了两行（1/3 与 0/3），谁都到不了 3。
  *
  * 规则（**只剥 `npc_` / `char_` 前缀，且右段不能是纯数字**）：
- *  - `npc_entity_alpha` / `char_entity_alpha` → `entity_alpha`（同一行）
- *  - `npc_角色甲` → `角色甲`（顺带让已注册人物能按名字命中）
+ *  - `npc_sample_name` / `char_sample_name` → `sample_name`（同一行）
+ *  - `npc_示例角色B` → `示例角色B`（顺带让已注册人物能按名字命中）
  *  - `char_001` → **原样不动**。它是本模块自己分配的 characterId，回挂路径依赖它；
  *    剥成 `001` 会同时废掉匹配与"内部标识不得当人名"的判据。
- *  - 复合键（`char_001|角色甲`）不动，它有自己的右段解析。
+ *  - 复合键（`char_001|示例角色B`）不动，它有自己的右段解析。
  */
 export function canonicalMentionKey(raw: string): string {
   const key = String(raw ?? '').trim();
@@ -406,7 +545,7 @@ export function canonicalMentionKey(raw: string): string {
  * 白名单是安全阀，三条缺一不可：
  *  · 行有可读名 —— `char_001` / `npc_xxx` / `char_xxx` 这类内部键永不符合
  *  · 未促升 —— 已建人的人不需要再攒轮次
- *  · **声明名与可读名/别名逐字相等**（**不做子串匹配**）—— 子串匹配会让「桐月」挂在
+ *  · **声明名与可读名/别名逐字相等**（**不做子串匹配**）—— 子串匹配会让「示例」挂在
  *    「示例学园」上，把 R4 那类地点/字段重新推进注册表
  */
 export function shouldCountByDeclaredPresence(
@@ -420,7 +559,7 @@ export function shouldCountByDeclaredPresence(
   return declaredNames.some((d) => names.includes(String(d ?? '').trim()));
 }
 
-/** 拆 `new_events[].characters`：模型混用顿号/逗号/分号/斜杠分隔（如「角色甲、角色乙, 角色丙」） */
+/** 拆 `new_events[].characters`：模型混用顿号/逗号/分号/斜杠分隔（如「示例角色B、示例角色A, 示例角色C」） */
 export function splitDeclaredCharacters(raw: string | undefined): string[] {
   return String(raw ?? '').split(/[、,，;；/|]+/).map((s) => s.trim()).filter(Boolean);
 }
@@ -433,10 +572,11 @@ function pickReadableName(hints: (string | undefined)[], key: string): string | 
   for (const h of hints) {
     const s = String(h ?? '').trim();
     if (!s || AMBIGUOUS_MENTION_RE.test(s)) continue;
-    if (!isPlausibleCharacterName(s)) continue;
+    if (!isPlausibleNpcIdentityName(s)) continue;
     return s;
   }
-  return readableNameFromKey(key);
+  const fromKey = readableNameFromKey(key);
+  return fromKey && isPlausibleNpcIdentityName(fromKey) ? fromKey : undefined;
 }
 
 /** 只有这些事实类别可以晋升为「当前状态」 */
@@ -468,6 +608,28 @@ function stableJson(value: unknown): string {
     .map((key) => JSON.stringify(key) + ':' + stableJson(row[key])).join(',') + '}';
 }
 
+function maintenanceAliasIntent(input: CharacterMaintenanceAliasInput): {
+  alias: string;
+  mentionKey: string;
+  aliasDigest: string;
+  intentFingerprint: string;
+} {
+  const alias = String(input.alias ?? '').normalize('NFKC').trim().replace(/\s+/gu, ' ');
+  const mentionKey = String(input.mentionKey ?? '').normalize('NFKC').trim().replace(/\s+/gu, ' ');
+  const aliasDigest = `sha256:${sha256Hex(alias)}`;
+  const intentFingerprint = `sha256:${sha256Hex(stableJson({
+    sessionKey: input.sessionKey,
+    characterId: input.characterId,
+    operationId: input.operationId,
+    alias,
+    mentionKey,
+    expectedEntityVersion: input.expectedEntityVersion,
+    sourceRefs: input.sourceRefs,
+    provenanceDigest: input.provenanceDigest,
+  }))}`;
+  return { alias, mentionKey, aliasDigest, intentFingerprint };
+}
+
 function maintenanceProjectionDigest(projection: CharacterProjection): string {
   return 'sha256:' + sha256Hex(stableJson({
     characterId: projection.characterId,
@@ -477,6 +639,239 @@ function maintenanceProjectionDigest(projection: CharacterProjection): string {
     history: projection.history,
     unresolved: projection.unresolved,
   }));
+}
+
+// ────────────────────── P16 C2 · 写后回读（canonical readback v1） ──────────────────────
+
+/**
+ * 版本化 canonical readback。
+ *
+ * 用途只有一个：**在正式写入提交之后，重新读取权威人物投影，产出一个可核对的摘要**。
+ * 它不是新的真值来源 —— 输入必须是提交后从存储里重新读出的 `CharacterProjection`，
+ * 不能复用写入前的对象、模型提案、备份锚点或 apply 应答。
+ *
+ * 覆盖范围（与 NPC 提案可修改的字段一一对应）：
+ * - 稳定身份：`characterId`、`identity.name`、`aliases`；
+ * - 版本边界：`entityVersion`（人物对象版本）与 `head.snapshotId`/`head.headRevision`（合法读取边界）；
+ * - 内容：`profile`、`facts`、`history`、`relationships`；
+ * - 知识边界：每条事实/关系的 `status`（confirmed/pending/unresolved/last-known/unknown）、
+ *   `factKind`，以及关系的 `perspective`（客观事实 vs 某人的主观认知）；
+ * - 目标：目标在人物投影里就是一条普通事实字段（`normalizeCharacterField` 的 `goal`），
+ *   随 `profile`/`facts` 一起被覆盖。
+ *
+ * 明确**排除**：备份锚点、非业务时间戳（创建/更新时间）、随机序号、会话元数据。
+ * 数组与空值按确定性规则规范化，多人物按 `characterId` 稳定排序 —— 同一状态必须得到同一摘要。
+ * 本结构只用于计算摘要与只读检查，**禁止持久化**（事实取值可能来自模型输出）。
+ */
+export const CHARACTER_READBACK_VERSION = 'character-readback-v1' as const;
+
+/** 与 locale 无关的字节序比较：摘要不能随运行环境变化。 */
+function readbackCompare(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+/** 完全由内容决定的排序：先规范化成 stableJson 再排序，重复项与并列都不受插入顺序影响。 */
+function readbackSorted<T>(items: readonly T[]): readonly T[] {
+  return Object.freeze([...items].sort((left, right) => readbackCompare(stableJson(left), stableJson(right))));
+}
+
+function readbackSourceRefs(refs: readonly SourceRef[] | undefined): readonly SourceRef[] {
+  const unique = new Map<string, SourceRef>();
+  for (const ref of refs ?? []) {
+    const normalized: SourceRef = {
+      source: ref.source,
+      recordId: ref.recordId,
+      ...(ref.recordVersion === undefined ? {} : { recordVersion: ref.recordVersion }),
+    };
+    unique.set(stableJson(normalized), Object.freeze(normalized));
+  }
+  return Object.freeze([...unique.entries()]
+    .sort((left, right) => readbackCompare(left[0], right[0]))
+    .map(([, ref]) => ref));
+}
+
+function readbackEffectiveAt(value: EffectiveAt | undefined): EffectiveAt {
+  return Object.freeze({
+    ...(value?.round === undefined ? {} : { round: value.round }),
+    ...(value?.messageId === undefined ? {} : { messageId: value.messageId }),
+    ...(value?.eventIndex === undefined ? {} : { eventIndex: value.eventIndex }),
+  });
+}
+
+export interface CharacterReadbackFact {
+  readonly field: string;
+  readonly value: unknown;
+  readonly status: FactStatus;
+  readonly factKind: FactKind;
+  readonly sceneId?: string;
+  readonly effectiveAt: EffectiveAt;
+  readonly sourceRefs: readonly SourceRef[];
+}
+
+export interface CharacterReadbackRelationship {
+  readonly relationshipId: string;
+  readonly fromCharacterId: string;
+  readonly toCharacterId: string;
+  readonly type: string;
+  readonly perspective: 'objective' | 'subjective';
+  readonly status: FactStatus;
+  readonly factKind: FactKind;
+  readonly sceneId?: string;
+  readonly effectiveAt: EffectiveAt;
+  readonly derived: boolean;
+  readonly sourceRefs: readonly SourceRef[];
+}
+
+export interface CharacterReadbackHistory {
+  readonly field: string;
+  readonly value: unknown;
+  readonly factKind: FactKind;
+  readonly status: FactStatus;
+  readonly effectiveAt: EffectiveAt;
+  readonly reason: string;
+  readonly sourceRefs: readonly SourceRef[];
+}
+
+export interface CharacterReadback {
+  readonly version: typeof CHARACTER_READBACK_VERSION;
+  readonly characterId: string;
+  readonly entityVersion: number;
+  readonly snapshotId: string;
+  readonly headRevision: number;
+  readonly identityName: string;
+  readonly aliases: readonly string[];
+  readonly profile: readonly CharacterReadbackFact[];
+  readonly facts: readonly CharacterReadbackFact[];
+  readonly relationships: readonly CharacterReadbackRelationship[];
+  readonly history: readonly CharacterReadbackHistory[];
+  readonly unresolved: readonly string[];
+}
+
+function readbackFacts(source: Record<string, CharacterFact> | undefined): readonly CharacterReadbackFact[] {
+  const fields = Object.keys(source ?? {})
+    .filter((field) => source![field] !== undefined && source![field] !== null)
+    .sort(readbackCompare);
+  return Object.freeze(fields.map((field) => {
+    const fact = source![field]!;
+    return Object.freeze({
+      field,
+      value: fact.value === undefined ? null : fact.value,
+      status: fact.status,
+      factKind: fact.factKind,
+      ...(fact.sceneId === undefined ? {} : { sceneId: fact.sceneId }),
+      effectiveAt: readbackEffectiveAt(fact.effectiveAt),
+      sourceRefs: readbackSourceRefs(fact.sourceRefs),
+    }) satisfies CharacterReadbackFact;
+  }));
+}
+
+function readbackStrings(values: readonly string[] | undefined): readonly string[] {
+  return Object.freeze([...new Set((values ?? [])
+    .filter((value): value is string => typeof value === 'string')
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0))].sort(readbackCompare));
+}
+
+export function canonicalCharacterReadback(projection: CharacterProjection): CharacterReadback {
+  return Object.freeze({
+    version: CHARACTER_READBACK_VERSION,
+    characterId: projection.characterId,
+    entityVersion: projection.entityVersion,
+    snapshotId: projection.head?.snapshotId ?? '',
+    headRevision: projection.head?.headRevision ?? 0,
+    identityName: typeof projection.identity?.name === 'string' ? projection.identity.name : '',
+    aliases: readbackStrings(projection.identity?.aliases),
+    profile: readbackFacts(projection.profile),
+    facts: readbackFacts(projection.facts),
+    relationships: readbackSorted((projection.relationships ?? []).map((rel) => Object.freeze({
+      relationshipId: rel.relationshipId,
+      fromCharacterId: rel.fromCharacterId,
+      toCharacterId: rel.toCharacterId,
+      type: rel.type,
+      perspective: rel.perspective,
+      status: rel.status,
+      factKind: rel.factKind,
+      ...(rel.sceneId === undefined ? {} : { sceneId: rel.sceneId }),
+      effectiveAt: readbackEffectiveAt(rel.effectiveAt),
+      derived: rel.derived === true,
+      sourceRefs: readbackSourceRefs(rel.sourceRefs),
+    }) satisfies CharacterReadbackRelationship)),
+    history: readbackSorted((projection.history ?? []).map((entry) => Object.freeze({
+      field: entry.field,
+      value: entry.value === undefined ? null : entry.value,
+      factKind: entry.factKind,
+      status: entry.status,
+      effectiveAt: readbackEffectiveAt(entry.effectiveAt),
+      reason: entry.reason,
+      sourceRefs: readbackSourceRefs(entry.sourceRefs),
+    }) satisfies CharacterReadbackHistory)),
+    unresolved: readbackStrings(projection.unresolved),
+  });
+}
+
+function readbackDigestOf(readback: CharacterReadback): string {
+  return 'sha256:' + sha256Hex(stableJson(readback));
+}
+
+export function characterReadbackDigest(projection: CharacterProjection): string {
+  return readbackDigestOf(canonicalCharacterReadback(projection));
+}
+
+/**
+ * 内容无关的回执：只带稳定标识、版本边界、各类计数和摘要。
+ * 事实取值、关系与历史正文一律不出这个结构，避免把模型输出写进控制面 receipt。
+ */
+export interface CharacterReadbackReceipt {
+  readonly version: typeof CHARACTER_READBACK_VERSION;
+  readonly characterId: string;
+  readonly entityVersion: number;
+  readonly snapshotId: string;
+  readonly headRevision: number;
+  readonly aliasCount: number;
+  readonly profileCount: number;
+  readonly factCount: number;
+  readonly relationshipCount: number;
+  readonly historyCount: number;
+  readonly unresolvedCount: number;
+  readonly readbackDigest: string;
+}
+
+export function characterReadbackReceipt(projection: CharacterProjection): CharacterReadbackReceipt {
+  const readback = canonicalCharacterReadback(projection);
+  return Object.freeze({
+    version: CHARACTER_READBACK_VERSION,
+    characterId: readback.characterId,
+    entityVersion: readback.entityVersion,
+    snapshotId: readback.snapshotId,
+    headRevision: readback.headRevision,
+    aliasCount: readback.aliases.length,
+    profileCount: readback.profile.length,
+    factCount: readback.facts.length,
+    relationshipCount: readback.relationships.length,
+    historyCount: readback.history.length,
+    unresolvedCount: readback.unresolved.length,
+    readbackDigest: readbackDigestOf(readback),
+  });
+}
+
+/**
+ * 批量摘要：多人物按 `characterId` 稳定排序后只绑"身份 + 版本 + 单人摘要"，
+ * 所以提案顺序、并发写入顺序都不会改变它；同一 `characterId` 重复出现只计一次。
+ */
+export function characterReadbackBatchDigest(
+  receipts: readonly CharacterReadbackReceipt[],
+): string {
+  const byCharacter = new Map<string, CharacterReadbackReceipt>();
+  for (const receipt of receipts) {
+    if (!byCharacter.has(receipt.characterId)) byCharacter.set(receipt.characterId, receipt);
+  }
+  const ordered = [...byCharacter.values()].sort((left, right) => readbackCompare(left.characterId, right.characterId));
+  if (ordered.length === 0) throw new Error('character-readback-batch-empty');
+  return 'sha256:' + sha256Hex(stableJson(ordered.map((receipt) => ({
+    characterId: receipt.characterId,
+    entityVersion: receipt.entityVersion,
+    readbackDigest: receipt.readbackDigest,
+  }))));
 }
 
 function emptyProjection(sessionKey: string, characterId: string, name: string, epoch: number): CharacterProjection {
@@ -673,11 +1068,15 @@ export class CharacterStore {
   ): { characterId: string; created: boolean; deduped: boolean } {
     const name = String(input.name ?? '').trim();
     if (!name) throw new Error('人物名不能为空');
-    // 内部标识（char_003 / char_001|角色甲 / entity_alpha / 纯数字）不是人物名：
+    // 内部标识（char_003 / char_001|示例角色B / sample_alias / 纯数字）不是人物名：
     // 旧链路把卡引擎的 entity_id 直接当名字建过人物，会与真正的 characterId 撞名。
     if (!isPlausibleCharacterName(name)) {
       throw new Error(`拒绝把内部标识注册为人物：${JSON.stringify(name)}（需要人类可读的人物名）`);
     }
+    // `ensureCharacter` is also the authoritative import/card-registration path.
+    // A card may intentionally use a title-only stable identity (for example
+    // "守卫"), so the generic-name gate belongs at untrusted auto-promotion and
+    // model `newEntity` boundaries, not at this registry primitive.
     const op = input.operationId ?? '';
     if (op) {
       const prev = this.db.prepare('SELECT character_id FROM character_registry WHERE create_operation_id = ?').get(op) as { character_id: string } | undefined;
@@ -709,7 +1108,15 @@ export class CharacterStore {
     const added: string[] = [];
     for (const raw of aliases ?? []) {
       const alias = String(raw ?? '').trim();
+      // Explicit/card aliases are authoritative input and may intentionally be a
+      // title ("老师", "守卫"). Model-produced identity aliases use the separate
+      // admitMaintenanceAlias boundary, while auto/newEntity callers filter
+      // candidates before reaching this convenience method.
       if (!alias || alias === characterId) continue;
+      const reservedIdentity = this.db.prepare(
+        'SELECT 1 AS ok FROM character_registry WHERE session_key=? AND lower(character_id)=lower(?) LIMIT 1',
+      ).get(sessionKey, alias) as { ok: number } | undefined;
+      if (reservedIdentity) continue;
       // 同一别名在同会话内已归属另一人物 → 视为歧义，不覆盖（跨批次重复发现先消歧）
       const owner = this.db.prepare('SELECT DISTINCT character_id FROM character_alias WHERE session_key = ? AND alias = ?')
         .all(sessionKey, alias) as { character_id: string }[];
@@ -719,6 +1126,261 @@ export class CharacterStore {
       if (Number(r.changes) > 0) added.push(alias);
     }
     return added;
+  }
+
+  /**
+   * Apply one operator-approved identity mapping with CAS, provenance and replay protection.
+   * This is intentionally separate from addAliases(): model-produced identity evidence must
+   * never reach the generic convenience method without an auditable operation boundary.
+   */
+  admitMaintenanceAlias(input: CharacterMaintenanceAliasInput): CharacterMaintenanceAliasApplyResult {
+    const { alias, mentionKey, aliasDigest, intentFingerprint } = maintenanceAliasIntent(input);
+    if (!input.sessionKey || !input.characterId || !input.operationId
+      || alias.length < 2 || mentionKey.length < 2
+      || /[\u0000-\u001f\u007f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/u.test(alias + mentionKey)
+      || AMBIGUOUS_MENTION_RE.test(alias) || AMBIGUOUS_MENTION_RE.test(mentionKey)
+      || isForbiddenNpcIdentityTerm(alias) || isForbiddenNpcIdentityTerm(mentionKey)
+      || !/^sha256:[a-f0-9]{64}$/u.test(input.provenanceDigest)
+      || !Number.isSafeInteger(input.expectedEntityVersion) || input.expectedEntityVersion < 0
+      || !Number.isSafeInteger(input.rollbackEntityVersion) || input.rollbackEntityVersion < 0
+      || input.rollbackEntityVersion < input.expectedEntityVersion
+      || input.sourceRefs.length < 1) {
+      throw new Error('character-maintenance-identity-binding-invalid');
+    }
+    const existingOperation = this.db.prepare(
+      `SELECT session_key, character_id, alias_digest, expected_entity_version,
+              rollback_entity_version, created_alias, provenance_digest,
+              intent_fingerprint, rolled_back_at
+       FROM character_alias_operation WHERE operation_id=?`,
+    ).get(input.operationId) as {
+      session_key: string;
+      character_id: string;
+      alias_digest: string;
+      expected_entity_version: number;
+      rollback_entity_version: number;
+      created_alias: number;
+      provenance_digest: string;
+      intent_fingerprint: string;
+      rolled_back_at: string | null;
+    } | undefined;
+    if (existingOperation) {
+      if (existingOperation.session_key !== input.sessionKey
+        || existingOperation.character_id !== input.characterId
+        || existingOperation.alias_digest !== aliasDigest
+        || existingOperation.expected_entity_version !== input.expectedEntityVersion
+        || existingOperation.rollback_entity_version !== input.rollbackEntityVersion
+        || existingOperation.provenance_digest !== input.provenanceDigest
+        || existingOperation.intent_fingerprint !== intentFingerprint
+        || existingOperation.rolled_back_at !== null) {
+        throw new Error('character-maintenance-identity-operation-conflict');
+      }
+      if (existingOperation.created_alias === 1) {
+        const stillPresent = this.db.prepare(
+          'SELECT 1 AS ok FROM character_alias WHERE session_key=? AND alias=? AND character_id=?',
+        ).get(input.sessionKey, alias, input.characterId) as { ok: number } | undefined;
+        if (!stillPresent) throw new Error('character-maintenance-identity-replay-missing');
+      }
+      return Object.freeze({
+        characterId: input.characterId,
+        operationId: input.operationId,
+        added: existingOperation.created_alias === 1,
+        deduped: true,
+        anchor: Object.freeze({
+          characterId: input.characterId,
+          operationId: input.operationId,
+          aliasDigest,
+          expectedEntityVersion: input.expectedEntityVersion,
+          rollbackEntityVersion: input.rollbackEntityVersion,
+          createdAlias: existingOperation.created_alias === 1,
+          provenanceDigest: input.provenanceDigest,
+        }),
+      });
+    }
+    const registered = this.db.prepare(
+      'SELECT name FROM character_registry WHERE session_key=? AND character_id=?',
+    ).get(input.sessionKey, input.characterId) as { name: string } | undefined;
+    if (!registered) throw new Error('character-maintenance-identity-character-missing');
+    const reservedIdentity = this.db.prepare(
+      `SELECT character_id FROM character_registry
+       WHERE session_key=? AND (lower(character_id)=lower(?) OR lower(character_id)=lower(?))
+       LIMIT 1`,
+    ).get(input.sessionKey, alias, mentionKey) as { character_id: string } | undefined;
+    if (reservedIdentity) throw new Error('character-maintenance-identity-character-id-conflict');
+    if (this.versionOf(input.sessionKey, input.characterId) !== input.rollbackEntityVersion) {
+      throw new StateVersionConflictError(input.rollbackEntityVersion, this.versionOf(input.sessionKey, input.characterId));
+    }
+    if (alias === registered.name) throw new Error('character-maintenance-identity-redundant');
+    const nameOwners = this.db.prepare(
+      'SELECT character_id FROM character_registry WHERE session_key=? AND name=?',
+    ).all(input.sessionKey, alias) as { character_id: string }[];
+    if (nameOwners.some((row) => row.character_id !== input.characterId)) {
+      throw new Error('character-maintenance-identity-name-conflict');
+    }
+    const aliasOwners = this.db.prepare(
+      'SELECT DISTINCT character_id FROM character_alias WHERE session_key=? AND alias=?',
+    ).all(input.sessionKey, alias) as { character_id: string }[];
+    if (aliasOwners.some((row) => row.character_id !== input.characterId)) {
+      throw new Error('character-maintenance-identity-alias-conflict');
+    }
+    const alreadyOwned = aliasOwners.some((row) => row.character_id === input.characterId);
+    if (!alreadyOwned) {
+      this.db.prepare(
+        'INSERT INTO character_alias (session_key,alias,character_id,explicit,created_at) VALUES (?,?,?,?,?)',
+      ).run(input.sessionKey, alias, input.characterId, 1, new Date().toISOString());
+    }
+    this.db.prepare(
+      `INSERT INTO character_alias_operation
+       (session_key,character_id,operation_id,alias,alias_digest,mention_key,
+        expected_entity_version,rollback_entity_version,created_alias,source_refs,
+        provenance_digest,intent_fingerprint,created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    ).run(
+      input.sessionKey, input.characterId, input.operationId, alias, aliasDigest, mentionKey,
+      input.expectedEntityVersion, input.rollbackEntityVersion, alreadyOwned ? 0 : 1,
+      JSON.stringify(input.sourceRefs), input.provenanceDigest, intentFingerprint, new Date().toISOString(),
+    );
+    return Object.freeze({
+      characterId: input.characterId,
+      operationId: input.operationId,
+      added: !alreadyOwned,
+      deduped: false,
+      anchor: Object.freeze({
+        characterId: input.characterId,
+        operationId: input.operationId,
+        aliasDigest,
+        expectedEntityVersion: input.expectedEntityVersion,
+        rollbackEntityVersion: input.rollbackEntityVersion,
+        createdAlias: !alreadyOwned,
+        provenanceDigest: input.provenanceDigest,
+      }),
+    });
+  }
+
+  /** Read-only crash-recovery proof for an exact alias operation. */
+  maintenanceAppliedAliasOperation(
+    input: CharacterMaintenanceAliasInput,
+  ): CharacterMaintenanceAliasApplyResult | null {
+    const { alias, aliasDigest, intentFingerprint } = maintenanceAliasIntent(input);
+    const row = this.db.prepare(
+      `SELECT session_key,character_id,alias_digest,expected_entity_version,
+              rollback_entity_version,created_alias,provenance_digest,
+              intent_fingerprint,rolled_back_at
+       FROM character_alias_operation WHERE operation_id=?`,
+    ).get(input.operationId) as {
+      session_key: string;
+      character_id: string;
+      alias_digest: string;
+      expected_entity_version: number;
+      rollback_entity_version: number;
+      created_alias: number;
+      provenance_digest: string;
+      intent_fingerprint: string;
+      rolled_back_at: string | null;
+    } | undefined;
+    if (!row) return null;
+    if (row.session_key !== input.sessionKey || row.character_id !== input.characterId
+      || row.alias_digest !== aliasDigest
+      || row.expected_entity_version !== input.expectedEntityVersion
+      || row.rollback_entity_version !== input.rollbackEntityVersion
+      || row.provenance_digest !== input.provenanceDigest
+      || row.intent_fingerprint !== intentFingerprint
+      || row.rolled_back_at !== null) {
+      throw new Error('character-maintenance-identity-operation-conflict');
+    }
+    if (row.created_alias === 1) {
+      const stillPresent = this.db.prepare(
+        'SELECT 1 AS ok FROM character_alias WHERE session_key=? AND alias=? AND character_id=?',
+      ).get(input.sessionKey, alias, input.characterId) as { ok: number } | undefined;
+      if (!stillPresent) throw new Error('character-maintenance-identity-replay-missing');
+    }
+    return Object.freeze({
+      characterId: input.characterId,
+      operationId: input.operationId,
+      added: row.created_alias === 1,
+      deduped: true,
+      anchor: Object.freeze({
+        characterId: input.characterId,
+        operationId: input.operationId,
+        aliasDigest,
+        expectedEntityVersion: input.expectedEntityVersion,
+        rollbackEntityVersion: input.rollbackEntityVersion,
+        createdAlias: row.created_alias === 1,
+        provenanceDigest: input.provenanceDigest,
+      }),
+    });
+  }
+
+  /** Roll back only aliases created by the bound operations; later writes fail the CAS. */
+  rollbackMaintenanceAliases(
+    sessionKey: string,
+    anchors: readonly CharacterMaintenanceAliasRollbackAnchor[],
+  ): CharacterMaintenanceAliasRollbackResult {
+    const ordered = [...anchors].sort((a, b) => a.operationId.localeCompare(b.operationId));
+    if (new Set(ordered.map((item) => item.operationId)).size !== ordered.length) {
+      throw new Error('character-maintenance-identity-rollback-anchor-duplicate');
+    }
+    const rows = ordered.map((anchor) => {
+      const row = this.db.prepare(
+        `SELECT character_id,alias,alias_digest,expected_entity_version,rollback_entity_version,
+                created_alias,provenance_digest,rolled_back_at
+         FROM character_alias_operation WHERE operation_id=? AND session_key=?`,
+      ).get(anchor.operationId, sessionKey) as {
+        character_id: string;
+        alias: string;
+        alias_digest: string;
+        expected_entity_version: number;
+        rollback_entity_version: number;
+        created_alias: number;
+        provenance_digest: string;
+        rolled_back_at: string | null;
+      } | undefined;
+      if (!row) throw new Error('character-maintenance-identity-rollback-operation-missing');
+      if (row.character_id !== anchor.characterId || row.alias_digest !== anchor.aliasDigest
+        || row.expected_entity_version !== anchor.expectedEntityVersion
+        || row.rollback_entity_version !== anchor.rollbackEntityVersion
+        || (row.created_alias === 1) !== anchor.createdAlias
+        || row.provenance_digest !== anchor.provenanceDigest) {
+        throw new Error('character-maintenance-identity-rollback-anchor-invalid');
+      }
+      return { anchor, row };
+    });
+    if (rows.every(({ row }) => row.rolled_back_at !== null)) {
+      return Object.freeze({ deduped: true, removedAliases: 0, operationIds: Object.freeze([]) });
+    }
+    if (rows.some(({ row }) => row.rolled_back_at !== null)) {
+      throw new Error('character-maintenance-identity-rollback-partial');
+    }
+    for (const { anchor } of rows) {
+      const actual = this.versionOf(sessionKey, anchor.characterId);
+      if (actual !== anchor.rollbackEntityVersion) {
+        throw new StateVersionConflictError(anchor.rollbackEntityVersion, actual);
+      }
+    }
+    let removedAliases = 0;
+    for (const { anchor, row } of rows) {
+      if (anchor.createdAlias) {
+        const laterOwner = this.db.prepare(
+          `SELECT 1 AS ok FROM character_alias_operation
+           WHERE session_key=? AND character_id=? AND alias=? AND operation_id<>? AND rolled_back_at IS NULL`,
+        ).get(sessionKey, anchor.characterId, row.alias, anchor.operationId) as { ok: number } | undefined;
+        if (laterOwner) throw new Error('character-maintenance-identity-rollback-dependent-operation');
+        const removed = this.db.prepare(
+          'DELETE FROM character_alias WHERE session_key=? AND alias=? AND character_id=?',
+        ).run(sessionKey, row.alias, anchor.characterId);
+        if (Number(removed.changes) !== 1) {
+          throw new Error('character-maintenance-identity-rollback-alias-missing');
+        }
+        removedAliases += 1;
+      }
+      this.db.prepare(
+        'UPDATE character_alias_operation SET rolled_back_at=? WHERE operation_id=? AND rolled_back_at IS NULL',
+      ).run(new Date().toISOString(), anchor.operationId);
+    }
+    return Object.freeze({
+      deduped: false,
+      removedAliases,
+      operationIds: Object.freeze(rows.map(({ anchor }) => anchor.operationId)),
+    });
   }
 
   aliasesOf(sessionKey: string, characterId: string): string[] {
@@ -766,7 +1428,7 @@ export class CharacterStore {
    * 按**稳定身份**匹配已注册人物：`characterId` / `name` / `alias` 三者都算。
    *
    * 旧链路只比 name/alias，于是卡引擎实体键恰好等于我们分配的 characterId 时会报「未注册」——
-   * 实测 `state_changes.entity_id = 'char_001'`，而注册表里 `char_001` 正是角色甲，
+   * 实测 `state_changes.entity_id = 'char_001'`，而注册表里 `char_001` 正是示例角色B，
    * 日志却写「char_001（未注册 NPC）」，自相矛盾，该实体的字段被永久丢弃。
    */
   matchRegistered(
@@ -854,12 +1516,21 @@ export class CharacterStore {
       // 池子里攒的是**还没被显式确认**的当前事实 → 与旧档迁移同口径，不把推断升级为确认
       status: 'pending' as const,
       effectiveAt: { round: p.r, messageId: p.m },
+      // 每个暂存字段保留它自己的原始消息，不能在第 3 轮促升时
+      // 把前两轮的事实都误标成「第 3 轮消息支持」。
+      ...(p.m !== undefined ? {
+        sourceRefs: [{ source: 'message' as const, recordId: String(p.m), recordVersion: 1 }],
+      } : {}),
     }));
     const fp = sha256Hex(JSON.stringify(changes.map((c) => [c.field, c.value ?? null, c.effectiveAt?.round ?? null])
       .sort((a, b) => String(a[0]).localeCompare(String(b[0]))))).slice(0, 16);
     const res = this.admit(sessionKey, { characterId, changes, relationships: [] }, {
       operationId: `promote:${sessionKey}:${key}:apply:r${round ?? 0}:${fp}`,
-      instanceId: `character-pool:${sessionKey}`,
+      // 必须与 ChatSession.stateInstanceId()（`state:<sessionId>`）保持一致：character scope 下
+      // 每个人物只有一份存储区，instanceId 由**首次写入者**定调（state-store.ts 的
+      // StateInstanceStaleError 校验）。两套前缀并存会让常规回合写入被整体拒绝，
+      // 人物事实从此冻结在创建时的版本。
+      instanceId: `state:${sessionKey}`,
       historyEpoch: this.store.historyEpoch(sessionKey),
       round,
       sourceRefs: messageId !== undefined ? [{ source: 'message', recordId: String(messageId) }] : [],
@@ -888,6 +1559,13 @@ export class CharacterStore {
     const key = canonicalMentionKey(String(input.mentionKey ?? '').trim());
     const base: StageMentionResult = { key, counted: false, hits: 0, threshold };
     if (!key) return { ...base, skipped: '候选缺少累计键' };
+    if (!isEligibleNpcMentionCandidate({
+      mentionKey: input.mentionKey,
+      entityType: input.entityType,
+      nameHints: [input.name, input.mention],
+    })) {
+      return { ...base, skipped: '候选不是可建档的具名 NPC（玩家、旁白、泛称或地点不入池）' };
+    }
 
     const existing = this.poolRow(sessionKey, key);
     // 已促升：本轮字段还没写 → 交给调用方走常规入口；同时把此前**未能转入**的暂存补一次
@@ -958,7 +1636,7 @@ export class CharacterStore {
 
     // ── 促升 ──
     // 唯一命中已有同名人物 → **回挂，不建新 ID**。这同时挡住模型把主角又标成 npc 时
-    // 造出第二个「角色甲」（实测 session-example-b 里 ('npc','角色甲') 与 ('protagonist','角色甲') 并存）
+    // 造出第二个「示例角色B」（实测某会话里 ('npc','示例角色B') 与 ('protagonist','示例角色B') 并存）
     const sameName = this.matchRegistered(sessionKey, displayName);
     if (sameName.length > 1) {
       this.upsertPoolRow(sessionKey, rowBase);
@@ -993,8 +1671,8 @@ export class CharacterStore {
   /**
    * 门 B 补名（**不计数**）：`presentEntities()` 是按标点分词的产物，会把「你来了」这类
    * 非人名片段一起送进来，让它参与计数会污染阈值。所以这里只做一件事：某个在场称呼能匹配到
-   * **已在池子里**的候选行时，把该称呼补进它的可读名候选（如 `char_001|角色甲` 因玩家
-   * 输入里的「角色甲」而补上别名）。**不为不存在的键建行** —— 池子只由门 A 驱动。
+   * **已在池子里**的候选行时，把该称呼补进它的可读名候选（如 `char_001|示例角色B` 因玩家
+   * 输入里的「示例角色B」而补上别名）。**不为不存在的键建行** —— 池子只由门 A 驱动。
    */
   annexNameHints(sessionKey: string, mentions: string[]): string[] {
     const annexed: string[] = [];
@@ -1004,7 +1682,7 @@ export class CharacterStore {
     if (rows.length === 0) return annexed;
     for (const raw of mentions) {
       const m = String(raw ?? '').trim();
-      if (!m || AMBIGUOUS_MENTION_RE.test(m) || !isPlausibleCharacterName(m)) continue;
+      if (!m || AMBIGUOUS_MENTION_RE.test(m) || !isPlausibleNpcIdentityName(m)) continue;
       if (this.matchRegistered(sessionKey, m).length > 0) continue; // 已注册 → 交给 resolveMentions
       const hit = rows.find((r) => r.mention_key.includes(m)
         || r.display_name === m
@@ -1091,7 +1769,8 @@ export class CharacterStore {
     const epoch = this.store.historyEpoch(sessionKey);
     const p = this.readProjection(sessionKey, characterId);
     if (p) return { ...p, identity: { ...p.identity, aliases: this.aliasesOf(sessionKey, characterId) }, scope: { ...p.scope, historyEpoch: epoch } };
-    return emptyProjection(sessionKey, characterId, reg?.name ?? characterId, epoch);
+    const empty = emptyProjection(sessionKey, characterId, reg?.name ?? characterId, epoch);
+    return { ...empty, identity: { ...empty.identity, aliases: this.aliasesOf(sessionKey, characterId) } };
   }
 
   projectAll(sessionKey: string): CharacterProjection[] {
@@ -1339,9 +2018,14 @@ export class CharacterStore {
     let characterId = candidate.characterId ?? '';
     if (!characterId && candidate.newEntity) {
       if (!candidate.name) return { ...base, error: { name: 'InvalidCandidate', message: 'newEntity 候选必须提供 name' } };
+      if (!isPlausibleNpcIdentityName(candidate.name)) {
+        return { ...base, error: { name: 'InvalidCandidate', message: 'newEntity name 不是可建档的具名 NPC' } };
+      }
       // ID 由代码分配；创建操作幂等（同一 operationId 重试取得同一结果）
       const c = this.ensureCharacter(sessionKey, {
-        name: candidate.name, aliases: candidate.aliases, kind: 'npc',
+        name: candidate.name,
+        aliases: candidate.aliases?.filter(isPlausibleNpcIdentityName),
+        kind: 'npc',
         operationId: `create:${sessionKey}:${ctx.operationId}`,
         // 显式 newEntity：即便已有同名人物也创建**独立 ID**（同名不等于同一人）
         reuseByName: false,
@@ -1366,7 +2050,9 @@ export class CharacterStore {
     if (ctx.allowedCharacterIds && !ctx.allowedCharacterIds.includes(characterId)) {
       return { ...base, error: { name: 'CharacterNotAllowed', message: `人物 ${characterId} 不在本任务允许集合内` } };
     }
-    if (candidate.aliases?.length) this.addAliases(sessionKey, characterId, candidate.aliases);
+    if (candidate.aliases?.length) {
+      this.addAliases(sessionKey, characterId, candidate.aliases.filter(isPlausibleNpcIdentityName));
+    }
 
     // 2. 幂等 / 业务指纹：
     //   同 ID 同意图且已提交 → 返回原回执（历史回执可读，但不重新应用）
@@ -1404,7 +2090,8 @@ export class CharacterStore {
     }
     const clean: CharacterChangeCandidate[] = [];
     for (const ch of changes) {
-      const field = String(ch.field ?? '').trim();
+      // 归并同义字段名（白名单内）：让同一概念实时落到同一个字段，而不是每轮新增同义键。
+      const field = normalizeCharacterField(String(ch.field ?? '').trim());
       if (!FIELD_RE.test(field) || field.includes('__proto__') || field.includes('constructor') || field.includes('prototype')) {
         base.rejected.push({ field, reason: '非法字段名' });
         continue;
@@ -1729,7 +2416,7 @@ export class CharacterStore {
   }
 
   /**
-   * 清理被污染的人物条目（**默认干跑**）：只删注册表/别名/事实日志 + 对应 memory_state 镜像，
+   * 清理被污染的人物条目（**默认干跑**）：只删注册表/别名/身份操作账/事实日志 + 对应 memory_state 镜像，
    * 不碰其它业务数据。请先看 dry-run 报告再决定是否 apply。
    */
   pruneSuspicious(sessionKey: string, opts: { apply?: boolean } = {}): {
@@ -1739,6 +2426,7 @@ export class CharacterStore {
     const removed = targets.map((t) => ({ characterId: t.characterId, name: t.name, reason: t.reason, facts: t.factCount }));
     if (!opts.apply) return { dryRun: true, removed };
     for (const t of targets) {
+      this.db.prepare('DELETE FROM character_alias_operation WHERE session_key = ? AND character_id = ?').run(sessionKey, t.characterId);
       this.db.prepare('DELETE FROM character_alias WHERE session_key = ? AND character_id = ?').run(sessionKey, t.characterId);
       this.db.prepare('DELETE FROM character_fact_log WHERE session_key = ? AND character_id = ?').run(sessionKey, t.characterId);
       this.db.prepare('DELETE FROM character_registry WHERE session_key = ? AND character_id = ?').run(sessionKey, t.characterId);

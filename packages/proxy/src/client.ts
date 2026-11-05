@@ -2,6 +2,7 @@
  * proxy 包 - OpenAI 兼容客户端（chat/completions + SSE 流式 + tools）
  * 端点：{baseUrl}/v1/chat/completions；支持非流式（工具调用首选）与流式（正文渲染）。
  */
+import { createHash, randomUUID } from 'node:crypto';
 import type { ProviderConfig } from './config.ts';
 
 export interface ChatMessage {
@@ -29,6 +30,10 @@ export interface ChatRequest {
   max_tokens?: number;
   stream?: boolean;
   extraBody?: Record<string, unknown>;
+  /** Host asks the official DeepSeek transport for bounded, non-thinking JSON output. */
+  deepseekJsonOutput?: boolean;
+  /** Require the exact official DeepSeek Flash vision transport before sending any frames. */
+  officialDeepSeekVisionRequired?: boolean;
 }
 
 export interface ToolCall {
@@ -56,6 +61,35 @@ export interface ChatResponse {
   raw: unknown;
 }
 
+/** Process-local evidence, attached only by the exact official transport with redirects disabled. */
+export interface OfficialDeepSeekModelEvidence {
+  readonly requestedModel: string;
+  readonly reportedModel: string;
+  readonly identity: 'official-response-reported';
+  readonly requestDigest: string;
+  readonly runId: string;
+}
+const officialDeepSeekEvidence = new WeakMap<object, { evidence: OfficialDeepSeekModelEvidence; responseDigest: string }>();
+function responseEvidenceDigest(value: ChatResponse): string {
+  return createHash('sha256').update(JSON.stringify({ content: value.content, toolCalls: value.toolCalls,
+    finishReason: value.finishReason, usage: value.usage })).digest('hex');
+}
+export function officialDeepSeekRequestDigest(value: Pick<ChatRequest, 'model' | 'messages' | 'temperature' | 'max_tokens'>): string {
+  return `sha256:${createHash('sha256').update(JSON.stringify({ model: value.model, messages: value.messages,
+    temperature: value.temperature, max_tokens: value.max_tokens })).digest('hex')}`;
+}
+export function readOfficialDeepSeekModelEvidence(value: unknown): OfficialDeepSeekModelEvidence | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const record = officialDeepSeekEvidence.get(value);
+  return record && responseEvidenceDigest(value as ChatResponse) === record.responseDigest ? record.evidence : undefined;
+}
+/** Copy only evidence already attached to an unchanged, validated response. */
+export function transferOfficialDeepSeekModelEvidence(source: unknown, target: ChatResponse): void {
+  const evidence = readOfficialDeepSeekModelEvidence(source);
+  if (evidence && responseEvidenceDigest(source as ChatResponse) === responseEvidenceDigest(target))
+    officialDeepSeekEvidence.set(target, { evidence, responseDigest: responseEvidenceDigest(target) });
+}
+
 /** 仅供宿主观测与准入使用；Registry 只向 Provider SPI 透传 runId，不下传其余本地元数据。 */
 export type ModelCallLane =
   | 'turn_final'
@@ -70,10 +104,15 @@ export type ModelCallLane =
   | 'video_prompt'
   | 'maintenance'
   | 'style_compile'
+  | 'skill_compile'
+  | 'skill_evaluate'
+  | 'skill_sample'
+  | 'skill_quality'
   | 'preference'
   | 'arc'
   | 'npc'
   | 'critic'
+  | 'rp_child_analysis'
   | 'unclassified';
 
 /** 单次酒馆内部模型调用的稳定身份。CLI 客户端可忽略该元数据。 */
@@ -84,6 +123,12 @@ export interface ChatProviderCall {
   round?: number;
   lane?: ModelCallLane;
   callIndex?: number;
+  /** Host-owned absolute wall deadline; arbitration includes queueing time, never sent in model payloads. */
+  deadlineAt?: string;
+  /** Host-only synchronous fence at the granted physical dispatch; never part of Provider payloads. */
+  beforeDispatch?: () => void;
+  /** Host-only synchronous fence immediately before the Registry enters its adapter. */
+  beforeAdapterDispatch?: () => void;
   /**
    * 宿主为受控调用设置的单次逻辑调用传输尝试硬上限。
    * 普通主对话不设置，继续使用客户端默认重试策略；Provider 适配器不得提高该值。
@@ -211,6 +256,7 @@ export async function streamSSE(
 const RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
 /** 总尝试次数（= 重试次数 + 1） */
 const MAX_ATTEMPTS = 3;
+const LEGACY_OPENCODE_ZEN_GO_CHAT_PATH = '/zen/go/v1/chat/completions';
 export interface OpenAICompatibleClientOptions {
   /**
    * 单次逻辑调用允许发出的 HTTP 请求总数。生产默认保留三次容错；
@@ -241,6 +287,28 @@ function isRetryableStatus(code: number): boolean {
   return RETRYABLE_STATUS.has(code);
 }
 
+/**
+ * The legacy OpenCode Zen/Go chat gateway rejects otherwise valid requests
+ * without a per-call session UUID. Keep this compatibility header pinned to
+ * that exact HTTPS endpoint so arbitrary OpenAI-compatible providers never
+ * receive gateway-specific metadata.
+ */
+function isLegacyOpenCodeZenGoChatEndpoint(endpoint: string): boolean {
+  try {
+    const url = new URL(endpoint);
+    return url.protocol === 'https:'
+      && url.hostname === 'opencode.ai'
+      && !url.port
+      && !url.username
+      && !url.password
+      && url.pathname === LEGACY_OPENCODE_ZEN_GO_CHAT_PATH
+      && !url.search
+      && !url.hash;
+  } catch {
+    return false;
+  }
+}
+
 /** 判定「无效空响应」：请求要求产出（正文或工具调用），响应却两者皆空 → 网关/模型静默失败，值得重试 */
 function isInvalidEmpty(res: ChatResponse, req: ChatRequest): boolean {
   if (res.content && res.content.trim()) return false;
@@ -261,10 +329,18 @@ function supportsVisionModel(model: string): boolean {
   ].some((key) => m.includes(key));
 }
 
-function assertVisionReady(req: ChatRequest, model: string): void {
-  if (hasImageContent(req.messages) && !supportsVisionModel(model)) {
+function assertVisionReady(req: ChatRequest, model: string, endpoint: string): void {
+  const supported = isOfficialDeepSeekEndpoint(endpoint)
+    ? ['deepseek-flash', 'deepseek-v4-flash', 'deepseek-v4-flash-vision-exp'].includes(model)
+    : supportsVisionModel(model);
+  if (hasImageContent(req.messages) && !supported) {
     throw new OpenAICompatibleError(`当前模型 ${model} 未声明支持图片输入，请在 Provider 面板切换到支持 vision/多模态的模型后重试。`, 400);
   }
+}
+function assertOfficialDeepSeekVision(req: ChatRequest, payload: Record<string, unknown>, endpoint: string): void {
+  if (req.officialDeepSeekVisionRequired === undefined || req.officialDeepSeekVisionRequired === false) return;
+  if (req.officialDeepSeekVisionRequired !== true || !isOfficialDeepSeekEndpoint(endpoint) || payload.model !== 'deepseek-flash'
+    || !Array.isArray(payload.messages) || !hasImageContent(payload.messages as ChatMessage[])) throw new Error('deepseek-official-vision-required');
 }
 
 /** 单次尝试超时：首轮用配置全超时；重试轮缩到 ≤60s，避免失败链把单次调用拖成 N×全超时 */
@@ -272,10 +348,48 @@ function attemptTimeoutMs(cfg: ProviderConfig, attempt: number): number {
   return attempt === 0 ? cfg.timeoutMs : Math.min(cfg.timeoutMs, 60_000);
 }
 
+function isOfficialDeepSeekEndpoint(endpoint: string): boolean {
+  try {
+    const url = new URL(endpoint);
+    return url.protocol === 'https:' && url.hostname === 'api.deepseek.com' && !url.port
+      && url.pathname === '/v1/chat/completions' && !url.search && !url.hash && !url.username && !url.password;
+  } catch { return false; }
+}
+
+/** DeepSeek's default thinking mode rejects forced tool choice; explicit caller settings still win. */
+function withDeepSeekForcedToolDefault(body: Record<string, unknown>, endpoint: string): Record<string, unknown> {
+  if (!Array.isArray(body.tools) || body.tools.length === 0
+    || body.thinking !== undefined || body.reasoning_effort !== undefined) return body;
+  const choice = body.tool_choice;
+  const named = choice && typeof choice === 'object' && !Array.isArray(choice)
+    ? choice as Record<string, unknown> : undefined;
+  const fn = named?.type === 'function' && named.function && typeof named.function === 'object'
+    && !Array.isArray(named.function) ? named.function as Record<string, unknown> : undefined;
+  if (choice !== 'required' && !(typeof fn?.name === 'string' && fn.name.trim())) return body;
+  if (!isOfficialDeepSeekEndpoint(endpoint)) return body;
+  return { ...body, thinking: { type: 'disabled' } };
+}
+
+/** The marker is host-only: never send DeepSeek-specific fields to a different endpoint. */
+function withDeepSeekJsonOutput(body: Record<string, unknown>, endpoint: string, requested: boolean | undefined): Record<string, unknown> {
+  if (requested === undefined || requested === false) return body;
+  if (requested !== true) throw new Error('deepseek-json-mode-invalid');
+  if (!isOfficialDeepSeekEndpoint(endpoint)) return body;
+  if (body.thinking !== undefined || body.reasoning_effort !== undefined || body.response_format !== undefined)
+    throw new Error('deepseek-json-mode-conflict');
+  return { ...body, thinking: { type: 'disabled' }, response_format: { type: 'json_object' } };
+}
+
 export class OpenAICompatibleClient {
   private readonly maxAttempts: number;
+  private readonly strictLiveTransport: boolean;
 
   constructor(private cfg: ProviderConfig, options: OpenAICompatibleClientOptions = {}) {
+    const strict = process.env.JG_SKILL_RECOVERY_LIVE_STRICT_TRANSPORT;
+    if (strict !== undefined && strict !== '0' && strict !== '1') {
+      throw new Error('skill-recovery-live-strict-transport-invalid');
+    }
+    this.strictLiveTransport = strict === '1';
     const maxAttempts = options.maxAttempts ?? MAX_ATTEMPTS;
     if (!Number.isSafeInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > MAX_ATTEMPTS) {
       throw new Error(`maxAttempts must be an integer in 1..${MAX_ATTEMPTS}`);
@@ -285,11 +399,11 @@ export class OpenAICompatibleClient {
 
   private attemptLimit(call?: ChatProviderCall): number {
     const requested = call?.maxTransportAttempts;
-    if (requested === undefined) return this.maxAttempts;
+    if (requested === undefined) return this.strictLiveTransport ? 1 : this.maxAttempts;
     if (!Number.isSafeInteger(requested) || requested < 1) {
       throw new Error('maxTransportAttempts must be a positive integer');
     }
-    return Math.min(requested, this.maxAttempts);
+    return Math.min(requested, this.strictLiveTransport ? 1 : this.maxAttempts);
   }
 
   modelName(): string { return this.cfg.model; }
@@ -301,11 +415,15 @@ export class OpenAICompatibleClient {
     return `${this.cfg.baseUrl.replace(/\/$/, '')}/v1`;
   }
 
-  private headers(): Record<string, string> {
-    return {
+  private headers(endpoint?: string): Record<string, string> {
+    const headers: Record<string, string> = {
       Authorization: `Bearer ${this.cfg.apiKey}`,
       'Content-Type': 'application/json',
     };
+    if (endpoint !== undefined && isLegacyOpenCodeZenGoChatEndpoint(endpoint)) {
+      headers['x-opencode-session'] = randomUUID();
+    }
+    return headers;
   }
 
   /** 列出可用模型 */
@@ -325,10 +443,15 @@ export class OpenAICompatibleClient {
   async complete(req: ChatRequest, signal?: AbortSignal, call?: ChatProviderCall): Promise<ChatResponse> {
     let lastErr: OpenAICompatibleError | Error | null = null;
     const maxAttempts = this.attemptLimit(call);
+    const endpoint = `${this.base}/chat/completions`;
+    const rejectRedirects = isLegacyOpenCodeZenGoChatEndpoint(endpoint)
+      || (req.deepseekJsonOutput === true && isOfficialDeepSeekEndpoint(endpoint));
+    // One UUID identifies one logical call; physical retries must reuse it.
+    const headers = this.headers(endpoint);
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       if (signal?.aborted) throw new AbortTurnError();
       const payload = injectCacheControl(
-        {
+        withDeepSeekJsonOutput(withDeepSeekForcedToolDefault({
           model: req.model ?? this.cfg.model,
           messages: req.messages,
           ...(req.tools?.length ? { tools: req.tools, tool_choice: req.tool_choice ?? 'auto' } : {}),
@@ -336,18 +459,22 @@ export class OpenAICompatibleClient {
           max_tokens: req.max_tokens,
           stream: false,
           ...req.extraBody,
-        },
+        }, endpoint), endpoint, req.deepseekJsonOutput),
         this.cfg.kind,
       );
-      assertVisionReady(req, String(payload.model ?? this.cfg.model));
+      if (!Array.isArray(payload.messages)) throw new OpenAICompatibleError('messages 必须为数组', 400);
+      assertOfficialDeepSeekVision(req, payload, endpoint);
+      assertVisionReady({ ...req, messages: payload.messages as ChatMessage[] }, String(payload.model ?? this.cfg.model), endpoint);
       let res: Response;
       try {
         const timeoutSignal = AbortSignal.timeout(attemptTimeoutMs(this.cfg, attempt));
-        res = await fetch(`${this.base}/chat/completions`, {
+        res = await fetch(endpoint, {
           method: 'POST',
-          headers: this.headers(),
+          headers,
           body: JSON.stringify(payload),
           signal: signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal,
+          ...(this.strictLiveTransport || rejectRedirects || isOfficialDeepSeekEndpoint(endpoint) && hasImageContent(payload.messages as ChatMessage[])
+            ? { redirect: 'error' as const } : {}),
         });
       } catch (e) {
         if (signal?.aborted) throw new AbortTurnError();
@@ -391,6 +518,18 @@ export class OpenAICompatibleClient {
         await sleep(600 * (attempt + 1), signal);
         continue;
       }
+      const reportedModel = (parsed.raw as { model?: unknown } | null)?.model;
+      const requestedModel = payload.model;
+      if (rejectRedirects && isOfficialDeepSeekEndpoint(endpoint)
+        && typeof requestedModel === 'string' && ['deepseek-flash', 'deepseek-v4-flash', 'deepseek-v4-flash-vision-exp', 'deepseek-v4-pro'].includes(requestedModel)
+        && typeof call?.runId === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/u.test(call.runId)
+        && typeof reportedModel === 'string' && /^deepseek-[A-Za-z0-9._-]{1,64}$/u.test(reportedModel)) {
+        const evidence = Object.freeze({ requestedModel, reportedModel, identity: 'official-response-reported' as const,
+          runId: call.runId,
+          requestDigest: officialDeepSeekRequestDigest({ model: requestedModel, messages: payload.messages as ChatMessage[],
+            temperature: payload.temperature as number | undefined, max_tokens: payload.max_tokens as number | undefined }) });
+        officialDeepSeekEvidence.set(parsed, { evidence, responseDigest: responseEvidenceDigest(parsed) });
+      }
       return parsed;
     }
     throw lastErr ?? new OpenAICompatibleError('chat/completions 请求失败（重试耗尽）');
@@ -410,29 +549,42 @@ export class OpenAICompatibleClient {
   ): Promise<ChatResponse> {
     let lastErr: OpenAICompatibleError | Error | null = null;
     const maxAttempts = this.attemptLimit(call);
+    const endpoint = `${this.base}/chat/completions`;
+    const rejectRedirects = isLegacyOpenCodeZenGoChatEndpoint(endpoint)
+      || (req.deepseekJsonOutput === true && isOfficialDeepSeekEndpoint(endpoint));
+    // One UUID identifies one logical call; physical retries must reuse it.
+    const headers = this.headers(endpoint);
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       if (signal?.aborted) throw new AbortTurnError();
       // 外部取消与超时合并：任一触发即中止（Node 22 AbortSignal.any）；每次尝试重建超时，避免累加过期信号
       const timeoutSignal = AbortSignal.timeout(attemptTimeoutMs(this.cfg, attempt));
       const combined = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
       const model = req.model ?? this.cfg.model;
-      assertVisionReady(req, model);
+      const payload = withDeepSeekJsonOutput(withDeepSeekForcedToolDefault({
+        model,
+        messages: req.messages,
+        ...(req.tools?.length ? {
+          tools: req.tools,
+          ...(req.tool_choice === undefined ? {} : { tool_choice: req.tool_choice }),
+        } : {}),
+        temperature: req.temperature,
+        max_tokens: req.max_tokens,
+        stream: true,
+        ...req.extraBody,
+      }, endpoint), endpoint, req.deepseekJsonOutput);
+      if (!Array.isArray(payload.messages)) throw new OpenAICompatibleError('messages 必须为数组', 400);
+      assertOfficialDeepSeekVision(req, payload, endpoint);
+      assertVisionReady({ ...req, messages: payload.messages as ChatMessage[] }, String(payload.model ?? this.cfg.model), endpoint);
 
       let res: Response;
       try {
-        res = await fetch(`${this.base}/chat/completions`, {
+        res = await fetch(endpoint, {
           method: 'POST',
-          headers: this.headers(),
-          body: JSON.stringify({
-            model,
-            messages: req.messages,
-            ...(req.tools?.length ? { tools: req.tools } : {}),
-            temperature: req.temperature,
-            max_tokens: req.max_tokens,
-            stream: true,
-            ...req.extraBody,
-          }),
+          headers,
+          body: JSON.stringify(payload),
           signal: combined,
+          ...(this.strictLiveTransport || rejectRedirects || isOfficialDeepSeekEndpoint(endpoint) && hasImageContent(payload.messages as ChatMessage[])
+            ? { redirect: 'error' as const } : {}),
         });
       } catch (e) {
         // 网络层 / 超时中止：先区分用户取消（AbortTurnError）与瞬时故障（可重试）

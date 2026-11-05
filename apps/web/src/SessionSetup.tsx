@@ -55,7 +55,7 @@ export function SessionSetup({ storageNamespace, onCreated, onCardsChanged }: {
   const [mode, setMode] = useState<CreateMode>('nsfw');
   const [selectedBooks, setSelectedBooks] = useState<string[]>([]);
   const [preset, setPreset] = useState('');
-  const [style, setStyle] = useState('未指定文风');
+  const [style, setStyle] = useState('文风-底座-轻小说');
   const [styleSkills, setStyleSkills] = useState<{ name: string; description: string; default?: boolean }[] | null>(null);
   const [blocks, setBlocks] = useState<PresetBlock[] | null>(null);
   const [overrides, setOverrides] = useState<Record<number, boolean>>({});
@@ -87,7 +87,11 @@ export function SessionSetup({ storageNamespace, onCreated, onCardsChanged }: {
         setCards(c.cards ?? []);
         setWorldbooks(w.worldbooks ?? []);
         setPresets(p.presets ?? []);
-        const styleOpts = (sk.skills ?? []).filter((s: { role?: string }) => s.role === 'style');
+        // Agent Skill 仓库协议使用 `kind=style`；旧服务端仍只有 `role=style`。
+        // 同时接受两种 Header，避免仓库读模型升级后新建会话的文风下拉框变空。
+        const styleOpts = (sk.skills ?? []).filter((s: { kind?: string; role?: string }) => (
+          s.kind === 'style' || s.role === 'style'
+        ));
         setStyleSkills(styleOpts);
         // 回填上次新建配置（存在快照时优先；仅缺失条目/已删预设按存活过滤）
         let snap: SetupSnapshot | null = null;
@@ -116,9 +120,9 @@ export function SessionSetup({ storageNamespace, onCreated, onCardsChanged }: {
               setOverrides(o);
             }
           }
-        } else if (styleOpts.length > 0) {
-          const defaultStyle = styleOpts.find((item: { default?: boolean }) => item.default) ?? styleOpts[0];
-          setStyle(defaultStyle.name);
+        } else {
+          // 公开版不预置任何世界书：由使用者按自己的素材库显式勾选。
+          setSelectedBooks([]);
         }
       } catch (e) { setError((e as Error).message); }
       loadedRef.current = true;
@@ -398,12 +402,14 @@ export function SessionSetup({ storageNamespace, onCreated, onCardsChanged }: {
 
       {mode !== 'director' && (
         <section className="console-section">
-          <h3>文风（公开版不内置文风 Skill；导入后可在此选择）</h3>
+          <h3>文风（默认轻小说；随会话稳定注入 &lt;文风指令&gt;，可从文风库切换作者风格）</h3>
           <div className="console-bar">
             <select value={style} onChange={(e) => setStyle(e.target.value)} style={{ maxWidth: 360 }}>
-              {styleSkills && styleSkills.length > 0 ? styleSkills.map((s) => (
+              {styleSkills?.map((s) => (
                 <option key={s.name} value={s.name}>{s.default ? '★ 默认 · ' : ''}{s.description || s.name}</option>
-              )) : <option value="未指定文风">未指定文风</option>}
+              )) || (
+                <option value={style}>{style}</option>
+              )}
             </select>
             <span className="muted">导入文风库可在 Skill 面板触发</span>
           </div>

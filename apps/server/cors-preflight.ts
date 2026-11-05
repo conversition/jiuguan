@@ -80,6 +80,11 @@ function allowedHeaders(policy: RouteAccessPolicy, method: string): ReadonlySet<
     && (method === 'GET' || method === 'HEAD')) {
     allowed.add('range');
   }
+  if (policy.template === '/api/events' && method === 'GET') {
+    allowed.add('last-event-id');
+    allowed.add('x-jg-last-server-instance');
+    allowed.add('x-jg-task-event-version');
+  }
   return allowed;
 }
 

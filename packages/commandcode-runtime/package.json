@@ -12,7 +12,9 @@
     ".": "./dist/index.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json"
+    "build": "tsc -p tsconfig.json",
+    "test:types": "tsc -p tsconfig.tests.json",
+    "test": "node --experimental-strip-types --experimental-transform-types tests/verify-config.ts && node --experimental-strip-types --experimental-transform-types tests/verify-transport.ts && node --experimental-strip-types --experimental-transform-types tests/verify-node-transport.ts && node --experimental-strip-types --experimental-transform-types tests/verify-identity.ts && node --experimental-strip-types --experimental-transform-types tests/verify-runtime.ts && pnpm run test:types"
   },
   "dependencies": {}
 }

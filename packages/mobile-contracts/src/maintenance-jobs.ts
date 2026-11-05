@@ -5,6 +5,7 @@ export const MAINTENANCE_TASK_KINDS = [
   'branch_index',
   'rolling_summary',
   'npc_state',
+  'worldbook_repair',
 ] as const;
 export type MaintenanceTaskKind = typeof MAINTENANCE_TASK_KINDS[number];
 export const MAINTENANCE_TRIGGERS = ['post-turn', 'idle', 'manual'] as const;

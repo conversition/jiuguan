@@ -1,11 +1,19 @@
 import {
   AGENT_TEST_SESSION_WINDOW_CALLS,
   AGENT_ROLLOUT_LANES,
+  PLAYER_SOVEREIGNTY_ACTION_ALIAS_DEFECT_ID,
+  PLAYER_SOVEREIGNTY_POLICY_REVISION,
   narrowAgentRolloutState,
   type AgentRolloutLane,
 } from '../../packages/agent-policy/src/lane-rollout.ts';
-import type { AgentControlStore, AgentLaneControlRow } from './agent-control-store.ts';
 import {
+  KNOWN_DEFECT_CORRECTION_MIN_PROVIDER_CALLS,
+  KNOWN_DEFECT_CORRECTION_MAX_PROVIDER_CALLS,
+  type AgentControlStore,
+  type AgentLaneControlRow,
+} from './agent-control-store.ts';
+import {
+  AGENT_LANE_OPERATOR_OVERRIDE_ACK,
   AGENT_LANE_RECOVERY_ACK,
   AGENT_SUBCAPABILITY_IDS,
   type AgentSubcapabilityId,
@@ -15,6 +23,8 @@ import {
 import type { LearnedStyleProposalStore } from '../../packages/core/src/learned-style-store.ts';
 
 export const AGENT_CONTROL_MUTATION_ACK = 'p14-agent-control-mutation-v1' as const;
+export const AGENT_KNOWN_DEFECT_CORRECTION_ACK =
+  'p14-interactive-action-alias-correction-v1' as const;
 export { AGENT_LANE_RECOVERY_ACK };
 
 export interface AgentControlMutationRuntimeConfig {
@@ -37,9 +47,32 @@ export type AgentControlMutation =
       readonly operation: 'recover';
       readonly lane: AgentRolloutLane;
       readonly expectedRevision: string;
+      readonly expectedWindowSequence: number;
       readonly evidenceDigest: string;
       readonly maxProviderCalls: number;
       readonly acknowledgement: typeof AGENT_LANE_RECOVERY_ACK;
+    }
+  | {
+      /**
+       * Operator override of a quality stop. Used only when the evidence-bound recovery is
+       * structurally unreachable (the lane is stopped, so it cannot generate passing evidence).
+       * Permanent safety stops are never eligible.
+       */
+      readonly operation: 'operator-override-quality-kill';
+      readonly lane: AgentRolloutLane;
+      readonly expectedRevision: string;
+      readonly acknowledgement: typeof AGENT_LANE_OPERATOR_OVERRIDE_ACK;
+      readonly reopenTo: 'off' | 'shadow' | 'test-session';
+    }
+  | {
+      readonly operation: 'correct-known-interactive-sovereignty-defect';
+      readonly lane: 'interactive';
+      readonly defectId: typeof PLAYER_SOVEREIGNTY_ACTION_ALIAS_DEFECT_ID;
+      readonly fixedPolicyRevision: typeof PLAYER_SOVEREIGNTY_POLICY_REVISION;
+      readonly expectedRevision: string;
+      readonly expectedWindowSequence: number;
+      readonly maxProviderCalls: number;
+      readonly acknowledgement: typeof AGENT_KNOWN_DEFECT_CORRECTION_ACK;
     }
   | {
       readonly operation: 'downgrade';
@@ -222,7 +255,7 @@ export function parseAgentControlMutation(value: unknown): AgentControlMutation 
   }
   if (row.operation === 'recover') {
     exactKeys(row, [
-      'operation', 'lane', 'expectedRevision', 'evidenceDigest',
+      'operation', 'lane', 'expectedRevision', 'expectedWindowSequence', 'evidenceDigest',
       'maxProviderCalls', 'acknowledgement',
     ]);
     if (row.acknowledgement !== AGENT_LANE_RECOVERY_ACK) {
@@ -237,13 +270,63 @@ export function parseAgentControlMutation(value: unknown): AgentControlMutation 
       || Number(row.maxProviderCalls) > AGENT_TEST_SESSION_WINDOW_CALLS[recoveryLane]) {
       throw new Error('lane-recovery-max-provider-calls-invalid');
     }
+    if (!Number.isSafeInteger(row.expectedWindowSequence)
+      || Number(row.expectedWindowSequence) < 1) {
+      throw new Error('authorization-window-sequence-invalid');
+    }
     return Object.freeze({
       operation: 'recover',
       lane: recoveryLane,
       expectedRevision: revision(row.expectedRevision),
+      expectedWindowSequence: Number(row.expectedWindowSequence),
       evidenceDigest: row.evidenceDigest,
       maxProviderCalls: Number(row.maxProviderCalls),
       acknowledgement: AGENT_LANE_RECOVERY_ACK,
+    });
+  }
+  if (row.operation === 'operator-override-quality-kill') {
+    exactKeys(row, ['operation', 'lane', 'expectedRevision', 'acknowledgement', 'reopenTo']);
+    if (row.acknowledgement !== AGENT_LANE_OPERATOR_OVERRIDE_ACK) {
+      throw new Error('operator-override-acknowledgement-invalid');
+    }
+    const reopenTo = row.reopenTo;
+    if (reopenTo !== 'off' && reopenTo !== 'shadow' && reopenTo !== 'test-session') {
+      throw new Error('operator-override-reopen-state-invalid');
+    }
+    return Object.freeze({
+      operation: 'operator-override-quality-kill',
+      lane: lane(row.lane),
+      expectedRevision: revision(row.expectedRevision),
+      acknowledgement: AGENT_LANE_OPERATOR_OVERRIDE_ACK,
+      reopenTo,
+    });
+  }
+  if (row.operation === 'correct-known-interactive-sovereignty-defect') {
+    exactKeys(row, [
+      'operation', 'lane', 'defectId', 'fixedPolicyRevision', 'expectedRevision',
+      'expectedWindowSequence', 'maxProviderCalls', 'acknowledgement',
+    ]);
+    if (row.lane !== 'interactive'
+      || row.defectId !== PLAYER_SOVEREIGNTY_ACTION_ALIAS_DEFECT_ID
+      || row.fixedPolicyRevision !== PLAYER_SOVEREIGNTY_POLICY_REVISION
+      || row.acknowledgement !== AGENT_KNOWN_DEFECT_CORRECTION_ACK) {
+      throw new Error('known-defect-correction-invalid');
+    }
+    if (!Number.isSafeInteger(row.expectedWindowSequence) || Number(row.expectedWindowSequence) < 1
+      || !Number.isSafeInteger(row.maxProviderCalls)
+      || Number(row.maxProviderCalls) < KNOWN_DEFECT_CORRECTION_MIN_PROVIDER_CALLS
+      || Number(row.maxProviderCalls) > KNOWN_DEFECT_CORRECTION_MAX_PROVIDER_CALLS) {
+      throw new Error('known-defect-correction-invalid');
+    }
+    return Object.freeze({
+      operation: 'correct-known-interactive-sovereignty-defect',
+      lane: 'interactive',
+      defectId: PLAYER_SOVEREIGNTY_ACTION_ALIAS_DEFECT_ID,
+      fixedPolicyRevision: PLAYER_SOVEREIGNTY_POLICY_REVISION,
+      expectedRevision: revision(row.expectedRevision),
+      expectedWindowSequence: Number(row.expectedWindowSequence),
+      maxProviderCalls: Number(row.maxProviderCalls),
+      acknowledgement: AGENT_KNOWN_DEFECT_CORRECTION_ACK,
     });
   }
   if (row.operation === 'downgrade') {
@@ -353,13 +436,18 @@ export function parseAgentControlMutation(value: unknown): AgentControlMutation 
   throw new Error('agent-control-mutation-invalid');
 }
 
-/** Applies only fail-safe transitions. Raising a lane remains CLI/operator-review only. */
+/**
+ * Applies fail-safe transitions. The sole upward exception is the fixed, evidence-bound known
+ * defect correction; it cannot target another lane/reason and reopens only test-session.
+ */
 export function applyAgentControlMutation(
   store: AgentControlStore,
   mutation: AgentControlMutation,
   resources: { readonly styleProposals?: LearnedStyleProposalStore } = {},
 ): AgentLaneControlRow | ReturnType<AgentControlStore['capabilityControl']>
   | ReturnType<AgentControlStore['recoverQualityKillCas']>
+  | ReturnType<AgentControlStore['operatorOverrideQualityKillCas']>
+  | ReturnType<AgentControlStore['correctKnownInteractiveSovereigntyFalsePositiveAndReopenCas']>
   | ReturnType<LearnedStyleProposalStore['read']> {
   if (mutation.operation === 'kill') {
     return store.killCas(mutation.lane, mutation.reasonCode, mutation.expectedRevision);
@@ -371,8 +459,20 @@ export function applyAgentControlMutation(
     return store.recoverQualityKillCas({
       lane: mutation.lane,
       expectedRevision: mutation.expectedRevision,
+      expectedWindowSequence: mutation.expectedWindowSequence,
       evidenceDigest: mutation.evidenceDigest,
       maxProviderCalls: mutation.maxProviderCalls,
+    });
+  }
+  if (mutation.operation === 'correct-known-interactive-sovereignty-defect') {
+    return store.correctKnownInteractiveSovereigntyFalsePositiveAndReopenCas(mutation);
+  }
+  if (mutation.operation === 'operator-override-quality-kill') {
+    return store.operatorOverrideQualityKillCas({
+      lane: mutation.lane,
+      expectedRevision: mutation.expectedRevision,
+      acknowledgement: mutation.acknowledgement,
+      reopenTo: mutation.reopenTo,
     });
   }
   if (mutation.operation === 'kill-capability') {

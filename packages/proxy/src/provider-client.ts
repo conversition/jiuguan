@@ -166,6 +166,7 @@ export class RegistryProviderClient implements ChatCompletionClient {
       ...(call?.maxTransportAttempts !== undefined
         ? { maxTransportAttempts: call.maxTransportAttempts }
         : {}),
+      ...(call?.beforeAdapterDispatch !== undefined ? { beforeAdapterDispatch: call.beforeAdapterDispatch } : {}),
     };
   }
 }

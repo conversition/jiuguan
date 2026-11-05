@@ -15,7 +15,7 @@
  *   - matchSkills(query) 并行匹配用户输入 vs 各 skill 描述 → 命中的 skill 正文
  */
 import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
-import { join, basename } from 'node:path';
+import { join, basename, dirname, relative, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 import {
   createWholeSkillAdmission,
@@ -40,6 +40,8 @@ export interface SkillInfo {
   enabled: boolean;
   /** SKILL.md 路径 */
   path: string;
+  /** Exact digest of the complete SKILL.md bytes that produced this metadata snapshot. */
+  documentIdentityDigest: string;
   /** 文风层(style) / 战术层(tactical)：区分文风指令与战术技能 */
   role?: string;
   /** 会话默认文风底座 */
@@ -54,6 +56,113 @@ export interface SkillInfo {
   styleId?: string;
   /** 自动战术 Skill 互斥组；同组每轮最多准入一个。 */
   conflictGroup?: string;
+  /** 通用 Agent Skill Header。旧 Skill 可省略，由兼容读模型推导。 */
+  kind?: 'foundation' | 'policy' | 'procedure' | 'style' | 'validator';
+  /** 领域稳定标识，例如 style / story / arc / npc / memory。 */
+  domain?: string;
+  /** 允许消费该 Skill 的 Agent capability id。 */
+  capabilityIds: string[];
+  /** 允许消费该 Skill 的 Agent task kind。 */
+  taskKinds: string[];
+  /** plan / execute / validate / learn。 */
+  phases: string[];
+  /** nsf / nsfw；空数组表示旧数据尚未声明，而不是允许全部。 */
+  contentModes: string[];
+  /** 作用域上限。 */
+  scopeLevel?: 'session' | 'card' | 'global' | 'world';
+  /** 非 global Skill 的精确作用域选择器；不得暴露到公共仓库读模型。 */
+  scopeSelector?: string;
+  /** Skill 本身的风险标签；不授予写权限。 */
+  risk?: 'advisory' | 'proposal' | 'write';
+  /** 候选发布状态；legacy 数据缺省由服务端兼容层推导。 */
+  lifecycle?: string;
+  /** builtin / filesystem / imported / learned；旧值由服务端兼容层归一化。 */
+  sourceType?: string;
+  /** 领域评估器稳定 id。 */
+  evaluatorId?: string;
+  /** 不可变候选的父版本摘要。 */
+  parentDigest?: string;
+  /** 依赖 Skill id，仅作为 DAG 约束，不会隐式装载。 */
+  requiresSkills: string[];
+  /** Skill 希望使用的工具；最终必须与 Ticket 白名单取交集。 */
+  desiredTools: string[];
+}
+
+export interface SkillDocumentSnapshot {
+  readonly skill: SkillInfo;
+  readonly body: string;
+  readonly documentIdentityDigest: string;
+}
+
+/** Raised when a caller tries to mutate a document that no longer matches its reviewed snapshot. */
+export class SkillDocumentRevisionConflictError extends Error {
+  readonly code = 'skill-document-revision-stale' as const;
+
+  constructor() {
+    super('Skill document changed after it was reviewed');
+    this.name = 'SkillDocumentRevisionConflictError';
+  }
+}
+
+export type SkillScopeDigestKind = 'session' | 'card' | 'world';
+
+/**
+ * Domain-separated opaque selector shared by live Sessions and filesystem manifests.
+ * Raw session/card/world identifiers must never cross the shadow-observer boundary.
+ */
+export function skillScopeIdentityDigest(kind: SkillScopeDigestKind, rawSelector: string): string {
+  if (kind !== 'session' && kind !== 'card' && kind !== 'world') {
+    throw new TypeError('Skill scope digest kind is invalid');
+  }
+  if (typeof rawSelector !== 'string') throw new TypeError('Skill scope selector must be a string');
+  const normalized = rawSelector.normalize('NFC').trim();
+  if (normalized.length < 1 || normalized.length > 4_096) {
+    throw new TypeError('Skill scope selector must be non-empty and bounded');
+  }
+  return `sha256:${createHash('sha256')
+    .update(`jiuguan.agent-skill.scope.v1\u0000${kind}\u0000${normalized}`, 'utf8')
+    .digest('hex')}`;
+}
+
+export function skillDocumentIdentityDigest(raw: string): string {
+  return `sha256:${createHash('sha256')
+    .update('jiuguan.agent-skill.document.v1\u0000', 'utf8')
+    .update(raw, 'utf8')
+    .digest('hex')}`;
+}
+
+function assertSnapshotPathInsideRoot(snapshot: SkillDocumentSnapshot, dir: string): void {
+  const root = resolve(dir);
+  const documentPath = resolve(snapshot.skill.path);
+  const skillDir = dirname(documentPath);
+  const relativeSkillDir = relative(root, skillDir);
+  if (basename(documentPath).toLocaleLowerCase('en-US') !== 'skill.md'
+    || relativeSkillDir.length < 1
+    || relativeSkillDir.startsWith('..')
+    || relativeSkillDir.includes('/')
+    || relativeSkillDir.includes('\\')) {
+    throw new TypeError('Skill snapshot path is outside the configured catalog root');
+  }
+}
+
+function readReviewedSkillDocument(
+  snapshot: SkillDocumentSnapshot,
+  dir: string,
+): { readonly meta: Record<string, string>; readonly body: string } {
+  assertSnapshotPathInsideRoot(snapshot, dir);
+  let raw: string;
+  try {
+    raw = readFileSync(snapshot.skill.path, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw new SkillDocumentRevisionConflictError();
+    }
+    throw error;
+  }
+  if (skillDocumentIdentityDigest(raw) !== snapshot.documentIdentityDigest) {
+    throw new SkillDocumentRevisionConflictError();
+  }
+  return parseSkillMd(raw);
 }
 
 /** 解析 SKILL.md：frontmatter（--- 包裹的 key: value）+ 正文 */
@@ -93,46 +202,86 @@ function parseKeywords(meta: Record<string, string>): string[] {
     .filter(Boolean);
 }
 
+/** Flat frontmatter keeps legacy SKILL.md human-editable; list fields use CSV. */
+function parseCsv(meta: Record<string, string>, key: string): string[] {
+  return (meta[key] ?? '')
+    .split(/[,，]/u)
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
 /** 解析布尔 frontmatter 字段（缺省 undefined） */
 function parseBool(v: string | undefined): boolean | undefined {
   return v === undefined ? undefined : v === 'true';
 }
 
 /** 从 frontmatter 提取扩展字段（供 setSkillEnabled 等重写时透传，避免丢失） */
-const EXTRA_KEYS = ['role', 'default', 'nsfw', 'source', 'sourceHash', 'styleId', 'conflictGroup'] as const;
+const EXTRA_KEYS = [
+  'role', 'default', 'nsfw', 'source', 'sourceHash', 'styleId', 'conflictGroup',
+  'kind', 'domain', 'capabilityIds', 'taskKinds', 'phases', 'contentModes',
+  'scopeLevel', 'scopeSelector', 'risk', 'lifecycle', 'sourceType', 'evaluatorId', 'parentDigest',
+  'requiresSkills', 'desiredTools',
+] as const;
 function extraFromMeta(meta: Record<string, string>): Record<string, string> {
   const out: Record<string, string> = {};
   for (const k of EXTRA_KEYS) if (meta[k] !== undefined) out[k] = meta[k];
   return out;
 }
 
-/** 扫描 data/skills 下的 skill 目录（各含 SKILL.md），返回全部 skill（按名称排序） */
-export function listSkills(dir = DEFAULT_SKILLS_DIR): SkillInfo[] {
+export function skillDocumentSnapshot(entryName: string, mdPath: string, raw: string): SkillDocumentSnapshot {
+  const { meta, body } = parseSkillMd(raw);
+  const documentIdentityDigest = skillDocumentIdentityDigest(raw);
+  const skill: SkillInfo = {
+    name: meta.name ?? entryName,
+    description: meta.description ?? '',
+    keywords: parseKeywords(meta),
+    version: meta.version ?? '1.0',
+    enabled: meta.enabled !== 'false',
+    path: mdPath,
+    documentIdentityDigest,
+    role: meta.role,
+    default: parseBool(meta.default),
+    nsfw: parseBool(meta.nsfw),
+    source: meta.source,
+    sourceHash: meta.sourceHash,
+    styleId: meta.styleId,
+    conflictGroup: meta.conflictGroup,
+    kind: meta.kind as SkillInfo['kind'],
+    domain: meta.domain,
+    capabilityIds: parseCsv(meta, 'capabilityIds'),
+    taskKinds: parseCsv(meta, 'taskKinds'),
+    phases: parseCsv(meta, 'phases'),
+    contentModes: parseCsv(meta, 'contentModes'),
+    scopeLevel: meta.scopeLevel as SkillInfo['scopeLevel'],
+    scopeSelector: meta.scopeSelector,
+    risk: meta.risk as SkillInfo['risk'],
+    lifecycle: meta.lifecycle,
+    sourceType: meta.sourceType,
+    evaluatorId: meta.evaluatorId,
+    parentDigest: meta.parentDigest,
+    requiresSkills: parseCsv(meta, 'requiresSkills'),
+    desiredTools: parseCsv(meta, 'desiredTools'),
+  };
+  return Object.freeze({ skill: Object.freeze(skill), body, documentIdentityDigest });
+}
+
+/** Read every SKILL.md exactly once so metadata, body and document identity cannot be mixed. */
+export function listSkillDocuments(dir = DEFAULT_SKILLS_DIR): SkillDocumentSnapshot[] {
   if (!existsSync(dir)) return [];
-  const out: SkillInfo[] = [];
+  const out: SkillDocumentSnapshot[] = [];
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;
     const mdPath = join(dir, entry.name, 'SKILL.md');
     if (!existsSync(mdPath)) continue;
     const raw = readFileSync(mdPath, 'utf8');
-    const { meta } = parseSkillMd(raw);
-    out.push({
-      name: meta.name ?? entry.name,
-      description: meta.description ?? '',
-      keywords: parseKeywords(meta),
-      version: meta.version ?? '1.0',
-      enabled: meta.enabled !== 'false',
-      path: mdPath,
-      role: meta.role,
-      default: parseBool(meta.default),
-      nsfw: parseBool(meta.nsfw),
-      source: meta.source,
-      sourceHash: meta.sourceHash,
-      styleId: meta.styleId,
-      conflictGroup: meta.conflictGroup,
-    });
+    out.push(skillDocumentSnapshot(entry.name, mdPath, raw));
   }
-  return out.sort((a, b) => a.name.localeCompare(b.name, 'zh'));
+  return out.sort((a, b) => a.skill.name.localeCompare(b.skill.name, 'zh'));
+}
+
+/** 扫描 data/skills 下的 skill 目录（各含 SKILL.md），返回全部 skill（按名称排序） */
+export function listSkills(dir = DEFAULT_SKILLS_DIR): SkillInfo[] {
+  return listSkillDocuments(dir).map((snapshot) => snapshot.skill);
 }
 
 /** 新增 skill：写 data/skills/<name>/SKILL.md（目录已存在则更新） */
@@ -140,6 +289,10 @@ export function addSkill(
   input: {
     name: string; description: string; content: string; keywords?: string[]; version?: string; enabled?: boolean;
     role?: string; default?: boolean; nsfw?: boolean; source?: string; sourceHash?: string; styleId?: string; conflictGroup?: string;
+    kind?: SkillInfo['kind']; domain?: string; capabilityIds?: string[]; taskKinds?: string[]; phases?: string[];
+    contentModes?: string[]; scopeLevel?: SkillInfo['scopeLevel']; scopeSelector?: string;
+    risk?: SkillInfo['risk']; lifecycle?: string;
+    sourceType?: string; evaluatorId?: string; parentDigest?: string; requiresSkills?: string[]; desiredTools?: string[];
   },
   dir = DEFAULT_SKILLS_DIR,
 ): SkillInfo {
@@ -161,12 +314,26 @@ export function addSkill(
   if (input.sourceHash) extra.sourceHash = input.sourceHash;
   if (input.styleId) extra.styleId = input.styleId;
   if (input.conflictGroup) extra.conflictGroup = input.conflictGroup;
-  writeFileSync(mdPath, renderSkillMd(name, input.description.trim(), input.version ?? '1.0', input.enabled ?? true, body, keywords, extra), 'utf8');
-  return {
-    name, description: input.description.trim(), keywords, version: input.version ?? '1.0', enabled: input.enabled ?? true, path: mdPath,
-    role: input.role, default: input.default, nsfw: input.nsfw, source: input.source, sourceHash: input.sourceHash, styleId: input.styleId,
-    conflictGroup: input.conflictGroup,
-  };
+  if (input.kind) extra.kind = input.kind;
+  if (input.domain) extra.domain = input.domain;
+  if (input.capabilityIds?.length) extra.capabilityIds = input.capabilityIds.join(',');
+  if (input.taskKinds?.length) extra.taskKinds = input.taskKinds.join(',');
+  if (input.phases?.length) extra.phases = input.phases.join(',');
+  if (input.contentModes?.length) extra.contentModes = input.contentModes.join(',');
+  if (input.scopeLevel) extra.scopeLevel = input.scopeLevel;
+  if (input.scopeSelector) extra.scopeSelector = input.scopeSelector;
+  if (input.risk) extra.risk = input.risk;
+  if (input.lifecycle) extra.lifecycle = input.lifecycle;
+  if (input.sourceType) extra.sourceType = input.sourceType;
+  if (input.evaluatorId) extra.evaluatorId = input.evaluatorId;
+  if (input.parentDigest) extra.parentDigest = input.parentDigest;
+  if (input.requiresSkills?.length) extra.requiresSkills = input.requiresSkills.join(',');
+  if (input.desiredTools?.length) extra.desiredTools = input.desiredTools.join(',');
+  const raw = renderSkillMd(
+    name, input.description.trim(), input.version ?? '1.0', input.enabled ?? true, body, keywords, extra,
+  );
+  writeFileSync(mdPath, raw, 'utf8');
+  return skillDocumentSnapshot(name, mdPath, raw).skill;
 }
 
 /** 启停 */
@@ -175,8 +342,37 @@ export function setSkillEnabled(name: string, enabled: boolean, dir = DEFAULT_SK
   if (!skill) throw new Error(`技能不存在: ${name}`);
   const { meta, body } = parseSkillMd(readFileSync(skill.path, 'utf8'));
   // 透传扩展元数据，避免启停重写时丢失 role/default/nsfw/source/sourceHash/styleId
-  writeFileSync(skill.path, renderSkillMd(meta.name ?? name, meta.description ?? '', meta.version ?? '1.0', enabled, body, parseKeywords(meta), extraFromMeta(meta)), 'utf8');
-  return { ...skill, enabled };
+  const raw = renderSkillMd(
+    meta.name ?? name, meta.description ?? '', meta.version ?? '1.0', enabled,
+    body, parseKeywords(meta), extraFromMeta(meta),
+  );
+  writeFileSync(skill.path, raw, 'utf8');
+  return skillDocumentSnapshot(meta.name ?? name, skill.path, raw).skill;
+}
+
+/**
+ * Enable or disable exactly the document that a caller reviewed.
+ *
+ * The full-document digest prevents a permission decision made from one header from being
+ * applied to a newer document with different provenance or ownership metadata.
+ */
+export function setSkillEnabledFromSnapshot(
+  snapshot: SkillDocumentSnapshot,
+  enabled: boolean,
+  dir = DEFAULT_SKILLS_DIR,
+): SkillInfo {
+  const { meta, body } = readReviewedSkillDocument(snapshot, dir);
+  const raw = renderSkillMd(
+    meta.name ?? snapshot.skill.name,
+    meta.description ?? '',
+    meta.version ?? '1.0',
+    enabled,
+    body,
+    parseKeywords(meta),
+    extraFromMeta(meta),
+  );
+  writeFileSync(snapshot.skill.path, raw, 'utf8');
+  return skillDocumentSnapshot(meta.name ?? snapshot.skill.name, snapshot.skill.path, raw).skill;
 }
 
 /** 删除（仅删用户层目录） */
@@ -186,30 +382,24 @@ export function deleteSkill(name: string, dir = DEFAULT_SKILLS_DIR): void {
   rmSync(skill.dir, { recursive: true, force: true });
 }
 
+/** Delete exactly the reviewed Skill document, failing closed when its revision drifted. */
+export function deleteSkillFromSnapshot(
+  snapshot: SkillDocumentSnapshot,
+  dir = DEFAULT_SKILLS_DIR,
+): void {
+  readReviewedSkillDocument(snapshot, dir);
+  rmSync(dirname(snapshot.skill.path), { recursive: true, force: true });
+}
+
 export function findSkill(name: string, dir = DEFAULT_SKILLS_DIR): (SkillInfo & { dir: string }) | null {
   if (!existsSync(dir)) return null;
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;
     const mdPath = join(dir, entry.name, 'SKILL.md');
     if (!existsSync(mdPath)) continue;
-    const { meta } = parseSkillMd(readFileSync(mdPath, 'utf8'));
-    if ((meta.name ?? entry.name) === name) {
-      return {
-        name: meta.name ?? entry.name,
-        description: meta.description ?? '',
-        keywords: parseKeywords(meta),
-        version: meta.version ?? '1.0',
-        enabled: meta.enabled !== 'false',
-        path: mdPath,
-        dir: join(dir, entry.name),
-        role: meta.role,
-        default: parseBool(meta.default),
-        nsfw: parseBool(meta.nsfw),
-        source: meta.source,
-        sourceHash: meta.sourceHash,
-        styleId: meta.styleId,
-        conflictGroup: meta.conflictGroup,
-      };
+    const snapshot = skillDocumentSnapshot(entry.name, mdPath, readFileSync(mdPath, 'utf8'));
+    if (snapshot.skill.name === name) {
+      return { ...snapshot.skill, dir: join(dir, entry.name) };
     }
   }
   return null;
@@ -217,10 +407,7 @@ export function findSkill(name: string, dir = DEFAULT_SKILLS_DIR): (SkillInfo & 
 
 /** 读取 skill 指令正文 */
 export function readSkillBody(name: string, dir = DEFAULT_SKILLS_DIR): string {
-  const skill = findSkill(name, dir);
-  if (!skill) return '';
-  const { body } = parseSkillMd(readFileSync(skill.path, 'utf8'));
-  return body;
+  return listSkillDocuments(dir).find((snapshot) => snapshot.skill.name === name)?.body ?? '';
 }
 
 /** 语义匹配：字符 n-gram 余弦（零依赖；description 较短时足够区分意图） */
@@ -256,11 +443,14 @@ export function matchSkills(
   opts: { dir?: string; threshold?: number; topK?: number; onlyEnabled?: boolean } = {},
 ): SkillMatch[] {
   const { dir, threshold = 0.18, topK = 3, onlyEnabled = true } = opts;
-  const skills = listSkills(dir).filter((s) => (onlyEnabled ? s.enabled : true) && s.role !== DEFAULT_STYLE_ROLE);
-  if (skills.length === 0) return [];
+  const documents = listSkillDocuments(dir).filter((snapshot) => (
+    (onlyEnabled ? snapshot.skill.enabled : true) && snapshot.skill.role !== DEFAULT_STYLE_ROLE
+  ));
+  if (documents.length === 0) return [];
   const qv = ngramVec(query);
   const scored: SkillMatch[] = [];
-  for (const skill of skills) {
+  for (const document of documents) {
+    const { skill, body } = document;
     // 通道①：关键词命中（任一触发词出现在输入中 → 强相关）
     let score = 0;
     let selectionReason: SkillMatch['selectionReason'] = 'semantic';
@@ -272,7 +462,7 @@ export function matchSkills(
       score = cosine(qv, ngramVec(skill.description));
     }
     if (score >= threshold) {
-      scored.push({ skill, score, body: readSkillBody(skill.name, dir), selectionReason });
+      scored.push({ skill, score, body, selectionReason });
     }
   }
   return scored.sort((a, b) => b.score - a.score).slice(0, topK);

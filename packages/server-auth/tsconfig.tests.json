@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "../..",
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "declaration": false
+  },
+  "include": [
+    "src/**/*",
+    "tests/**/*",
+    "../mobile-contracts/src/**/*"
+  ]
+}

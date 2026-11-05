@@ -89,9 +89,10 @@ export function createOpenAIProviderController(
 
     async complete(request, ctx) {
       const activeClient = client;
-      return activeClient.complete(request, ctx.signal, ctx.maxTransportAttempts === undefined
+      return activeClient.complete(request, ctx.signal, ctx.maxTransportAttempts === undefined && ctx.runId === undefined
         ? undefined
-        : { maxTransportAttempts: ctx.maxTransportAttempts });
+        : { ...(ctx.maxTransportAttempts === undefined ? {} : { maxTransportAttempts: ctx.maxTransportAttempts }),
+            ...(ctx.runId === undefined ? {} : { runId: ctx.runId }) });
     },
 
     async stream(request, sink, ctx) {
@@ -116,9 +117,10 @@ export function createOpenAIProviderController(
           });
         },
         ctx.signal,
-        ctx.maxTransportAttempts === undefined
+        ctx.maxTransportAttempts === undefined && ctx.runId === undefined
           ? undefined
-          : { maxTransportAttempts: ctx.maxTransportAttempts },
+          : { ...(ctx.maxTransportAttempts === undefined ? {} : { maxTransportAttempts: ctx.maxTransportAttempts }),
+              ...(ctx.runId === undefined ? {} : { runId: ctx.runId }) },
       );
     },
 

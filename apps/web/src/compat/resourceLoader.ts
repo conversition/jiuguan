@@ -206,7 +206,7 @@ export function planResourceRewrite(
 /**
  * 外部前端页的**相对引用**解析（FE-04.0 资源边界）。
  *
- * 卡自带外部页（如 `.../external-page/index.html`）由服务端代理抓成文本后注入 srcdoc ——
+ * 卡自带外部页（如 `.../sample-phone-host/index.html`）由服务端代理抓成文本后注入 srcdoc ——
  * 此时页面自身没有 base URL，`./style.css`、`img/x.png`、`../shared/a.js` 都会落到宿主源上（404）。
  * 因此按**原页面 URL** 把相对引用绝对化，再由 planResourceRewrite 统一转同源代理。
  *

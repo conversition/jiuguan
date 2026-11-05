@@ -39,6 +39,27 @@ export {
   expandVariables,
 } from './assembly.ts';
 export type { AssembleInput, AssembleResult, Message } from './assembly.ts';
+export {
+  AGENT_SKILL_COMPILER_VERSION,
+  AGENT_SKILL_COMPILER_REVISION,
+  AGENT_SKILL_PRIMITIVE_REGISTRY_DIGEST,
+  AGENT_SKILL_PROGRAM_JSON_SCHEMA,
+  AGENT_SKILL_PROGRAM_INVALID_REASONS,
+  assessAgentSkillProgramCompatibility,
+  validateAgentSkillProgramPrimitives,
+  compileAgentSkillPrograms,
+  verifyCompiledAgentSkillArtifact,
+} from './agent-skill-compiler.ts';
+export type {
+  AgentSkillCompilationRequestV1,
+  AgentSkillProgramInvalidReason,
+  AgentSkillProgramCompatibility,
+  AgentSkillCompiledProgramTraceV1,
+  AgentSkillPromptSlotKindV1,
+  AgentSkillPromptSlotV1,
+  AgentSkillValidatorPlanEntryV1,
+  CompiledAgentSkillArtifactV1,
+} from './agent-skill-compiler.ts';
 export { planTurnContextBudget, CONTEXT_BUDGET_PLAN_VERSION } from './context-plan.ts';
 export type {
   ContextModelProfile,

@@ -20,10 +20,15 @@ export const MODEL_CALL_LANES = Object.freeze([
   'video_prompt',
   'maintenance',
   'style_compile',
+  'skill_compile',
+  'skill_evaluate',
+  'skill_sample',
+  'skill_quality',
   'preference',
   'arc',
   'npc',
   'critic',
+  'rp_child_analysis',
   'unclassified',
 ] as const satisfies readonly ModelCallLane[]);
 

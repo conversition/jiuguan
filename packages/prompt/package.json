@@ -9,12 +9,15 @@
     ".": "./dist/index.js",
     "./turn": "./dist/turn.js",
     "./assembly": "./dist/assembly.js",
+    "./agent-skill-compiler": "./dist/agent-skill-compiler.js",
     "./context-plan": "./dist/context-plan.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json"
+    "build": "tsc -p tsconfig.json",
+    "test": "node --experimental-strip-types --experimental-transform-types tests/verify.ts && node --experimental-strip-types --experimental-transform-types tests/verify-turn-repair.ts && node --experimental-strip-types --experimental-transform-types tests/verify-agent-skill-compiler.ts && node --experimental-strip-types --experimental-transform-types tests/verify-skill-program-contract.ts && node --experimental-strip-types --experimental-transform-types tests/verify-context-plan.ts && node --experimental-strip-types --experimental-transform-types tests/verify-context-recovery-scale.ts && node --experimental-strip-types --experimental-transform-types tests/verify-rp-query-context.ts"
   },
   "dependencies": {
+    "@jiuguan/skill-hub": "workspace:*",
     "zod": "^4.4.3"
   }
 }

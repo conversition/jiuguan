@@ -1,7 +1,7 @@
 /**
  * 世界书 ⇄ TavernHelper 形状桥接（FE-02）
  *
- * 卡（示例卡 开场页）按 **TavernHelper 形状**使用世界书：
+ * 卡（WuWa 开场页）按 **TavernHelper 形状**使用世界书：
  *   uid（稳定标识，回写靠它匹配）/ name（= ST 的 comment）/ key（关键词数组）/ content / enabled
  * 磁盘上的世界书文件是 **ST v1.12 原生形状**：
  *   id / comment / keys / enabled / constant / position / extensions ...

@@ -12,7 +12,8 @@
     ".": "./dist/index.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json"
+    "build": "tsc -p tsconfig.json",
+    "test": "node --experimental-strip-types --experimental-transform-types tests/verify.ts && node --experimental-strip-types --experimental-transform-types tests/verify-requests.ts && node --experimental-strip-types --experimental-transform-types tests/verify-responses.ts && node --experimental-strip-types --experimental-transform-types tests/verify-streams.ts"
   },
   "dependencies": {}
 }

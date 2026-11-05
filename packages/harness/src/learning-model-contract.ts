@@ -1,7 +1,8 @@
 import { PROMPT_PREFERENCE_ALLOWED_TOKENS } from '../../agent-policy/src/prompt-preference.ts';
 import {
   STYLE_DRAFT_TOOL_NAME,
-} from '../../agent-policy/src/style-compiler.ts';
+  STYLE_DRAFT_NAME_PATTERN,
+} from '../../agent-policy/public/style-compiler.ts';
 import type { SemanticBranchCandidate } from '../../agent-policy/src/branch-preference.ts';
 import type { ChatRequest } from '../../proxy/src/client.ts';
 
@@ -86,19 +87,11 @@ export function buildBranchAttributionModelRequest(input: {
   });
 }
 
-export function buildStyleCompilationModelRequest(input: {
-  readonly profileVersion: string;
-  readonly samples: readonly { readonly sourceRevision: string; readonly prose: string }[];
-  readonly maxOutputTokens?: number;
-}): ChatRequest {
-  const sampleChars = input.samples.reduce((sum, sample) => sum + sample.prose.length, 0);
-  if (typeof input.profileVersion !== 'string' || input.profileVersion.length < 1
-    || input.profileVersion.length > 240 || input.samples.length < 1 || input.samples.length > 8
-    || sampleChars > 100_000 || input.samples.some((sample) => (
-      typeof sample.sourceRevision !== 'string' || sample.sourceRevision.length < 1
-      || sample.sourceRevision.length > 240 || typeof sample.prose !== 'string' || sample.prose.length < 1
-    ))) throw new Error('style-compilation-input-invalid');
-  const tools: Record<string, unknown>[] = [{
+export const STYLE_COMPILATION_TOOL_SURFACE_VERSION = 'style-compilation-native-tools-v1' as const;
+
+/** The Provider request and read-only inventory use the same output-submission schema. */
+export function styleCompilationNativeTools(): readonly Record<string, unknown>[] {
+  return [{
     type: 'function',
     function: {
       name: STYLE_DRAFT_TOOL_NAME,
@@ -108,7 +101,7 @@ export function buildStyleCompilationModelRequest(input: {
         additionalProperties: false,
         required: ['name', 'description', 'keywords', 'body'],
         properties: {
-          name: { type: 'string', minLength: 1, maxLength: 80 },
+          name: { type: 'string', minLength: 1, maxLength: 80, pattern: STYLE_DRAFT_NAME_PATTERN },
           description: { type: 'string', minLength: 12, maxLength: 500 },
           keywords: {
             type: 'array',
@@ -126,6 +119,21 @@ export function buildStyleCompilationModelRequest(input: {
       },
     },
   }];
+}
+
+export function buildStyleCompilationModelRequest(input: {
+  readonly profileVersion: string;
+  readonly samples: readonly { readonly sourceRevision: string; readonly prose: string }[];
+  readonly maxOutputTokens?: number;
+}): ChatRequest {
+  const sampleChars = input.samples.reduce((sum, sample) => sum + sample.prose.length, 0);
+  if (typeof input.profileVersion !== 'string' || input.profileVersion.length < 1
+    || input.profileVersion.length > 240 || input.samples.length < 1 || input.samples.length > 8
+    || sampleChars > 100_000 || input.samples.some((sample) => (
+      typeof sample.sourceRevision !== 'string' || sample.sourceRevision.length < 1
+      || sample.sourceRevision.length > 240 || typeof sample.prose !== 'string' || sample.prose.length < 1
+    ))) throw new Error('style-compilation-input-invalid');
+  const tools = [...styleCompilationNativeTools()];
   return Object.freeze({
     messages: [
       {
@@ -133,6 +141,7 @@ export function buildStyleCompilationModelRequest(input: {
         content: [
           '把经授权的代表回复编译为完整、独立、可执行的文风 Skill。',
           `只调用一次 ${STYLE_DRAFT_TOOL_NAME}，参数字段严格为 name、description、keywords、body；不得输出正文。`,
+          'name 长度 1–80，只能包含中文、英文字母、数字、下划线或连字符（-）；不得包含空格、其他标点或路径分隔符。',
           'body 必须至少 400 字，并依次包含 Markdown 标题：# 适用条件、# 完整步骤、# 禁止项、# 例子、# 校验规则。',
           '完整步骤必须是可执行流程；例子必须明确区分输入场景与输出示例。',
           '不得逐句复制来源样本，不得写入角色名、人物别名、会话标识、摘要版、标签拼接版、来源正文、思维链或 Markdown 围栏。',

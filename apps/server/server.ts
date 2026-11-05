@@ -1,3 +1,11 @@
+import { createSessionProviderRuntime } from './session-provider-runtime.ts';
+import { createSchemaRepairAdmittedDispatcher, createSchemaRepairContextReader } from './schema-repair-admission.ts';
+import { createContextCompilerSessionHost } from './context-compiler-session-host.ts';
+import { recoverSessionEffectWatch } from './effect-watch-recovery.ts';
+import { ContextCompilerShadowRunner, buildContextCompilerShadowRequest } from './context-compiler-shadow-runner.ts';
+import { ContextCompilerCanarySamples } from './context-compiler-canary.ts';
+import { estimateTokens } from '../../packages/prompt/public/assembly.ts';
+import { createWorldbookApplyEvidenceScheduler, hasRetainedWorldbookApplyEvidence } from './skill-hub/worldbook-apply-evidence.ts';
 /**
  * Web API 服务（前后端软件的后端）
  * 聚合 core/memory/prompt/proxy/variable 包，暴露 REST + SSE API：
@@ -12,15 +20,181 @@
  * 会话实例进程内 Map + DB 文件持久化。
  */
 import { createServer, IncomingMessage, ServerResponse } from 'node:http';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { readdirSync, existsSync, readFileSync, rmSync, appendFileSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import { createTurnOperationHost } from './turn-operation-host.ts';
+import type { TurnOperationPhase } from './turn-operation-runtime.ts';
+import { AgentSkillConsumptionOutbox } from '../../packages/memory/public/agent-skill-consumption-outbox.ts';
+import { createToolResultBodyAccess, parseToolResultBodyRead } from './tool-result-body-access.ts';
+import { createContextCompilerSkillLiveCall } from './skill-hub/context-compiler-live.ts';
+import { createSkillFulfillmentSessionHost } from './skill-fulfillment-session-host.ts';
+import { CONTEXT_COMPILER_INPUT_VERSION, parseContextCompilerInput, contextCompilerInputManifest }
+  from '../../packages/agent-policy/public/context-compiler-input.ts';
+import { agentSkillLiveEnabled } from './skill-hub/live-request.ts';
+import {
+  createLearningPreferenceSkillLiveCall, createLearningPreferenceSkillDispatchAuthority,
+  learningPreferenceSkillLiveEnabled,
+  learningPreferenceSkillPolicyAllowed,
+} from './skill-hub/learning-preference-live.ts';
+import {
+  captureLearningPreferenceSkillSource, createLearningPreferenceSkillSourceAuthority,
+} from './skill-hub/learning-preference-context.ts';
+import { createLearningPreferenceSkillSourceCommitAuthority }
+  from './skill-hub/learning-preference-source-commit.ts';
+import { createLearningPreferenceSkillSourceScheduler } from './skill-hub/learning-preference-source-reconciler.ts';
+import { openLearningPreferenceSkillSourceRecovery } from './learning-preference-source-recovery.ts';
+import {
+  createBranchPreferenceSkillLiveCall, createBranchPreferenceSkillDispatchAuthority,
+  branchPreferenceSkillLiveEnabled, branchPreferenceSkillPolicyAllowed,
+} from './skill-hub/branch-preference-live.ts';
+import {
+  captureBranchPreferenceSkillSource, createBranchPreferenceSkillSourceAuthority,
+} from './skill-hub/branch-preference-context.ts';
+import { createBranchPreferenceSkillSourceCommitAuthority }
+  from './skill-hub/branch-preference-source-commit.ts';
+import { captureStyleCompileSkillSource, isStyleCompileSkillSourceCurrent,
+  type StyleCompileSkillSourceSnapshotV1 } from './skill-hub/style-compile-context.ts';
+import { createStyleCompileSkillLiveCall, styleCompileSkillLiveEnabled,
+  styleCompileSkillPolicyAllowed } from './skill-hub/style-compile-live.ts';
+import { createStyleCompileSkillHostAuthority } from './skill-hub/style-compile-host-authority.ts';
+import { commitStyleCompileSkillSourceReceipt, commitStyleCompileSkillAdoption } from './style-compile-skill-source.ts';
+import { AGENT_EVIDENCE_DB_FILE, AgentEvidenceLedger } from './agent-evidence-ledger.ts';
+import { openAgentEvidenceRuntime } from './agent-evidence-runtime.ts';
+import { openAgentSkillCandidateRuntime, candidateSubmissionsEnabled } from './skill-hub/candidate-runtime.ts';
+import { openSkillCompileRuntime, skillCompileEnabled } from './skill-hub/skill-compile-runtime.ts';
+import { SKILL_COMPILE_DB_FILE } from './skill-compile-store.ts';
+import { submitSkillCompile, readSkillCompile } from './skill-compile-api.ts';
+import { SKILL_COMPILE_POLICY_VERSION } from './skill-compile-model.ts';
+import { openSkillEvaluateRuntime, skillEvaluateEnabled } from './skill-hub/skill-evaluate-runtime.ts';
+import { SKILL_EVALUATE_DB_FILE } from './skill-evaluate-store.ts';
+import { SKILL_EVALUATE_POLICY_VERSION } from './skill-evaluate-model.ts';
+import { createSkillEvaluatePlan } from './skill-evaluate-registry.ts';
+import { submitSkillEvaluate, readSkillEvaluate } from './skill-evaluate-api.ts';
+import {
+    openSkillSampleRuntime, skillSampleEnabled, skillSampleSuiteEnabled, type SkillSampleQualityInput,
+} from './skill-hub/skill-sample-runtime.ts';
+import {
+    CandidateEvaluationSampleHost,
+    candidateEvaluationCompletedSourceIdentityCurrent,
+    candidateEvaluationSampleSourceFromCurrent,
+} from './skill-hub/candidate-evaluation-sample-host.ts';
+import { SKILL_SAMPLE_DB_FILE } from './skill-sample-store.ts';
+import { SKILL_SAMPLE_POLICY_VERSION } from './skill-sample-model.ts';
+import { createSkillSamplePlan } from './skill-sample-registry.ts';
+import {
+    submitSkillSample, readSkillSample, submitSkillSampleSuite, readSkillSampleSuite,
+} from './skill-sample-api.ts';
+import { openSkillQualityRuntime } from './skill-hub/skill-quality-runtime.ts';
+import { SKILL_QUALITY_DB_FILE } from './skill-quality-store.ts';
+import { SKILL_QUALITY_POLICY_VERSION } from './skill-quality-model.ts';
+import {
+    resolveSkillQualityAuthority, skillQualityEnabled,
+} from './skill-quality-authority.ts';
+import { submitSkillQualitySuite, readSkillQualitySuite } from './skill-quality-api.ts';
+import { openSkillPromotionRuntime } from './skill-hub/skill-promotion-runtime.ts';
+import { readAdmissionDecisionsApi, ADMISSION_DECISIONS_ROUTE } from './admission-decisions-api.ts';
+import {
+    CandidateEvaluationBatchStore, CANDIDATE_EVALUATION_BATCH_DB_FILE,
+} from './candidate-evaluation-batch-store.ts';
+import {
+    readSkillPromotionPreflightApi, promoteSkillCandidateApi, retireSkillCandidateApi, adoptSkillCandidateApi,
+    readSkillChannelApi, readSkillChannelEvidenceApi, readSkillPromotionOverviewApi, reconcileSkillRetirementsApi,
+    readSkillCandidateDiffApi, listSkillPromotionEvidenceApi, SKILL_PROMOTION_ROUTE_TEMPLATES,
+} from './skill-promotion-api.ts';
+import { createSkillOperationalSource } from './skill-hub/skill-operational-source.ts';
+import { listSkillOperationalSources, readSkillOperationalSource } from './skill-operational-source-api.ts';
+import { openExplicitPreferenceEvidenceSource } from './explicit-preference-evidence-source.ts';
+import { createExplicitPreferenceEvidenceScheduler } from './skill-hub/explicit-preference-evidence.ts';
+import { openClosureSkillEvidenceSource } from './closure-skill-evidence-source.ts';
+import { createClosureSkillEvidenceScheduler } from './skill-hub/closure-skill-evidence.ts';
+import { openMaintenanceMemoryEvidenceSource } from './maintenance-memory-evidence-source.ts';
+import { createMaintenanceMemoryEvidenceScheduler } from './skill-hub/maintenance-memory-evidence.ts';
+import { openMaintenanceSummaryEvidenceSource } from './maintenance-summary-evidence-source.ts';
+import { createMaintenanceSummaryEvidenceScheduler } from './skill-hub/maintenance-summary-evidence.ts';
+import { createMaintenanceProposalRejectionEvidenceScheduler, maintenanceProposalRejectionEvidenceRecord }
+  from './skill-hub/maintenance-proposal-rejection-evidence.ts';
+import { createMaintenanceProposalApprovalEvidenceScheduler, maintenanceProposalApprovalEvidenceRecord }
+  from './skill-hub/maintenance-proposal-approval-evidence.ts';
+import { createRegenerationEvidenceScheduler } from './skill-hub/regeneration-evidence.ts';
+import { createStyleCompileAdoptionEvidenceScheduler, hasRetainedStyleCompileAdoptionEvidence,
+  readStyleCompileAdoptionEvidencePage }
+  from './skill-hub/style-compile-adoption-evidence.ts';
+import { createVariableApplyEvidenceScheduler, hasRetainedVariableApplyEvidence, readVariableApplyEvidencePage }
+  from './skill-hub/variable-apply-evidence.ts';
+import { readVariableApplyEvidencePageV2 } from './skill-hub/variable-apply-outcome.ts';
+import { createReportedEffectEvidenceScheduler, hasRetainedReportedEffects } from './skill-hub/reported-effect-evidence.ts';
+import { createBranchModifiedEvidenceScheduler, hasRetainedBranchModifiedEvidence } from './skill-hub/branch-modified-evidence.ts';
+import { createVariableInvalidationEvidenceScheduler, hasRetainedVariableInvalidationEvidence } from './skill-hub/variable-invalidation-evidence.ts';
+import { createBranchAttributionEvidenceScheduler, hasRetainedBranchAttributionEvidence } from './skill-hub/branch-attribution-evidence.ts';
+import { createPreferenceInferenceEvidenceScheduler, hasRetainedPreferenceInferenceEvidence } from './skill-hub/preference-inference-evidence.ts';
+import { createAqlAdvisoryEvidenceScheduler, hasRetainedAqlAdvisoryEvidence } from './skill-hub/aql-advisory-evidence.ts';
+import { createNsfwSceneEvidenceScheduler, hasRetainedNsfwSceneEvidence } from './skill-hub/nsfw-scene-evidence.ts';
+import { createArcCommitEvidenceScheduler, hasRetainedArcCommitEvidence } from './skill-hub/arc-commit-evidence.ts';
+import { createNpcOperationEvidenceScheduler, hasRetainedNpcOperationEvidence } from './skill-hub/npc-operation-evidence.ts';
+import { openRegenerationEvidenceSource, hasRetainedRegenerationEvidence } from './regeneration-evidence-source.ts';
+import { CRITIC_SKILL_POLICY_VERSION, criticSkillLiveEnabled, createCriticSkillLiveCall } from './skill-hub/critic-live.ts';
+import { createForegroundSkillHostAuthority } from './skill-hub/foreground-host-authority.ts';
+import { createPreludeSkillLiveCall, preludeSkillLiveEnabled, preludeSkillPolicyAllowed } from './skill-hub/prelude-live.ts';
+import { createVariableProposalSkillLiveCall, variableProposalSkillLiveEnabled,
+  variableProposalSkillPolicyAllowed } from './skill-hub/variable-proposal-live.ts';
+import { buildVariableProposalSkillRequest, parseVariableProposalSkillOutput }
+  from '../../packages/agent-policy/public/variable-proposal-skill.ts';
+import { createAgentSkillConsumptionScheduler } from './skill-hub/consumption-scheduler.ts';
+import { captureMaintenanceMemorySkillSource } from './skill-hub/maintenance-memory-context.ts';
+import { createMaintenanceMemorySkillHostAuthority } from './skill-hub/maintenance-memory-host-authority.ts';
+import { createMaintenanceMemorySkillLiveCall, bindMaintenanceMemorySkillLifecycle,
+  maintenanceMemorySkillLiveEnabled, maintenanceMemorySkillPolicyAllowed } from './skill-hub/maintenance-memory-live.ts';
+import { captureMaintenanceSummarySkillSource } from './skill-hub/maintenance-summary-context.ts';
+import { createMaintenanceSummarySkillHostAuthority } from './skill-hub/maintenance-summary-host-authority.ts';
+import {
+  createMaintenanceSummarySkillLiveCall, bindMaintenanceSummarySkillLifecycle,
+  maintenanceSummarySkillLiveEnabled, maintenanceSummarySkillPolicyAllowed,
+} from './skill-hub/maintenance-summary-live.ts';
+import { captureMaintenanceArcSkillSource } from './skill-hub/maintenance-arc-context.ts';
+import { createMaintenanceArcSkillHostAuthority } from './skill-hub/maintenance-arc-host-authority.ts';
+import { createMaintenanceArcSkillLiveCall, bindMaintenanceArcSkillLifecycle,
+  maintenanceArcSkillLiveEnabled, maintenanceArcSkillPolicyAllowed } from './skill-hub/maintenance-arc-live.ts';
+import { captureMaintenanceNpcSkillSource } from './skill-hub/maintenance-npc-context.ts';
+import { createMaintenanceNpcSkillHostAuthority } from './skill-hub/maintenance-npc-host-authority.ts';
+import { createMaintenanceNpcSkillLiveCall, bindMaintenanceNpcSkillLifecycle,
+  maintenanceNpcSkillLiveEnabled, maintenanceNpcSkillPolicyAllowed } from './skill-hub/maintenance-npc-live.ts';
+import { captureMaintenanceWorldbookSkillSource } from './skill-hub/maintenance-worldbook-context.ts';
+import { createNsfwSceneSkillHost, nsfwSceneSkillLiveEnabled } from './skill-hub/nsfw-scene-host.ts';
+import { nsfwSceneRequestDigest } from '../../packages/session/public/nsfw-scene-request.ts';
+import { createMaintenanceWorldbookSkillHostAuthority } from './skill-hub/maintenance-worldbook-host-authority.ts';
+import { createMaintenanceWorldbookSkillLiveCall, bindMaintenanceWorldbookSkillLifecycle,
+  maintenanceWorldbookSkillLiveEnabled, maintenanceWorldbookSkillPolicyAllowed } from './skill-hub/maintenance-worldbook-live.ts';
+import { maintenanceModelModeAllowed } from './maintenance-model-mode-policy.ts';
+import { createMaintenanceMemorySkillProposalScheduler } from './skill-hub/maintenance-memory-proposal-reconciler.ts';
+import { createMaintenanceMemoryWriteScheduler,
+  withMaintenanceMemoryWriteWake } from './skill-hub/maintenance-memory-write-reconciler.ts';
+import { createMaintenanceSummaryWriteScheduler,
+  withMaintenanceSummaryWriteWake } from './skill-hub/maintenance-summary-write-reconciler.ts';
+import { openMaintenanceMemoryWriteRecovery,
+  openMaintenanceMemoryConsumptionRecovery,
+  openMaintenanceSummaryWriteRecovery,
+  openMaintenanceSummaryConsumptionRecovery } from './maintenance-memory-write-recovery.ts';
+import { MaintenanceMemoryConsumptionAuthority } from './skill-hub/maintenance-memory-consumption-authority.ts';
+import { MaintenanceSummaryConsumptionAuthority } from './skill-hub/maintenance-summary-consumption-authority.ts';
+import { createMaintenanceMemoryConsumptionScheduler }
+  from './skill-hub/maintenance-memory-consumption-reconciler.ts';
+import { createMaintenanceSummaryConsumptionScheduler }
+  from './skill-hub/maintenance-summary-consumption-reconciler.ts';
+import { assertMaintenanceMemoryDirectWriteAllowed } from './maintenance-memory-direct-write.ts';
+import { assertMaintenanceSummaryDirectWriteAllowed } from './maintenance-summary-direct-write.ts';
 import {
   ChatSession,
   StoryIndexGenerationUnavailableError,
-} from '../../tools/cli/session.ts';
-import type { BranchSelectionReference, ImageAttachment } from '../../tools/cli/session.ts';
+} from '../../packages/session/src/session.ts';
+import type {
+  BranchSelectionReference,
+  ImageAttachment,
+  SessionArgs,
+} from '../../packages/session/src/session.ts';
 import { MemoryDb } from '../../packages/memory/src/db.ts';
+import { getPgVectorStore } from '../../packages/memory/public/db.ts';
 import {
   aggregateSessionSnapshot,
   computeSessionDatabaseSnapshot,
@@ -32,6 +206,7 @@ import { toPublicPluginRecord } from '../../packages/plugin/src/public-record.ts
 import { DshPluginHost } from '../../packages/plugin/src/dsh-host.ts';
 import {
   AssetRevisionConflictError,
+  deleteUserAssetOverrideCas,
   deleteUserAssetCas,
   deleteUserCardCas,
   deleteWorldbookFileCas,
@@ -40,6 +215,7 @@ import {
   readAsset,
   readCardText,
   readRevisionedAsset,
+  readRevisionedAssetLayer,
   readRevisionedCard,
   resolveCard,
   saveAssetBuffer,
@@ -54,19 +230,53 @@ import { parseWorldBook } from '../../packages/core/src/worldbook.ts';
 import { parsePreset } from '../../packages/core/src/preset.ts';
 import { parseCharaCard, extractCharaFromPng, pngPayloadToJson, buildCharaPng } from '../../packages/core/src/chara.ts';
 import { RegexLibrary } from '../../packages/core/src/regex-library.ts';
-import { StoryboardOrchestrator, StoryboardRegistry, DEFAULT_WORKFLOW } from '../../tools/cli/storyboard-orchestrator.ts';
-import type { StoryboardResult } from '../../tools/cli/storyboard-orchestrator.ts';
-import { VideoPromptGenerator } from '../../tools/cli/video-prompt-generator.ts';
-import type { VideoPromptResult } from '../../tools/cli/video-prompt-generator.ts';
+import { StoryboardOrchestrator, StoryboardRegistry, DEFAULT_WORKFLOW } from '../../packages/session/src/storyboard-orchestrator.ts';
+import { DirectorCreativeStore, DIRECTOR_CREATIVE_DB_FILE } from './director-creative-store.ts';
+import { DirectorCreativeService } from './director-creative-service.ts';
+import type { StoryboardResult } from '../../packages/session/src/storyboard-orchestrator.ts';
+import { VideoPromptGenerator } from '../../packages/session/src/video-prompt-generator.ts';
+import type { VideoPromptResult } from '../../packages/session/src/video-prompt-generator.ts';
 import { renderDirectorMarkdown, safeParseStage, PanelsSchemaLenient } from '../../packages/prompt/src/storyboard.ts';
 import type { Panel } from '../../packages/prompt/src/storyboard.ts';
-import { OpenAICompatibleClient, type ChatCompletionClient } from '../../packages/proxy/src/client.ts';
-import { loadProviderConfig, assertProviderReady, readLocalEnvCredential } from '../../packages/proxy/src/config.ts';
+import {
+  OpenAICompatibleClient,
+  type ChatCompletionClient,
+  type ChatRequest,
+} from '../../packages/proxy/src/client.ts';
+import { loadProviderConfig, assertProviderReady, readLocalEnvCredential, credentialLockdownActive } from '../../packages/proxy/src/config.ts';
 import {
   ProviderRegistry,
   ProviderRegistryError,
 } from '../../packages/proxy/src/provider-registry.ts';
 import { createRegistryProviderClient } from '../../packages/proxy/src/provider-client.ts';
+import {
+  AgentProviderConfigFileError,
+  loadAgentProviderConfig,
+  normalizeAgentProviderConfig,
+  resolveAgentProviderSelection,
+  writeAgentProviderConfig,
+  type AgentProviderConfig,
+} from './agent-provider-config.ts';
+import { OperationalReplayBridge } from './operational-replay-bridge.ts';
+import {
+  CachedLegacyAgentSkillCatalogResolver,
+  createFilesystemLegacyAgentSkillCatalogAdapter,
+  createSessionAgentSkillShadowObserver,
+  evaluateSessionAgentSkillShadowPromotion,
+  SessionAgentSkillShadowHealthWindow,
+  SessionAgentSkillShadowRunner,
+  SessionAgentSkillShadowMetrics,
+} from './skill-hub/index.ts';
+import { createStylePackageShadowObserver, STYLE_PACKAGE_SHADOW_PIN } from './skill-hub/style-package-shadow.ts';
+import { createStylePackageCanary, STYLE_PACKAGE_CANARY_FILE } from './skill-hub/style-package-canary.ts';
+import { SkillPackagePinStore } from './skill-package-pin-store.ts';
+import { readSkillPinApi, setSkillPinApi } from './skill-governance-api.ts';
+import { readSkillActiveDiffApi } from './skill-promotion-api.ts';
+import { readCurrentTurnAgentEvidence } from './turn-agent-evidence.ts';
+import {
+  parseAgentSkillShadowRuntimeConfig,
+  publicAgentSkillShadowRuntimeSummary,
+} from './agent-skill-shadow-runtime-config.ts';
 import { createOpenAIProviderController } from '../../packages/proxy/src/openai-provider.ts';
 import { RetrievalEngine } from '../../packages/memory/src/retrieval.ts';
 import { HashEmbeddingProvider, createEmbeddingProvider } from '../../packages/memory/src/embedding.ts';
@@ -105,7 +315,11 @@ import {
   type AuthenticatedContext,
 } from './auth-runtime.ts';
 import { AuthenticatedStreamRegistry } from './auth-stream-registry.ts';
-import { decideRouteAccess, matchRouteAccess } from './route-access.ts';
+import {
+  decideRouteAccess,
+  matchRouteAccess,
+  sessionScopedRouteTarget,
+} from './route-access.ts';
 import { parseStoryIndexPostBody } from './story-index-request.ts';
 import {
   PairingAdmissionController,
@@ -125,6 +339,8 @@ import {
   IDEMPOTENCY_KEY_HEADER,
   MAX_CLIENT_PROTOCOL_VERSION,
   MIN_CLIENT_PROTOCOL_VERSION,
+  PUBLIC_MAINTENANCE_REVIEW_DETAIL_MAX_CODE_POINTS,
+  PUBLIC_MAINTENANCE_REVIEW_TITLE_MAX_CODE_POINTS,
   REQUEST_ID_HEADER,
   REVISION_HEADER,
   formatStrongEtag,
@@ -141,6 +357,7 @@ import {
   type ApiErrorPayload,
   type LocalAssetDescriptor,
   type LocalAssetImportResult,
+  type PublicMaintenanceProposalReviewItem,
   type PublicAssetDescriptor,
   type ServerMeta,
 } from '../../packages/mobile-contracts/src/index.ts';
@@ -162,13 +379,30 @@ import {
 import { evaluateCorsActual } from './cors-actual.ts';
 import { applyActualCorsHeaders } from './cors-response.ts';
 import { serveStaticWeb } from './static-web.ts';
-import { rawEntriesOf, toTavernHelperEntry, applyChangedEntries, type TavernHelperEntry } from './worldbook-bridge.ts';
+import {
+  rawEntriesOf, stableEntryUid, toTavernHelperEntry, applyChangedEntries, type TavernHelperEntry,
+} from './worldbook-bridge.ts';
 import { loadOrCreateInstallationIdentity } from './installation-identity.ts';
 import { TurnJobConflictError } from './turn-job-manager.ts';
 import { TurnJobAdmissionError, TurnJobService } from './turn-job-service.ts';
-import { InvalidationHub } from './event-hub.ts';
+import {
+  InvalidationHub,
+  publishAgentLoopTaskInvalidation,
+  publishMaintenanceLifecycleInvalidation,
+} from './event-hub.ts';
+import { createAgentLoopTaskInvalidationDrainer } from './agent-loop-task-invalidation.ts';
+import { readAgentLoopTaskStatus, readAgentLoopTaskExplanation } from './agent-loop-task-status.ts';
+import { readAgentLoopTaskOutcomeStatus } from './agent-loop-task-outcome.ts';
+import { AgentLoopSummaryApplyOutcomeReader } from './agent-loop-summary-apply-task-outcome.ts';
 import { AgentLearningLedger } from './agent-learning-ledger.ts';
 import { LearningOutboxDrainer } from './learning-outbox-drainer.ts';
+import { normalizeStyleCompileBinding } from '../../packages/memory/public/style-compile-intent-outbox.ts';
+import { createStyleCompilePipeline } from './skill-hub/style-compile-pipeline.ts';
+import { StyleCompileJobStore, STYLE_COMPILE_JOB_DB_FILE, STYLE_COMPILE_JOB_DATA_DIRECTORY } from './skill-hub/style-compile-job-store.ts';
+import { startStyleCompileRuntime, type StyleCompileRuntime } from './skill-hub/style-compile-runtime.ts';
+import { parseStyleCompileRuntimeConfig } from './skill-hub/style-compile-runtime-config.ts';
+import { createStyleCompilePilotClient } from './skill-hub/style-compile-pilot.ts';
+import { scanStyleCompileRecoverySessions } from './skill-hub/style-compile-session-inventory.ts';
 import { runSettledLearningBarrier } from './settled-learning-barrier.ts';
 import {
   opaqueLearningToken,
@@ -206,43 +440,160 @@ import {
   recoverSnapshotRestoreBeforeServerLock,
 } from './snapshot-restore.ts';
 import { SessionDeletionJournal } from './session-deletion-journal.ts';
-import { MaintenanceJobManager, MaintenanceDisabledError } from './maintenance-job-manager.ts';
-import { MaintenanceHarnessService } from './maintenance-harness-service.ts';
+import {
+  SessionDeletionCoordinator,
+  type SessionDeletionReservation,
+} from './session-deletion-coordinator.ts';
+import { createDshSessionDeletionStep } from './dsh-session-deletion-adapter.ts';
+import { cleanupDeletedSessionSnapshotArtifacts } from './session-deletion-snapshot-cleanup.ts';
+import { createP14EvidenceSessionDeletionStep } from './p14-evidence-deletion-adapter.ts';
+import {
+  MaintenanceJobManager,
+  MaintenanceDisabledError,
+  createMaintenanceProductionQueuedJobReaderInternal,
+  type MaintenanceProductionProjectionRecoveryCursor,
+} from './maintenance-job-manager.ts';
+import {
+  MaintenanceHarnessService,
+  maintenanceSystemPrompt,
+  type MaintenanceHarnessServiceOptions,
+  type MaintenanceRuntimeObservation,
+} from './maintenance-harness-service.ts';
+import {
+  createMaintenanceDrainPump,
+  type MaintenanceDrainPump,
+} from './maintenance-drain-pump.ts';
 import { MaintenanceProposalControl } from './maintenance-proposal-control.ts';
 import { createNpcMaintenanceProposalAdapters } from './npc-maintenance-proposal-adapter.ts';
+import { npcOccupiedRelationshipTargets } from './npc-relationship-occupancy.ts';
+import { NpcMaintenanceApplyBackupStore } from './npc-maintenance-apply-backup.ts';
+import { MemorySummaryMaintenanceCommitter } from './memory-summary-maintenance-committer.ts';
+import { shadowDiff } from './maintenance-proposal-committer.ts';
 import {
-  maintenanceApplyAllowsSession,
+  boundedNpcReviewText,
+  npcReviewProposalHasCompleteWriteReview,
+  shouldExposeDynamicNpcReviewItems,
+} from './npc-maintenance-review-surface.ts';
+import {
+  maintenanceReviewHasApplicableWrite,
+  typedMaintenanceProposalReviewItems,
+} from './maintenance-proposal-review-surface.ts';
+import {
+  assertMaintenanceMemorySummaryCommitAllowed,
+  maintenanceGuardedAutoAllowsNpcSession,
+  maintenanceMemorySummaryApplyMode,
   maintenanceProposalApplySupported,
   parseMaintenanceApplyRuntimeConfig,
 } from './maintenance-apply-runtime-config.ts';
+import {
+  deleteNpcMaintenanceActivationSession,
+  readNpcMaintenanceActivationMarkers,
+} from './npc-maintenance-activation.ts';
+import {
+  NPC_APPLY_POLICY_LIMITS,
+  evaluateNpcApplyPolicy,
+  type NpcApplyOccupiedFactTarget,
+} from '../../packages/agent-policy/src/npc-apply-policy.ts';
+import {
+  normalizeNpcMaintenanceProposal,
+  type NpcMaintenanceProposalContext,
+} from '../../packages/agent-policy/src/npc-maintenance-proposal.ts';
 import { createAdmittedMaintenanceModel } from './admitted-maintenance-model.ts';
+import { AgentLoopProjectionStore } from './agent-loop-projection-store.ts';
+import { startAgentLoopRecoveryLifecycle } from './agent-loop-recovery-lifecycle.ts';
+import { arbitratedAgentClient, resolvedArbitratedAgentClient } from './agent-arbitrated-client.ts';
+import { shadowJobSourceState } from './agent-loop-turnjob-shadow.ts';
+import {
+  AGENT_LOOP_MAINTENANCE_EXECUTION_PROFILE_VERSION,
+  bindAgentLoopMaintenanceProductionCanaryExecutionPort,
+  createAgentLoopServerComposition,
+  isAgentLoopServerCompositionCapabilityManifest,
+  readAgentLoopServerCompositionCapabilityManifest,
+} from './agent-loop-runtime.ts';
+import {
+  createAgentLoopMaintenanceCanaryAdmissionReaderInternal,
+  createAgentLoopMaintenanceCanarySourcePolicyReader,
+}
+  from './agent-loop-maintenance-canary-source-policy.ts';
+import { AGENT_LOOP_MAINTENANCE_CANARY_COHORT_EPOCH_V2 }
+  from './agent-loop-maintenance-canary-route-plan-v2.ts';
+import {
+  createAgentLoopMaintenanceProductionDispatcher,
+  createAgentLoopMaintenanceProductionRouteSnapshotReaderInternal,
+} from './agent-loop-maintenance-production-dispatcher.ts';
+import {
+  AGENT_LOOP_MAINTENANCE_PRODUCTION_ROUTE_CONTRACT,
+}
+  from './agent-loop-maintenance-production-route-contract.ts';
+import type { AgentLoopMaintenancePrepareSource } from './agent-loop-prepare.ts';
+import { createAgentLoopMaintenanceExecutionPrepare, assertAgentLoopMaintenancePreparedBinding } from './agent-loop-maintenance-execution-prepare.ts';
+import { issueAgentLoopGetVariablesAuthorization, agentLoopMaintenanceBindingRef } from './agent-loop-get-variables-authorization.ts';
+import { createAgentLoopMaintenanceCorrectionPrepare } from './agent-loop-maintenance-correction-prepare.ts';
+import { createAgentLoopMaintenanceCorrectionModel } from './agent-loop-maintenance-correction-model.ts';
+import { createAgentLoopMaintenanceCorrectionProposalPrepare } from './agent-loop-maintenance-correction-proposal-prepare.ts';
+import { createAgentLoopMaintenanceCorrectionProposalModel } from './agent-loop-maintenance-correction-proposal-model.ts';
+import { createAgentLoopMaintenanceCorrectionProposalAction,
+  type AgentLoopMaintenanceCorrectionProposalActionOptions } from './agent-loop-maintenance-correction-proposal-action.ts';
+import { revokeAgentLoopCorrectionProposalCapability } from './agent-loop-correction-proposal-authorization.ts';
+import { normalizeAgentLoopActionObject } from './agent-loop-action-receipt.ts';
+import { createAgentLoopMaintenanceGetVariablesAction } from './agent-loop-maintenance-get-variables-action.ts';
+import { issueAgentLoopRollingSummaryProposalAuthorization } from './agent-loop-rolling-summary-proposal-authorization.ts';
+import { createAgentLoopMaintenanceRollingSummaryProposalAction } from './agent-loop-maintenance-rolling-summary-proposal-action.ts';
+import { createAgentLoopMaintenanceRollingSummaryApplyAction } from './agent-loop-maintenance-rolling-summary-apply-action.ts';
+import { issueAgentLoopRollingSummaryApplyAuthorization, revokeAgentLoopRollingSummaryApplyCapability,
+  assertAgentLoopRollingSummaryApplyModelCapability,
+  type AgentLoopRollingSummaryApplyCapability } from './agent-loop-rolling-summary-apply-authorization.ts';
+import { createAgentLoopRollingSummaryProposalVerification } from './agent-loop-rolling-summary-proposal-verification.ts';
+import { createAgentLoopShadowPublication, createAgentLoopCorrectionShadowPublication } from './agent-loop-shadow-publication.ts';
+import type { AgentLoopCorrectionRollingSummaryArtifactSourceOptions } from './agent-loop-rolling-summary-artifacts.ts';
+import { createAgentLoopSummaryApplyCompletion } from './agent-loop-summary-apply-completion.ts';
+import { sameMaintenanceAgentLoopClaim, type MaintenanceAgentLoopExecutionContext } from './agent-loop-maintenance-lifecycle.ts';
+import { consumeAgentLoopModelInvocationPermit, type AgentLoopModelAdmissionScope } from './agent-loop-model-invocation-permit.ts';
+import { deriveAgentLoopModelCallBudget } from './agent-loop-model-call-budget.ts';
+import type { AgentLoopCoordinatorPorts } from './agent-loop-coordinator.ts';
+import { createMaintenanceModelHostGuard, type MaintenanceModelHostEnvironment } from './maintenance-model-host-guard.ts';
+import { assertAgentLoopMaintenanceModelRecord, createAgentLoopMaintenanceModel } from './agent-loop-maintenance-model.ts';
 import {
   maintenanceBudgetProfileForAutonomy,
   maintenanceCostEstimator,
   parseMaintenanceRuntimeConfig,
 } from './maintenance-runtime-config.ts';
-import { buildMaintenanceSessionSnapshot } from './maintenance-session-snapshot.ts';
+import {
+  bindArcMaintenanceReviewSnapshot,
+  buildMaintenanceSessionSnapshot,
+} from './maintenance-session-snapshot.ts';
 import {
   MAINTENANCE_POLICY,
   MAINTENANCE_POLICY_VERSION,
   isMaintenanceTaskKind,
+  isWorldbookRepairProposalContext,
+  type WorldbookRepairFileEvidence,
+  type WorldbookRepairProposalContext,
 } from './maintenance-types.ts';
-import { InteractiveCallLedger } from './interactive-call-ledger.ts';
+import {
+  INTERACTIVE_LEDGER_DB_FILE,
+  InteractiveCallLedger,
+} from './interactive-call-ledger.ts';
 import {
   foregroundSummaryBudgetProfile,
   interactiveBudgetProfileForAutonomy,
   parseInteractiveRuntimeConfig,
 } from './interactive-runtime-config.ts';
-import { resolveModelRuntimeProfile } from '../../packages/prompt/src/model-runtime-profile.ts';
+import { modelRuntimeProfileDigest, resolveModelRuntimeProfile } from '../../packages/prompt/src/model-runtime-profile.ts';
 import {
   contextCompilerAllowsSession,
+  contextCompilerAllowsShadowSession,
+  CONTEXT_COMPILER_SHADOW_POLICY_VERSION,
   parseContextCompilerRuntimeConfig,
 } from './context-compiler-runtime-config.ts';
 import { agentTaskBudgetProfile } from './agent-task-budget-profiles.ts';
 import { ModelUsageLedger } from './model-usage-ledger.ts';
 import { AgentAdmissionLedger, AGENT_ADMISSION_DB_FILE } from './agent-admission-ledger.ts';
 import { readSessionAgentControl } from './agent-control-api.ts';
-import { agentCapabilityTicketAllowed } from './agent-capability-binding.ts';
+import {
+  agentCapabilityTicketAllowed,
+} from './agent-capability-binding.ts';
+import { recordMaintenanceProtocolCircuit } from './maintenance-protocol-circuit.ts';
 import {
   evaluateAgentTicketBeginPolicy,
   rolloutLaneForAdmission,
@@ -256,48 +607,71 @@ import {
 import {
   WORLDBOOK_REPAIR_DB_FILE,
   WorldbookRepairControl,
+  worldbookEntryDigest,
+  type WorldbookAssetAdapter,
 } from './worldbook-repair-control.ts';
 import { WorldbookRepairControlPlane } from './worldbook-repair-control-plane.ts';
 import {
   parseWorldbookRepairRuntimeConfig,
+  worldbookRepairForwardAllowsSession,
 } from './worldbook-repair-runtime-config.ts';
 import {
   agentAdmissionAllowsSession,
   parseAgentAdmissionRuntimeConfig,
 } from './agent-admission-runtime-config.ts';
 import { parseLearningTextRuntimeConfig } from './learning-text-runtime-config.ts';
-import { AdmissionTicketBroker } from './agent-admission-broker.ts';
+import { AdmissionTicketBroker, type AgentAdmissionLease } from './agent-admission-broker.ts';
 import {
+  AdmittedModelGatewayError,
   AdmittedModelGateway,
+  safeAdmittedModelGatewayErrorCode,
+  type AdmittedModelGatewayErrorCode,
   type AdmittedModelLeaseAudit,
 } from './admitted-model-gateway.ts';
 import {
   admissionRequestDigest,
   admissionLimitsFromBudgetProfile,
   agentToolSetDigest,
+  parseNsfwAgentState,
 } from '../../packages/agent-policy/src/admission.ts';
 import {
   agentBudgetProfileDigest,
+  normalizeAgentBudgetProfile,
+  assertAgentBudgetWithinHostCeiling,
 } from '../../packages/agent-policy/src/budget-profile.ts';
+import { parseAqlReplanOutput } from '../../packages/agent-policy/public/aql-replan-output.ts';
+import { buildAqlReplanRequest, aqlReplanNativeTools } from '../../packages/agent-policy/public/aql-replan-request.ts';
+import { captureAqlReplanSkillSource, isAqlReplanSkillSourceCurrent } from './skill-hub/aql-replan-context.ts';
+import { aqlReplanSkillLiveEnabled, aqlReplanSkillPolicyAllowed, createAqlReplanSkillLiveCall }
+  from './skill-hub/aql-replan-live.ts';
+import { createAqlReplanSkillHostAuthority } from './skill-hub/aql-replan-host-authority.ts';
+import { commitAqlReplanSkillSourceReceipt } from './aql-replan-skill-source.ts';
+import { parseAqlReplanInput, renderAqlReplanInput } from '../../packages/agent-policy/public/aql-replan-input.ts';
+import {
+  captureAqlSummaryRequestEvidence, isAqlSummaryRequestEvidenceCurrent, commitAqlSummaryRequestEvidence,
+} from './aql-summary-request-evidence.ts';
 import {
   parseLearnedStyleModelResponse,
   STYLE_DRAFT_TOOL_NAME,
 } from '../../packages/agent-policy/src/style-compiler.ts';
 import { evaluateLearnedStyleDraft } from '../../packages/agent-policy/src/style-evaluator.ts';
 import {
+  buildForegroundSummaryModelRequest, foregroundSummaryNativeTools,
+} from '../../packages/harness/public/foreground-summary-model.ts';
+import {
   selectArcSessionProjection,
   selectNpcSessionProjection,
 } from '../../packages/agent-policy/src/domain-projection-contract.ts';
-import { INTERACTIVE_NATIVE_TOOLS } from '../../packages/harness/src/interactive-tools.ts';
+import { effectiveInteractiveNativeTools } from '../../packages/harness/src/interactive-tools.ts';
 import {
   CONTEXT_COMPILER_POLICY_VERSION,
   ContextCapsuleCache,
   buildContextCompilerModelRequest,
-  contextCompilerSourceDigest,
   parseContextCapsule,
   partitionContextCompilerSources,
 } from '../../packages/harness/src/context-compiler.ts';
-import { buildPrecommitCriticModelRequest } from '../../packages/harness/src/precommit-critic-model.ts';
+import { buildPrecommitCriticRequestFromInput } from '../../packages/harness/precommit-critic-model.ts';
+import { createCriticInput, criticInputManifest } from '../../packages/harness/public/critic-input.ts';
 import {
   buildBranchAttributionModelRequest,
   buildPreferenceExtractionModelRequest,
@@ -311,8 +685,15 @@ import { buildMaintenanceAdmissionAudits } from './maintenance-admission-shadow.
 import { schedulePostTurnMaintenance } from './maintenance-admission-enforcer.ts';
 import { ArcProjectionStore, ARC_PROJECTION_DB_FILE } from './arc-projection-store.ts';
 import { AgentControlStore } from './agent-control-store.ts';
-import { parseAgentLaneRuntimeConfig } from './agent-lane-runtime-config.ts';
+import { AgentClosureStore } from './agent-closure-store.ts';
+import { AgentClosureRecorder } from './agent-closure-recorder.ts';
+import { executionClassForLearningSession } from '../../packages/agent-closure/index.ts';
 import {
+  agentLaneRolloutBucketIdentity,
+  parseAgentLaneRuntimeConfig,
+} from './agent-lane-runtime-config.ts';
+import {
+  AGENT_ROLLOUT_LANES,
   evaluateAgentLaneRollout,
   type AgentRolloutLane,
 } from '../../packages/agent-policy/src/lane-rollout.ts';
@@ -321,6 +702,12 @@ import {
   configuredModelUsageCostEstimator,
 } from './model-usage-client.ts';
 import { releaseDrainState } from './release-drain.ts';
+import {
+  NsfwSceneSafetyControl,
+  NsfwSceneSafetyControlError,
+  parseNsfwSceneSafetyUpdate,
+} from './nsfw-scene-safety-control.ts';
+import { NsfwSceneAttestationMemory } from './nsfw-scene-attestation-memory.ts';
 
 function parsePort(value: string | undefined, fallback: number): number {
   const port = value === undefined ? fallback : Number(value);
@@ -332,7 +719,7 @@ function parsePort(value: string | undefined, fallback: number): number {
 
 const PORT = parsePort(process.env.JG_WEB_PORT, 17800);
 const HOST = '127.0.0.1';
-const APP_VERSION = '0.1.0';
+const APP_VERSION = '0.6.1';
 const SERVER_INSTANCE_ID = randomUUID();
 const WEB_DIST_DIR = resolve(process.env.JG_WEB_DIST ?? 'apps/web/dist');
 /**
@@ -363,7 +750,6 @@ const ALLOWED_AUTHORITIES = new Set([
   ...PUBLIC_HTTPS.authorities,
 ]);
 const AGENT_CONTROL_MUTATION_RUNTIME = parseAgentControlMutationRuntimeConfig(process.env);
-const MAINTENANCE_APPLY_RUNTIME = parseMaintenanceApplyRuntimeConfig(process.env);
 const WORLDBOOK_REPAIR_RUNTIME = parseWorldbookRepairRuntimeConfig(process.env);
 /**
  * Web 进程直接跑本地 bge：onnxruntime 原生推理占用唯一 HTTP 事件循环的风险**已知并接受**。
@@ -381,7 +767,13 @@ const DATA_DIR = process.env.JG_USER_DATA_DIR
 const INTERACTIVE_RUNTIME = parseInteractiveRuntimeConfig();
 const AGENT_ADMISSION_RUNTIME = parseAgentAdmissionRuntimeConfig();
 const CONTEXT_COMPILER_RUNTIME = parseContextCompilerRuntimeConfig();
+const CONTEXT_COMPILER_CANARY = CONTEXT_COMPILER_RUNTIME.canaryScope
+  ? new ContextCompilerCanarySamples(CONTEXT_COMPILER_RUNTIME.canaryScope) : null;
+const CONTEXT_COMPILER_SHADOW_RUNNER = new ContextCompilerShadowRunner();
 const LEARNING_TEXT_RUNTIME = parseLearningTextRuntimeConfig();
+const STYLE_COMPILE_RUNTIME_CONFIG = parseStyleCompileRuntimeConfig(process.env);
+let STYLE_COMPILE_RUNTIME: StyleCompileRuntime | null = null;
+let styleCompileStartupReady = false;
 const MAINTENANCE_ADMISSION_RUNTIME = parseMaintenanceAdmissionRuntimeConfig();
 const AGENT_RUNTIME_PROFILE = process.env.JG_AGENT_RUNTIME_PROFILE?.trim();
 if (AGENT_RUNTIME_PROFILE !== undefined
@@ -393,7 +785,7 @@ const LEARNED_STYLE_PROPOSALS = new LearnedStyleProposalStore(
   resolve(DATA_DIR, 'skills'),
 );
 const learnedStyleResolverForSession = (rawSessionId: string): NonNullable<
-  import('../../tools/cli/session.ts').SessionArgs['learnedStyleResolver']
+  import('../../packages/session/src/session.ts').SessionArgs['learnedStyleResolver']
 > => {
   const expectedSessionId = opaqueLearningToken('session', rawSessionId);
   return (scope) => scope.sessionId === expectedSessionId
@@ -406,7 +798,6 @@ recoverSnapshotRestoreBeforeServerLock({ dataDir: DATA_DIR });
 if (readSnapshotRestorePendingMarker(DATA_DIR)) {
   throw new Error('快照恢复已切换，但认证世代尚未由 P8-10 轮换；服务保持 fail closed');
 }
-
 /**
  * P5.2-A2：访问模式。`local-only`（默认）保持现状零认证；`secured` 启用设备认证，
  * 要求先完成 `pnpm auth:bootstrap`——没有激活世代时 AuthRuntime.open() 抛错，
@@ -423,22 +814,108 @@ const SERVER_PROCESS_LOCK = acquireServerProcessLock({
   dataDir: DATA_DIR,
   instanceId: SERVER_INSTANCE_ID,
 });
+// Activation evidence belongs to the post-recovery data generation and is inspected only
+// after this process owns the dataDir. This closes the gap in which activation or restore
+// could replace the marker/backups while startup was validating them.
+let NPC_MAINTENANCE_ACTIVATIONS: ReturnType<typeof readNpcMaintenanceActivationMarkers> = Object.freeze([]);
+try {
+  NPC_MAINTENANCE_ACTIVATIONS = readNpcMaintenanceActivationMarkers(DATA_DIR);
+} catch {
+  // Backup evidence is an apply-only credential. Invalid evidence keeps formal
+  // writes closed, but must not suppress shadow proposal generation.
+  console.warn('[NPCMaintenance] ACTIVATION_INVALID（NPC 正式写入已关闭，shadow 提案继续）');
+}
+const NPC_MAINTENANCE_ACTIVATION_SESSIONS = new Set(
+  NPC_MAINTENANCE_ACTIVATIONS.map((record) => record.sessionId),
+);
+const MAINTENANCE_APPLY_RUNTIME = parseMaintenanceApplyRuntimeConfig(process.env, {
+  npcActivationSessions: NPC_MAINTENANCE_ACTIVATION_SESSIONS,
+});
 // H7: authoritative deletion fences live beside DATA_DIR so a snapshot restore cannot roll them back.
 // Opening this store is fail-closed: a corrupt privacy journal must prevent the server from serving
 // restored session bytes without their tombstones.
 const SESSION_DELETION_JOURNAL = new SessionDeletionJournal({ dataDir: DATA_DIR });
+const SESSION_DELETION_RESERVATIONS = new Map<string, SessionDeletionReservation>();
+const sessionDeletionAdmissionOpen = (sessionId: string): boolean => (
+  !SESSION_DELETION_RESERVATIONS.has(sessionId)
+  && !SESSION_DELETION_JOURNAL.isBlocked(sessionId)
+);
+// A disabled forward runtime must still reopen prior audit evidence so session
+// deletion can erase it. Runtime disablement is not a privacy-retention switch.
 const INTERACTIVE_CALL_LEDGER = INTERACTIVE_RUNTIME.enabled
+  || existsSync(resolve(DATA_DIR, INTERACTIVE_LEDGER_DB_FILE))
   ? new InteractiveCallLedger({ dataDir: DATA_DIR })
   : null;
 const MODEL_USAGE_LEDGER = new ModelUsageLedger({ dataDir: DATA_DIR });
 const AGENT_CONTROL_STORE = new AgentControlStore({ dataDir: DATA_DIR });
+for (const laneId of AGENT_ROLLOUT_LANES) {
+  try {
+    const repaired = AGENT_CONTROL_STORE.repairLegacyLatencySampleDenominatorKill(laneId);
+    if (repaired) {
+      console.warn(
+        `[AgentControl] repaired ${laneId} ${repaired.operation}; reopened window `
+        + `${repaired.authorizationWindow.sequence} in test-session`,
+      );
+    }
+  } catch (error) {
+    // A failed compatibility repair must not mutate or bypass the persisted stop.
+    console.error(
+      `[AgentControl] latency denominator repair failed for ${laneId}: ${(error as Error).message}`,
+    );
+  }
+}
+let AGENT_CLOSURE_DEGRADED = false;
+const AGENT_CLOSURE_STORE = (() => {
+  try { return new AgentClosureStore({ dataDir: DATA_DIR }); }
+  catch (error) {
+    AGENT_CLOSURE_DEGRADED = true;
+    console.error(`[AgentClosure] initialization failed; evaluation disabled: ${(error as Error).message}`);
+    return null;
+  }
+})();
+const AGENT_CLOSURE_RECORDER = AGENT_CLOSURE_STORE
+  ? new AgentClosureRecorder(
+    AGENT_CLOSURE_STORE,
+    () => new Date().toISOString(),
+    (code) => {
+      AGENT_CLOSURE_DEGRADED = true;
+      console.warn(`[AgentClosure] ${code}`);
+    },
+  )
+  : null;
+const NSFW_SCENE_SAFETY_CONTROL = new NsfwSceneSafetyControl();
+// Device-wide memory of the latest adult attestation, used only to pre-fill a new session's
+// grant form. A failed write here must never break the per-session gate itself.
+const NSFW_SCENE_ATTESTATION_MEMORY = new NsfwSceneAttestationMemory(DATA_DIR);
+const WORLDBOOK_REPAIR_ASSET: WorldbookAssetAdapter = Object.freeze({
+  read: (file: string) => readRevisionedAsset('worldbook', file),
+  readLayer: (file: string, source: 'asset') => readRevisionedAssetLayer('worldbook', file, source),
+  save: (file: string, raw: string, expectedRevision: string) => AGENT_CONTROL_STORE.withAssetMutation(
+    () => saveUserAssetCas('worldbook', file, raw, expectedRevision),
+  ),
+  deleteUserOverride: (file: string, expectedRevision: string, expectedAssetRevision: string) => (
+    AGENT_CONTROL_STORE.withAssetMutation(
+      () => deleteUserAssetOverrideCas('worldbook', file, expectedRevision, expectedAssetRevision),
+    )
+  ),
+});
 // Existing control state is reopened even after the forward gate is disabled so
 // trusted operators retain reject/revert recovery access.
 const WORLDBOOK_REPAIR_CONTROL = WORLDBOOK_REPAIR_RUNTIME.enabled
   || existsSync(resolve(DATA_DIR, WORLDBOOK_REPAIR_DB_FILE))
-  ? new WorldbookRepairControl({ dataDir: DATA_DIR })
+  ? new WorldbookRepairControl({
+    dataDir: DATA_DIR,
+    asset: WORLDBOOK_REPAIR_ASSET,
+    // P16 C2.2：世界书修正的 create/apply/revert 回执直连旁路评估层。
+    // best-effort —— 评估失败不得影响控制面结果（控制面内部已 try/catch）。
+    observe: observeWorldbookApplyTransition,
+  })
   : null;
 const AGENT_ADMISSION_LEDGER = AGENT_ADMISSION_RUNTIME.enabled
+  || skillCompileEnabled()
+  || skillEvaluateEnabled()
+  || skillSampleEnabled()
+  || skillQualityEnabled()
   || CONTEXT_COMPILER_RUNTIME.enabled
   || MAINTENANCE_ADMISSION_RUNTIME.enabled
   || existsSync(resolve(DATA_DIR, AGENT_ADMISSION_DB_FILE))
@@ -465,7 +942,28 @@ try {
 const LEARNING_OUTBOX_DRAINER = AGENT_LEARNING_LEDGER
   ? new LearningOutboxDrainer({ ledger: AGENT_LEARNING_LEDGER })
   : null;
+// Retained metadata recovers even after forward recording is disabled; it never enables an Agent.
+let AGENT_EVIDENCE_LEDGER = openAgentEvidenceRuntime({
+    dataDir: DATA_DIR, recordingEnabled: process.env.JG_EXPLICIT_PREFERENCE_ADOPTION_EVIDENCE === '1'
+        || process.env.JG_AGENT_SKILL_EVIDENCE === '1',
+    resolveSession: (file) => resolveSessionDatabase(DATA_DIR, file),
+    isSessionDeleted: (rawSessionId) => SESSION_DELETION_JOURNAL.isBlocked(rawSessionId),
+    onFailure: (code) => console.warn(`[AgentEvidence] ${code}（原回执保留，前台继续）`),
+});
 const MODEL_USAGE_COST = configuredModelUsageCostEstimator();
+const CONTEXT_COMPILER_SHADOW_RATES = Object.freeze({ input: process.env.JG_HARNESS_INPUT_MICROUSD_PER_MTOK,
+  output: process.env.JG_HARNESS_OUTPUT_MICROUSD_PER_MTOK });
+const AGENT_SKILL_CANDIDATE_RUNTIME = openAgentSkillCandidateRuntime({
+    dataDir: DATA_DIR, submissionEnabled: candidateSubmissionsEnabled,
+    onFailure: (code) => console.warn(`[AgentSkillCandidate] ${code}（候选保留，原Agent继续）`),
+});
+const SKILL_OPERATIONAL_SOURCE = AGENT_SKILL_CANDIDATE_RUNTIME && AGENT_CLOSURE_STORE
+  ? createSkillOperationalSource({
+    candidates: AGENT_SKILL_CANDIDATE_RUNTIME,
+    closures: AGENT_CLOSURE_STORE,
+    sourceAllowed: (rawSessionId) => !SESSION_DELETION_JOURNAL.isBlocked(rawSessionId),
+  })
+  : null;
 const rolloutLane = (lane: 'interactive' | 'maintenance' | 'learning' | 'critic'): AgentRolloutLane => (
   rolloutLaneForAdmission(lane)
 );
@@ -497,15 +995,35 @@ const maintenanceLaneExecutionAllowed = (sessionId: string): boolean => {
     }
     return AGENT_CONTROL_STORE.decide(
       'maintenance',
-      sessionId,
+      agentLaneRolloutBucketIdentity(runtime, sessionId),
       runtime.ceilings.maintenance,
     ).allowed;
   } catch {
     return false;
   }
 };
+const maintenanceTaskExecutionAllowed = (
+  sessionId: string,
+  taskKind?: import('./maintenance-types.ts').MaintenanceTaskKind,
+): boolean => {
+  if (!sessionDeletionAdmissionOpen(sessionId)) return false;
+  if (!maintenanceLaneExecutionAllowed(sessionId)) return false;
+  // NPC activation/backup is deliberately absent here: shadow proposal
+  // execution is governed by the Maintenance lane and capability only. The
+  // per-session backup proof is acquired at the final guarded apply boundary.
+  if (!taskKind) return true;
+  try {
+    return agentCapabilityTicketAllowed(AGENT_CONTROL_STORE, {
+      taskKind,
+      policyVersion: MAINTENANCE_POLICY_VERSION,
+    });
+  } catch {
+    return false;
+  }
+};
 const agentTicketControl = (
-  input: import('../../packages/agent-policy/src/admission.ts').AdmissionRequest,
+  input: Pick<import('../../packages/agent-policy/src/admission.ts').AdmissionRequest,
+    'sessionId' | 'lane' | 'taskKind' | 'policyVersion'>,
 ): ReturnType<AgentControlStore['get']> | false => {
   if (!agentCapabilityTicketAllowed(AGENT_CONTROL_STORE, input)) return false;
   const lane = rolloutLane(input.lane);
@@ -528,11 +1046,71 @@ const agentTicketControl = (
       return false;
     }
   } else if (!AGENT_CONTROL_STORE.decide(
-    lane, input.sessionId, runtime.ceilings[lane],
+    lane,
+    agentLaneRolloutBucketIdentity(runtime, input.sessionId),
+    runtime.ceilings[lane],
   ).allowed) {
     return false;
   }
   return AGENT_CONTROL_STORE.get(lane);
+};
+/**
+ * P16 C2.3 / C3：`learning.*` 与 `interactive.*` 都没有维护 job，证据来源只能按**会话种类**判定。
+ *
+ * 生产证据 = 本机 managed-local 真实会话，且学习 lane 当前**不处于 `test-session` 灰度**。
+ * `test-session` 下的产出是本机真跑、但不是生产证据，记 `operational-replay`：既不进生产
+ * 分母，也不像 `fixture` 那样从报表里彻底消失。运营 replay / 离线脚本不走本路径，必须
+ * 显式声明 `replay`；判定失败一律 `unknown`（由合同 fail-closed 记 `fixture`）。
+ *
+ * 这里用**纯函数** `evaluateAgentLaneRollout` 而不是 `AGENT_CONTROL_STORE.decide()`：
+ * 后者在 `shouldKill` 时会**写入** kill，观测路径绝不能产生业务副作用。
+ */
+const agentSessionKind = (sessionId: string): 'production' | 'replay' | 'unknown' => {
+  try {
+    const runtime = parseAgentLaneRuntimeConfig(process.env);
+    const managed = runtime.managed;
+    const decision = evaluateAgentLaneRollout({
+      lane: 'learning',
+      sessionId: managed ? agentLaneRolloutBucketIdentity(runtime, sessionId) : sessionId,
+      desiredState: managed ? AGENT_CONTROL_STORE.get('learning').desiredState : 'on',
+      hostCeiling: managed ? runtime.ceilings.learning : 'on',
+      evidence: AGENT_CONTROL_STORE.evidence('learning'),
+    });
+    return decision.effectiveState === 'test-session' ? 'replay' : 'production';
+  } catch {
+    return 'unknown';
+  }
+};
+/**
+ * P16 C2.3：操作者对 Style 提案 approve / rollback / disable 之后的转换证据。
+ *
+ * 读回发生在**提交之后**：从磁盘重读 `proposal.json`（权威真值）并核对派生 Skill 的
+ * 绑定。读回不成立就只记 `apply-committed`，绝不合成 `verified`。停用没有生效版本，
+ * 因此不产生读回，只把**原链**标成 `rolled-back`。
+ */
+const observeStyleCompileControl = (
+  proposal: StyleProposal,
+  status: 'applied' | 'reverted' | 'disabled',
+): void => {
+  if (!AGENT_CLOSURE_RECORDER) return;
+  const lineage = proposal.versions[0];
+  if (!lineage) return;
+  let readbackDigest: string | undefined;
+  if (status !== 'disabled') {
+    try {
+      readbackDigest = LEARNED_STYLE_PROPOSALS.readback(proposal.id).readbackDigest;
+    } catch {
+      // fail-closed：回读未成立 ⇒ 证据停在 apply，由 C4 的 reconciler 补录。
+      readbackDigest = undefined;
+    }
+  }
+  AGENT_CLOSURE_RECORDER.observeStyleCompileTransition({
+    proposalId: proposal.id,
+    lineageDigest: lineage.sourceDigest,
+    occurredAt: new Date().toISOString(),
+    status,
+    ...(readbackDigest ? { readbackDigest, targetRevision: readbackDigest } : {}),
+  });
 };
 const agentTicketAllowed = (
   input: import('../../packages/agent-policy/src/admission.ts').AdmissionRequest,
@@ -540,7 +1118,9 @@ const agentTicketAllowed = (
   allowed: true;
   maxModelCalls: number;
   quotaReservationDigest: string;
+  quotaWindowSequence: number;
   reservationCreated: boolean;
+  allowedLeaseClaimPurposes?: readonly ['server-agent-skill-profile-admission-v1'];
 }> => {
   const control = agentTicketControl(input);
   if (control === false) return false;
@@ -558,7 +1138,36 @@ const agentTicketAllowed = (
       allowed: true,
       maxModelCalls: reservation.maxModelCalls,
       quotaReservationDigest: reservation.reservationDigest,
+      quotaWindowSequence: reservation.windowSequence,
       reservationCreated: reservation.created,
+      ...(AGENT_CLOSURE_STORE && (
+        (agentSkillLiveEnabled(process.env) && input.taskKind === 'context_compiler'
+          && (input.policyVersion === CONTEXT_COMPILER_POLICY_VERSION || input.policyVersion === 'p14-q9r-context-compiler-v2'))
+        || (criticSkillLiveEnabled(process.env) && input.taskKind === 'critic_revision'
+          && input.policyVersion === CRITIC_SKILL_POLICY_VERSION)
+        || (preludeSkillLiveEnabled(process.env) && input.taskKind === 'interactive_prelude'
+          && preludeSkillPolicyAllowed(input.policyVersion))
+        || (variableProposalSkillLiveEnabled(process.env) && input.taskKind === 'interactive_prelude'
+          && variableProposalSkillPolicyAllowed(input.policyVersion))
+        || (aqlReplanSkillLiveEnabled(process.env) && input.taskKind === 'aql_replan'
+          && aqlReplanSkillPolicyAllowed(input.policyVersion))
+        || (maintenanceMemorySkillLiveEnabled(process.env) && input.taskKind === 'memory_consolidation'
+          && maintenanceMemorySkillPolicyAllowed(input.policyVersion))
+        || (maintenanceSummarySkillLiveEnabled(process.env) && input.taskKind === 'rolling_summary'
+          && maintenanceSummarySkillPolicyAllowed(input.policyVersion))
+        || (maintenanceArcSkillLiveEnabled(process.env) && input.taskKind === 'branch_index'
+          && maintenanceArcSkillPolicyAllowed(input.policyVersion))
+        || (maintenanceNpcSkillLiveEnabled(process.env) && input.taskKind === 'npc_state'
+          && maintenanceNpcSkillPolicyAllowed(input.policyVersion))
+        || (maintenanceWorldbookSkillLiveEnabled(process.env) && input.taskKind === 'worldbook_repair'
+          && maintenanceWorldbookSkillPolicyAllowed(input.policyVersion))
+        || (learningPreferenceSkillLiveEnabled(process.env) && input.taskKind === 'preference_extract'
+          && learningPreferenceSkillPolicyAllowed(input.policyVersion))
+        || (branchPreferenceSkillLiveEnabled(process.env) && input.taskKind === 'preference_extract'
+          && branchPreferenceSkillPolicyAllowed(input.policyVersion))
+        || (styleCompileSkillLiveEnabled(process.env) && input.taskKind === 'style_compile'
+          && styleCompileSkillPolicyAllowed(input.policyVersion)))
+        ? { allowedLeaseClaimPurposes: ['server-agent-skill-profile-admission-v1'] as const } : {}),
     });
   } catch {
     return false;
@@ -575,7 +1184,7 @@ const agentTicketBeginAllowed = (
   try { runtime = parseAgentLaneRuntimeConfig(process.env); } catch { return false; }
   const decision = evaluateAgentTicketBeginPolicy({
     lane: ticket.lane,
-    sessionId: ticket.sessionId,
+    sessionId: agentLaneRolloutBucketIdentity(runtime, ticket.sessionId),
     desiredState: current.desiredState,
     hostCeiling: runtime.ceilings[lane],
     managed: runtime.managed,
@@ -604,9 +1213,16 @@ const recordAgentControlObservation = (input: AgentControlObservation): void => 
     return;
   }
   const ceiling = runtime.managed ? runtime.ceilings[input.lane] : 'on';
-  AGENT_CONTROL_STORE.decide(input.lane, input.sessionId, ceiling);
+  AGENT_CONTROL_STORE.decide(
+    input.lane,
+    agentLaneRolloutBucketIdentity(runtime, input.sessionId),
+    ceiling,
+  );
 };
-const recordAgentRuntimeLease = (entry: AdmittedModelLeaseAudit): void => {
+const recordMaintenanceProtocolObservation = (input: MaintenanceRuntimeObservation): void => {
+  recordMaintenanceProtocolCircuit(AGENT_CONTROL_STORE, input);
+};
+const recordAgentRuntimeLease = (entry: AdmittedModelLeaseAudit, qualifyingSample = true): void => {
   const lane = rolloutLane(entry.lane);
   try {
     AGENT_ADMISSION_LEDGER?.recordRuntimeLease(entry);
@@ -628,7 +1244,7 @@ const recordAgentRuntimeLease = (entry: AdmittedModelLeaseAudit): void => {
     ...(entry.quotaReservationDigest
       ? { reservationDigest: entry.quotaReservationDigest }
       : {}),
-    qualifyingSample: entry.outcome === 'completed' && entry.authorizationCallsUsed > 0,
+    qualifyingSample: qualifyingSample && entry.outcome === 'completed' && entry.authorizationCallsUsed > 0,
     providerCalls: entry.authorizationCallsUsed,
     providerErrors: entry.providerErrorAttemptsUsed,
     ...(entry.authorizationCallsUsed > 0 ? { latencyMs: entry.wallMsUsed } : {}),
@@ -636,12 +1252,23 @@ const recordAgentRuntimeLease = (entry: AdmittedModelLeaseAudit): void => {
 };
 let modelUsageRecordWarningEmitted = false;
 process.once('exit', () => {
+  STYLE_COMPILE_RUNTIME?.stop();
   try { MODEL_USAGE_LEDGER.close(); } catch { /* graceful shutdown normally closes first */ }
   try { AGENT_ADMISSION_LEDGER?.close(); } catch { /* graceful shutdown normally closes first */ }
   try { AGENT_LEARNING_LEDGER?.close(); } catch { /* graceful shutdown normally closes first */ }
+  try { AGENT_EVIDENCE_LEDGER?.close(); } catch { /* graceful shutdown normally closes first */ }
+  try { AGENT_SKILL_CANDIDATE_RUNTIME?.close(); } catch { /* graceful shutdown normally closes first */ }
+  try { SKILL_QUALITY_RUNTIME?.close(); } catch { /* graceful shutdown normally closes first */ }
+  try { SKILL_SAMPLE_RUNTIME?.close(); } catch { /* graceful shutdown normally closes first */ }
+  try { CANDIDATE_EVALUATION_SAMPLE_HOST.close(); } catch { /* graceful shutdown normally closes first */ }
+  try { SKILL_EVALUATION_BATCH_STORE?.close(); } catch { /* graceful shutdown normally closes first */ }
+  try { SKILL_PROMOTION_RUNTIME?.close(); } catch { /* graceful shutdown normally closes first */ }
+  try { SKILL_EVALUATE_RUNTIME?.close(); } catch { /* graceful shutdown normally closes first */ }
+  try { SKILL_COMPILE_RUNTIME?.close(); } catch { /* graceful shutdown normally closes first */ }
   try { ARC_PROJECTIONS?.close(); } catch { /* graceful shutdown normally closes first */ }
   try { WORLDBOOK_REPAIR_CONTROL?.close(); } catch { /* graceful shutdown normally closes first */ }
   try { AGENT_CONTROL_STORE.close(); } catch { /* graceful shutdown normally closes first */ }
+  try { AGENT_CLOSURE_STORE?.close(); } catch { /* graceful shutdown normally closes first */ }
   try { SESSION_DELETION_JOURNAL.close(); } catch { /* graceful shutdown normally closes first */ }
   try { SERVER_PROCESS_LOCK.release(); } catch { /* exit 阶段只做固定锁目录的 best-effort 清理。 */ }
 });
@@ -653,7 +1280,7 @@ const ASSET_IMPORT_TRANSACTIONS = new AssetImportTransactionCoordinator({
   identities: ASSET_IDENTITIES,
 });
 // P8-04: process lock is already held; recovery completes before any HTTP listener exists.
-ASSET_IMPORT_TRANSACTIONS.recover();
+AGENT_CONTROL_STORE.recoverAssetMutationPending(() => ASSET_IMPORT_TRANSACTIONS.recover());
 const SNAPSHOT_FREEZE = new SynchronousSnapshotFreezeAdapter({
   dataDir: DATA_DIR,
   serverLock: SERVER_PROCESS_LOCK,
@@ -689,7 +1316,7 @@ const AUTH_PAIR_ADMISSION = new PairingAdmissionController({
 });
 const AUTH_REQUEST_ADMISSION = new RequestAdmissionController();
 const PLUGINS_DIR = resolve(DATA_DIR, 'plugins');
-/** 前端日志落盘路径（日志模块 v0.1.0：浏览器批量上报 → 逐行追加） */
+/** 前端日志落盘路径（日志模块 v0.6.1：浏览器批量上报 → 逐行追加） */
 const WEB_LOG_PATH = resolve(DATA_DIR, 'web.log');
 const SECURITY_AUDIT_PATH = resolve(DATA_DIR, 'security', 'audit.ndjson');
 const SECURITY_AUDIT = AUTH_RUNTIME
@@ -792,6 +1419,64 @@ function stripSensitive(value: unknown): unknown {
 }
 
 const sessions = new Map<string, ChatSession>();
+const EXPLICIT_PREFERENCE_EVIDENCE_SCHEDULER = AGENT_EVIDENCE_LEDGER
+    ? createExplicitPreferenceEvidenceScheduler({
+        ledger: AGENT_EVIDENCE_LEDGER, allowed: sessionDeletionAdmissionOpen,
+        open: (rawSessionId) => {
+            if (!sessionDeletionAdmissionOpen(rawSessionId)) return null;
+            const path = resolveSessionDatabase(DATA_DIR, `${rawSessionId}.db`);
+            return path ? openExplicitPreferenceEvidenceSource(path, rawSessionId) : null;
+        },
+        onFailure: () => console.warn('[AgentEvidence] RECEIPT_DELIVERY_PENDING（原回执保留，等待下次触发）'),
+    }) : null;
+const CLOSURE_SKILL_EVIDENCE_SCHEDULER = AGENT_EVIDENCE_LEDGER && AGENT_CLOSURE_STORE
+    ? createClosureSkillEvidenceScheduler({
+        ledger: AGENT_EVIDENCE_LEDGER, closure: AGENT_CLOSURE_STORE, allowed: sessionDeletionAdmissionOpen,
+        onClosureReady: (id) => { scheduleReportedEffectEvidence(id); wakeEffectWatchRecovery(id); },
+        open: (rawSessionId) => {
+            if (!sessionDeletionAdmissionOpen(rawSessionId)) return null;
+            const path = resolveSessionDatabase(DATA_DIR, `${rawSessionId}.db`);
+            return path ? openClosureSkillEvidenceSource(path, rawSessionId) : null;
+        },
+        onFailure: () => console.warn('[AgentEvidence] SKILL_RECEIPT_DELIVERY_PENDING（原回执保留，等待下次触发）'),
+    }) : null;
+const LEARNING_PREFERENCE_SOURCE_SCHEDULER = AGENT_LEARNING_LEDGER ? createLearningPreferenceSkillSourceScheduler({
+  ledger: AGENT_LEARNING_LEDGER, allowed: sessionDeletionAdmissionOpen,
+  open: (sessionId) => {
+    if (!sessionDeletionAdmissionOpen(sessionId)) return null;
+    const path = resolveSessionDatabase(DATA_DIR, `${sessionId}.db`);
+    return path ? openLearningPreferenceSkillSourceRecovery(path, sessionId) : null;
+  },
+  onFailure: () => console.warn('[AgentLearning] PREFERENCE_SOURCE_RECOVERY_PENDING（原来源保留，后台退避重试）'),
+}) : null;
+let skillDrainWarningEmitted = false;
+const SKILL_CONSUMPTION_SCHEDULER = AGENT_CLOSURE_STORE ? createAgentSkillConsumptionScheduler({
+  closure: AGENT_CLOSURE_STORE,
+  allowed: sessionDeletionAdmissionOpen,
+  onDelivered: (id) => { scheduleReportedEffectEvidence(id); wakeEffectWatchRecovery(id); },
+  open: (sessionId) => {
+    const session = sessions.get(sessionId);
+    if (session) {
+      const outbox = session.readAgentSkillConsumptionOutbox();
+      return outbox ? { outbox, close() {} } : null;
+    }
+    const path = resolveSessionDatabase(DATA_DIR, `${sessionId}.db`);
+    if (!path || !existsSync(path)) return null;
+    // Restart recovery opens only the metadata outbox, not ChatSession, assets or a Provider.
+    const db = new DatabaseSync(path);
+    try {
+      const outbox = AgentSkillConsumptionOutbox.openExisting(db);
+      if (!outbox) { db.close(); return null; }
+      return { outbox, close: () => db.close() };
+    } catch (error) { db.close(); throw error; }
+  },
+  onFailure: () => {
+    if (!skillDrainWarningEmitted) {
+      skillDrainWarningEmitted = true;
+      console.warn('[AgentSkill] CONSUMPTION_DRAIN_PENDING（保留待送回执，后台退避重试）');
+    }
+  },
+}) : null;
 const learningDrainScheduled = new WeakSet<ChatSession>();
 const learningReconcileRequested = new WeakSet<ChatSession>();
 const learningReconcileCursor = new WeakMap<ChatSession, { createdAt: string; eventId: string }>();
@@ -880,10 +1565,341 @@ const registryProviderClient = createRegistryProviderClient({
   },
 });
 
+function resolveAgentSelection() {
+  const main = loadProviderConfig();
+  return resolveAgentProviderSelection({
+    // P16 T-1：凭据封锁（测试安全门）下不得读取 agent-provider.json。
+    config: loadAgentProviderConfig({ ignoreFile: credentialLockdownActive() }),
+    main: { providerId: main.providerId, model: main.model },
+    describe: (providerId) => providerRegistry.describe(providerId),
+  });
+}
+
+/** Resolve and freeze an Agent provider/model at one admission boundary. */
+function agentModelBinding(selection = resolveAgentSelection()): {
+  selection: ReturnType<typeof resolveAgentSelection>;
+  client: ChatCompletionClient;
+} {
+  const fixedSelection = Object.freeze({ providerId: selection.providerId, model: selection.model });
+  const client = createRegistryProviderClient({
+    registry: providerRegistry,
+    resolveSelection: () => fixedSelection,
+  });
+  return {
+    selection: fixedSelection,
+    client: observeServerModelClient(client, () => fixedSelection.providerId),
+  };
+}
+
+function contextCompilerRuntimeAllows(config: ReturnType<typeof parseContextCompilerRuntimeConfig>, sessionId: string): boolean {
+  if (CONTEXT_COMPILER_RUNTIME.mode === 'canary' && config.mode !== 'canary') return false;
+  if (config.mode !== 'canary') return contextCompilerAllowsSession(config, sessionId);
+  if (CONTEXT_COMPILER_RUNTIME.mode !== 'canary' || !CONTEXT_COMPILER_CANARY
+    || CONTEXT_COMPILER_CANARY.scope.sessionId !== sessionId) return false;
+  if (process.env.JG_HARNESS_INPUT_MICROUSD_PER_MTOK !== CONTEXT_COMPILER_SHADOW_RATES.input
+    || process.env.JG_HARNESS_OUTPUT_MICROUSD_PER_MTOK !== CONTEXT_COMPILER_SHADOW_RATES.output)
+    throw new Error('context-canary-pricing-stale');
+  const { selection, client } = agentModelBinding();
+  const current = parseContextCompilerRuntimeConfig(process.env, modelRuntimeProfileFor(selection, client));
+  if (!current.budgetProfile || JSON.stringify(current.canaryScope) !== JSON.stringify(CONTEXT_COMPILER_CANARY.scope)
+    || !contextCompilerAllowsSession(current, sessionId, { providerId: selection.providerId, model: selection.model,
+      profileDigest: agentBudgetProfileDigest(current.budgetProfile) })) throw new Error('context-canary-scope-stale');
+  return true;
+}
+
+const OPERATIONAL_REPLAY_BRIDGE = process.env.JG_OPERATIONAL_REPLAY_BRIDGE === '1'
+  ? new OperationalReplayBridge({
+      dataDir: DATA_DIR,
+      serverInstanceId: SERVER_INSTANCE_ID,
+      resolveSelection: resolveAgentSelection,
+      complete: (selection, request, context) => {
+        const fixedSelection = Object.freeze({ providerId: selection.providerId, model: selection.model });
+        const client = createRegistryProviderClient({
+          registry: providerRegistry,
+          resolveSelection: () => fixedSelection,
+          createRequestId: () => context.requestId,
+        });
+        return arbitratedAgentClient(client, fixedSelection, 'operational-replay').complete(
+          request as unknown as ChatRequest, context.signal,
+          { runId: context.runId, maxTransportAttempts: context.maxTransportAttempts },
+        );
+      },
+    })
+  : null;
+process.once('exit', () => { OPERATIONAL_REPLAY_BRIDGE?.disposeSync(); });
+
+// P17-02.1: shadow recovery never grants execution authority. Legacy Managers
+// must be initialized/reconciled before even reconstructing their projections.
+let agentLoopLegacySourceReady = false;
+let agentLoopManagerReadersReady = false;
+// Private pre-write binding, keyed by this exact Service/Runtime context. No
+// persisted DTO or post-write reconstruction can create this host bundle.
+const AGENT_LOOP_APPLY_COMPLETION_HOSTS = new WeakMap<MaintenanceAgentLoopExecutionContext, ReturnType<typeof createAgentLoopSummaryApplyCompletion>>();
+const AGENT_LOOP_PROJECTION_STORE = new AgentLoopProjectionStore({
+  dataDir: resolve(DATA_DIR, 'agent-loop-projection'),
+  now: () => new Date().toISOString(),
+});
+const AGENT_LOOP_RUNTIME = createAgentLoopServerComposition({
+  store: AGENT_LOOP_PROJECTION_STORE,
+  ownerId: `server.${SERVER_INSTANCE_ID}`,
+  clock: () => new Date().toISOString(),
+  readers: {
+    readTurnJob: (runId) => agentLoopManagerReadersReady ? turnJobs.get(runId) : null,
+    readMaintenanceJob: (runId) => agentLoopManagerReadersReady ? maintenanceJobs.get(runId) : null,
+  },
+  maintenancePrepareSource: (runId) => readAgentLoopMaintenancePrepareSource(runId),
+  // Lazy host ports share this runtime's Coordinator. Construction never reads a TDZ Manager or allocates a Client.
+  maintenanceExecution: {
+    // Versioned, mutually exclusive production profile. Capturing this factory
+    // constructs no context-bound bundle and grants no claim or execution right.
+    executionProfile: {
+      version: AGENT_LOOP_MAINTENANCE_EXECUTION_PROFILE_VERSION,
+      route: 'correction-proposal',
+      publication: 'required',
+      correctionProposal: (context, step, lifetime) =>
+        createAgentLoopMaintenanceHostCorrectionProposal(context, step, lifetime),
+    },
+    readExecution: (runId) => agentLoopManagerReadersReady ? maintenanceJobs.readExecution(runId) : null,
+    prepare: (context, step) => createAgentLoopMaintenanceHostPrepare({
+      runId: context.execution.job.runId, taskId: context.taskId, ownerId: context.ownerId,
+      expectedRevision: step.revision, signal: context.signal,
+    }).prepare(step),
+    decide: (context, step) => createAgentLoopMaintenanceHostModel({
+      runId: context.execution.job.runId, taskId: context.taskId, ownerId: context.ownerId,
+      expectedRevision: step.revision, signal: context.signal,
+    }).decide(step),
+    getVariables: {
+      prepare: (context, step) => createAgentLoopMaintenanceHostPrepare({
+        runId: context.execution.job.runId, taskId: context.taskId, ownerId: context.ownerId,
+        expectedRevision: step.revision, signal: context.signal,
+      }).prepareGetVariables(step),
+      act: (context, step) => createAgentLoopMaintenanceHostAction({
+        runId: context.execution.job.runId, taskId: context.taskId, ownerId: context.ownerId,
+        expectedRevision: step.actionRequest.expectedTaskRevision, signal: context.signal,
+      }).act(step),
+    },
+    rollingSummaryProposal: {
+      prepare: (context, step) => createAgentLoopMaintenanceHostPrepare({
+        runId: context.execution.job.runId, taskId: context.taskId, ownerId: context.ownerId,
+        expectedRevision: step.revision, signal: context.signal,
+      }).prepareRollingSummaryProposal(step),
+      act: (context, step) => createAgentLoopMaintenanceHostAction({
+        runId: context.execution.job.runId, taskId: context.taskId, ownerId: context.ownerId,
+        expectedRevision: step.actionRequest.expectedTaskRevision, signal: context.signal,
+      }).actRollingSummaryProposal(step),
+      // Lazy, source-bound host request/Verify, not a claim/Provider enable switch.
+      publication: (context, step) => createAgentLoopMaintenanceHostPrepare({
+        runId: context.execution.job.runId, taskId: context.taskId, ownerId: context.ownerId,
+        expectedRevision: step.revision, signal: context.signal,
+      }).publication(),
+    },
+    // Trusted host route only; the Service pre-claim gate below stays false.
+    // This SAME Prepare capability selects MODEL without consumption, then the
+    // original apply Action consumes it once. Provider output grants nothing.
+    rollingSummaryApply: {
+      prepare: (context, step) => createAgentLoopMaintenanceHostPrepare({
+        runId: context.execution.job.runId, taskId: context.taskId, ownerId: context.ownerId,
+        expectedRevision: step.revision, signal: context.signal,
+      }).prepareRollingSummaryApply(step, context),
+      decide: (context, step, capability) => createAgentLoopMaintenanceHostModel({
+        runId: context.execution.job.runId, taskId: context.taskId, ownerId: context.ownerId,
+        expectedRevision: step.revision, signal: context.signal,
+      }, capability).decide(step),
+      act: (context, step, capability) => createAgentLoopMaintenanceHostAction({
+        runId: context.execution.job.runId, taskId: context.taskId, ownerId: context.ownerId,
+        expectedRevision: step.actionRequest.expectedTaskRevision, signal: context.signal,
+      }).actRollingSummaryApply(step, capability),
+      completion: (context, step) => createAgentLoopMaintenanceHostApplyCompletion(context, step),
+    },
+  },
+});
+// Exact construction fact for this one production Runtime: the versioned
+// correction-proposal factory and required-publication contract are captured,
+// while their context-bound bundle/publication remain uninstantiated and grant
+// no claim, execution, completion, publication, Canary or production authority.
+const AGENT_LOOP_SERVER_COMPOSITION_CAPABILITY_MANIFEST =
+  readAgentLoopServerCompositionCapabilityManifest(AGENT_LOOP_RUNTIME);
+if (!AGENT_LOOP_SERVER_COMPOSITION_CAPABILITY_MANIFEST
+  || !isAgentLoopServerCompositionCapabilityManifest(
+    AGENT_LOOP_RUNTIME,
+    AGENT_LOOP_SERVER_COMPOSITION_CAPABILITY_MANIFEST,
+  )) throw new Error('agent-loop-production-capability-manifest-unbound');
+// Read-only §13.84 observation only. Construction captures lazy callbacks and
+// must not touch the Manager that is initialized later in this module.
+const AGENT_LOOP_MAINTENANCE_PRODUCTION_JOB_READER =
+  createMaintenanceProductionQueuedJobReaderInternal(
+    () => maintenanceJobs,
+    () => {
+      if (!agentLoopManagerReadersReady) {
+        throw new Error('agent-loop-maintenance-production-reader-not-ready');
+      }
+    },
+  );
+const AGENT_LOOP_MAINTENANCE_ADMISSION_READER =
+  createAgentLoopMaintenanceCanaryAdmissionReaderInternal(
+    () => AGENT_ADMISSION_LEDGER,
+  );
+const AGENT_LOOP_MAINTENANCE_CANARY_SOURCE_POLICY_READER =
+  createAgentLoopMaintenanceCanarySourcePolicyReader({
+    readJob: AGENT_LOOP_MAINTENANCE_PRODUCTION_JOB_READER,
+    releaseOpen: () => agentLoopManagerReadersReady && releaseAdmissionOpen(),
+    sessionOpen: (sessionId) => agentLoopManagerReadersReady
+      && sessionDeletionAdmissionOpen(sessionId),
+    maintenanceEnabled: (sessionId) => agentLoopManagerReadersReady
+      && maintenanceJobs.settings(sessionId).effectiveEnabled,
+    modeAllowed: (job) => agentLoopManagerReadersReady
+      && maintenanceModelModeAllowed(MAINTENANCE_RUNTIME.enabled, MAINTENANCE_APPLY_RUNTIME, job),
+    foregroundActive: (sessionId) => !agentLoopManagerReadersReady
+      || turnJobs.getActiveForSession(sessionId) !== null,
+    summarySkillConflict: (job) => !agentLoopManagerReadersReady
+      || (maintenanceSummarySkillLiveEnabled(process.env)
+        && maintenanceSummarySkillPolicyAllowed(job.policyVersion)),
+    readAdmissions: AGENT_LOOP_MAINTENANCE_ADMISSION_READER,
+    readSource: (sessionId) => {
+      if (!agentLoopManagerReadersReady) return null;
+      const session = sessions.get(sessionId);
+      if (!session) return null;
+      const snapshot = snapshotForSession(session);
+      return {
+        // The proof keeps this identity private and the production dispatcher
+        // later requires this exact MemoryDb as its Session claim authority.
+        sessionIdentity: session.getMemory().mem,
+        sourceRevision: snapshot.snapshotToken,
+        databaseRevision: snapshot.databaseRevision,
+      };
+    },
+  });
+/** Same bounded Context Builder for legacy execution and the non-authorizing AL preview. */
+function buildRollingSummarySnapshotForSession(
+  session: ChatSession, sessionId: string, revision: string,
+  providerInput: Readonly<{ maxTokens: number; system: string }>,
+) {
+  const summaryState = session.getMemory().mem.db.prepare(
+    "SELECT COALESCE(longterm,'') longterm,COALESCE(summary_round,0) summaryRound FROM memory_meta WHERE id=1",
+  ).get() as { longterm: string; summaryRound: number } | undefined;
+  return buildMaintenanceSessionSnapshot({ session, sessionId, revision, taskKind: 'rolling_summary',
+    worldbookEntries: maintenanceWorldbookEntries(session),
+    ...(summaryState ? { summaryState } : {}), providerInputBudget: providerInput });
+}
+/** Rebuild the same Arc source for initial loading and every live Skill authority check. */
+function buildBranchIndexSnapshotForSession(
+  session: ChatSession, sessionId: string, revision: string,
+  providerInput: Readonly<{ maxTokens: number; system: string }>,
+) {
+  const learningArcProjection = AGENT_LEARNING_LEDGER
+    ? selectArcSessionProjection(AGENT_LEARNING_LEDGER.arcSessionProjections(), session.learningProfileIdentity())
+    : undefined;
+  const approvedArcProjection = ARC_PROJECTIONS?.read(sessionId);
+  const arcReviewBinding = bindArcMaintenanceReviewSnapshot({
+    learningArcs: (learningArcProjection?.arcs ?? []).map((arc) => ({
+      arcId: arc.arcId, status: arc.status, firstRound: arc.firstRound, lastRound: arc.lastRound,
+      evidenceCount: arc.evidenceCount, latestSourceRevision: arc.latestSourceRevision,
+    })),
+    reviewCatalog: session.getArcReviewCatalog(),
+    approvedStatuses: approvedArcProjection?.statuses,
+    mergedInto: approvedArcProjection?.mergedInto,
+  });
+  return buildMaintenanceSessionSnapshot({ session, sessionId, revision, taskKind: 'branch_index',
+    allowedArcIds: arcReviewBinding.allowedArcIds,
+    arcProjectionDigest: approvedArcProjection?.projectionDigest,
+    arcProjection: arcReviewBinding.arcEvidence,
+    arcReviewCatalog: arcReviewBinding.arcReviewDescriptors,
+    worldbookEntries: maintenanceWorldbookEntries(session), providerInputBudget: providerInput });
+}
+/** No Session loading, claim, Ticket, Client or model call. A preview is never an execution grant. */
+function readAgentLoopMaintenancePrepareSource(runId: string): AgentLoopMaintenancePrepareSource | null {
+  if (!agentLoopManagerReadersReady || !PROVIDER_SPI_ENABLED) return null;
+  const job = maintenanceJobs.get(runId);
+  const productionAdmission = AGENT_LOOP_MAINTENANCE_PRODUCTION_ROUTE_CONTRACT.jobAdmission;
+  const productionRouteSource = job?.taskKind === productionAdmission.taskKind
+    && job.mode === productionAdmission.mode
+    && job.trigger === productionAdmission.trigger
+    && job.policyVersion === productionAdmission.policyVersion
+    && isSafeOpaqueId(job.parentRunId);
+  if (!job || job.taskKind !== 'rolling_summary' || (job.status !== 'queued' && job.status !== 'running')
+    || (job.policyVersion !== MAINTENANCE_POLICY_VERSION && !productionRouteSource)
+    || !sessionDeletionAdmissionOpen(job.sessionId)) return null;
+  const session = sessions.get(job.sessionId);
+  if (!session) return null;
+  const revision = snapshotForSession(session).snapshotToken;
+  if (revision !== job.sourceRevision) return null;
+  const selection = resolveAgentSelection();
+  const descriptor = providerRegistry.describe(selection.providerId);
+  if (!descriptor?.configured || !descriptor.capabilities.chatCompletions || !descriptor.capabilities.tools) return null;
+  // Public capabilities suffice here: do not construct a client just to inspect its profile.
+  const runtimeProfile = resolveModelRuntimeProfile({ providerId: selection.providerId, modelId: selection.model,
+    supportsTools: descriptor.capabilities.tools, supportsStreaming: descriptor.capabilities.stream });
+  const budgetProfile = maintenanceBudgetProfileForAutonomy('quality-beta', 'rolling_summary', process.env, runtimeProfile);
+  const snapshot = buildRollingSummarySnapshotForSession(session, job.sessionId, revision, {
+    maxTokens: budgetProfile.agentInputBudgetTokens, system: maintenanceSystemPrompt('rolling_summary'),
+  });
+  if (!sessionDeletionAdmissionOpen(job.sessionId) || sessions.get(job.sessionId) !== session
+    || snapshotForSession(session).snapshotToken !== revision) return null;
+  return { job, snapshot, profile: { providerId: selection.providerId, modelId: selection.model,
+    runtimeProfile, budgetProfile, policyVersion: job.policyVersion, contentMode: session.getContentMode() } };
+}
+const AGENT_LOOP_RECOVERY_LIFECYCLE = startAgentLoopRecoveryLifecycle({
+  store: AGENT_LOOP_PROJECTION_STORE,
+  ownerId: `server.${SERVER_INSTANCE_ID}`,
+  leaseMs: 300_000,
+  intervalMs: 60_000,
+  limit: 32,
+  runOnStart: false,
+  shadowPublication: {
+    readManager: () => agentLoopLegacySourceReady ? maintenanceJobs : null,
+    clock: () => new Date().toISOString(),
+  },
+  summaryApplyCompletion: {
+    readManager: () => agentLoopLegacySourceReady ? maintenanceJobs : null,
+    clock: () => new Date().toISOString(),
+  },
+  sourceState: (envelope) => {
+    // The periodic timer can fire during slow plugin startup. Do not touch TDZ
+    // Managers or guess source liveness from a historical projection.
+    if (!agentLoopLegacySourceReady) return 'unavailable';
+    return shadowJobSourceState(envelope, {
+      readTurnJob: (runId) => turnJobs.get(runId),
+      readMaintenanceJob: (runId) => maintenanceJobs.get(runId),
+    });
+  },
+});
+let agentLoopProjectionStoreClosed = false;
+let agentLoopTaskInvalidationDrainer: ReturnType<typeof createAgentLoopTaskInvalidationDrainer> | undefined;
+function closeAgentLoopProjectionStore(): void {
+  if (agentLoopProjectionStoreClosed) return;
+  agentLoopProjectionStoreClosed = true;
+  AGENT_LOOP_PROJECTION_STORE.close();
+}
+async function quiesceAgentLoopRecovery(): Promise<void> {
+    await AGENT_LOOP_RECOVERY_LIFECYCLE.quiesce();
+    await AGENT_LOOP_RUNTIME.close();
+    await agentLoopTaskInvalidationDrainer?.stop();
+    agentLoopManagerReadersReady = false;
+    closeAgentLoopProjectionStore();
+}
+async function settleAgentLoopManagerReadersBeforeClose(): Promise<void> {
+  // Both background readers may still hold a Manager reference.  Shutdown
+  // first revokes the shared reader gate, then every Manager close joins both
+  // already-published tails before closing the underlying DB.
+  agentLoopManagerReadersReady = false;
+  const settled = await Promise.allSettled([
+    AGENT_LOOP_RECOVERY_LIFECYCLE.whenIdle(),
+    AGENT_LOOP_RUNTIME.whenIdle(),
+  ]);
+  const failure = settled.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+  if (failure) throw failure.reason;
+}
+process.once('exit', () => {
+  AGENT_LOOP_RECOVERY_LIFECYCLE.stop();
+  closeAgentLoopProjectionStore();
+});
+
+let providerConfigurationGeneration = 0;
 /** 重新读取电脑端配置并更新 builtin descriptor；Key 只留在 controller 内。 */
 function refreshProviderConfiguration(): ReturnType<typeof loadProviderConfig> {
   const cfg = loadProviderConfig();
   const descriptor = openAIProvider.rebind(cfg);
+  providerConfigurationGeneration++;
   if (PROVIDER_SPI_ENABLED) providerRegistry.updateDescriptor(PROVIDER_OWNER_ID, descriptor);
   for (const session of sessions.values()) {
     try { session.rebindProvider(cfg); } catch { /* 单个会话刷新失败不阻塞配置提交 */ }
@@ -891,14 +1907,129 @@ function refreshProviderConfiguration(): ReturnType<typeof loadProviderConfig> {
   return cfg;
 }
 
-function providerClientForServer() {
-  return PROVIDER_SPI_ENABLED ? registryProviderClient : undefined;
+function providerClientForServer(selection?: { readonly providerId: string; readonly model: string }) {
+  if (!PROVIDER_SPI_ENABLED) return undefined;
+  if (!selection) return registryProviderClient;
+  const fixedSelection = Object.freeze({ providerId: selection.providerId, model: selection.model });
+  return createRegistryProviderClient({ registry: providerRegistry, resolveSelection: () => fixedSelection });
 }
+
+/** Capture transport, identity and usage attribution together before each Session request queues. */
+/** Exact-session, opt-in operation accounting. All limits/rates must be supplied by the host. */
+let serverSessionProviderRuntime: ReturnType<typeof createSessionProviderRuntime> | undefined;
+function sessionProviderRuntime(): ReturnType<typeof createSessionProviderRuntime> {
+  return serverSessionProviderRuntime ??= createSessionProviderRuntime({ env: process.env,
+    providerSpiEnabled: PROVIDER_SPI_ENABLED, operationBudgetStore: () => turnJobs.manager.operationBudgetStore(),
+    loadProviderConfig, assertProviderReady, createDirectProviderClient: config => new OpenAICompatibleClient(config),
+    agentModelBinding, modelRuntimeProfileFor, providerClientForServer,
+    registryProviderClient, providerRegistry, readProviderGeneration: () => providerConfigurationGeneration,
+    observeServerModelClient, resolvedArbitratedAgentClient, skillFulfillmentForSession,
+    schemaRepairDispatchForSession: rawSessionId => {
+      return createSchemaRepairAdmittedDispatcher({
+        readContext: createSchemaRepairContextReader(() => sessions.get(rawSessionId),
+          () => sessionDeletionAdmissionOpen(rawSessionId)),
+        admissionAvailable: () => !!AGENT_ADMISSION_LEDGER && !!MODEL_USAGE_COST,
+        authorize: sessionId => agentTicketControl({ sessionId, lane: 'critic', taskKind: 'critic_revision',
+          policyVersion: 'p14-skill-fulfillment-v1' }) !== false,
+        broker: AGENT_ADMISSION_BROKER, audit: recordAgentRuntimeLease,
+      });
+    },
+    schemaRepairEvidence: (sessionId, value) => {
+      if (turnJobs.get(value.runId)) {
+        try { turnJobs.manager.saveRepairEvidence(sessionId, value.runId, value.candidateDigest, value.evidence); }
+        catch (cause) { throw new Error('schema-repair-evidence-storage-failed', { cause }); }
+      }
+    },
+    reportProgress: (sessionId, runId, phase) => turnJobs.reportProgress(sessionId, runId, phase),
+  });
+}
+function turnOperationClientForServer(sessionId: string, runId: string | undefined,
+  phase: TurnOperationPhase, client: ChatCompletionClient): ChatCompletionClient {
+  return sessionProviderRuntime().turnOperationClientForServer(sessionId, runId, phase, client);
+}
+
+/** Exact-session W4 host; all four lanes remain in the same parent operation. */
+function skillFulfillmentForSession(rawSessionId: string, operation: ReturnType<typeof createTurnOperationHost>) {
+  return createSkillFulfillmentSessionHost({
+    getSession: sessionId => sessions.get(sessionId),
+    admissionAvailable: () => !!AGENT_ADMISSION_LEDGER && !!MODEL_USAGE_COST,
+    sessionDeletionAdmissionOpen,
+    readStages: () => process.env.JG_SKILL_FULFILLMENT_STAGES_JSON,
+    agentModelBinding,
+    mainSelection: () => { const config = loadProviderConfig(); return { providerId: config.providerId, model: config.model }; },
+    arbitratedAgentClient,
+    broker: AGENT_ADMISSION_BROKER,
+    authorizeLease: (sessionId, phase) => agentTicketControl({ sessionId,
+      lane: phase === 'requirements' ? 'interactive' : 'critic',
+      taskKind: phase === 'requirements' ? 'interactive_prelude' : 'critic_revision',
+      policyVersion: 'p14-skill-fulfillment-v1' }) !== false,
+    audit: recordAgentRuntimeLease,
+  }, rawSessionId, operation);
+}
+
+/** Keep SPI-off's legacy fallback policy while decorating its internally selected transport. */
+function sessionProviderArgsForServer(sessionId: string): Pick<SessionArgs, 'providerClient' | 'observeProviderClient' | 'turnOperation' | 'skillFulfillment' | 'onTurnProgress' | 'onRejectedTurnCandidate' | 'schemaRepair' | 'schemaRepairMode'> {
+  return { ...sessionProviderRuntime().sessionProviderArgsForServer(sessionId),
+    onRejectedTurnCandidate: ({ runId, candidate }) => {
+      // Some internal Session callers have no TurnJob; only job-owned turns have this store.
+      if (turnJobs.get(runId)) turnJobs.manager.saveCandidate(sessionId, runId, candidate);
+    } };
+}
+
+const SESSION_AGENT_SKILL_SHADOW_RUNTIME_CONFIG = parseAgentSkillShadowRuntimeConfig();
+const STYLE_PACKAGE_SHADOW_ENABLED = SESSION_AGENT_SKILL_SHADOW_RUNTIME_CONFIG.enabled
+  && SESSION_AGENT_SKILL_SHADOW_RUNTIME_CONFIG.allowedSkillIds.includes(STYLE_PACKAGE_SHADOW_PIN.skillId);
+const STYLE_PACKAGE_SHADOW = createStylePackageShadowObserver({
+  directory: resolve(DATA_DIR, 'skills'), isEnabled: () => STYLE_PACKAGE_SHADOW_ENABLED,
+});
+const SESSION_AGENT_SKILL_SHADOW_METRICS = new SessionAgentSkillShadowMetrics();
+const SESSION_AGENT_SKILL_SHADOW_HEALTH_WINDOW = new SessionAgentSkillShadowHealthWindow();
+const SESSION_AGENT_SKILL_SHADOW_CATALOG = new CachedLegacyAgentSkillCatalogResolver({
+  load: () => createFilesystemLegacyAgentSkillCatalogAdapter({
+    allowedRootSkillIds: SESSION_AGENT_SKILL_SHADOW_RUNTIME_CONFIG.allowedSkillIds,
+  }),
+  ttlMs: 5_000,
+});
+const SESSION_AGENT_SKILL_SHADOW_DELEGATE = createSessionAgentSkillShadowObserver({
+  allowedRootSkillIds: SESSION_AGENT_SKILL_SHADOW_RUNTIME_CONFIG.allowedSkillIds,
+  resolveCatalog: () => SESSION_AGENT_SKILL_SHADOW_CATALOG.resolve(),
+  audit: (entry) => {
+    // The runner/cache only expose process-lifetime counters and do not know which catalog they
+    // serve. Rotate from the previous successful-audit checkpoint when a new revision first audits.
+    const runner = SESSION_AGENT_SKILL_SHADOW_RUNNER.snapshot();
+    const catalog = SESSION_AGENT_SKILL_SHADOW_CATALOG.snapshot();
+    SESSION_AGENT_SKILL_SHADOW_HEALTH_WINDOW.recordSuccessfulAudit(entry.catalogRevision, {
+      failed: runner.failed,
+      dropped: runner.dropped,
+      catalogRefreshFailures: catalog.refreshFailures,
+    });
+    SESSION_AGENT_SKILL_SHADOW_METRICS.record(entry);
+  },
+});
+const SESSION_AGENT_SKILL_SHADOW_RUNNER = new SessionAgentSkillShadowRunner(
+  { async observe(input) {
+    await SESSION_AGENT_SKILL_SHADOW_DELEGATE.observe(input);
+    if (STYLE_PACKAGE_SHADOW_ENABLED) await STYLE_PACKAGE_SHADOW.observe(input);
+  } },
+  { staleAfterMs: 120_000 },
+);
+function skillSelectionObserverForSession(rawSessionId: string): SessionArgs['skillSelectionObserver'] {
+  return SESSION_AGENT_SKILL_SHADOW_RUNTIME_CONFIG.allowsSession(rawSessionId)
+    ? SESSION_AGENT_SKILL_SHADOW_RUNNER
+    : undefined;
+}
+const STYLE_PACKAGE_PIN_STORE = new SkillPackagePinStore({ dataDir: DATA_DIR });
+const STYLE_PACKAGE_CANARY = createStylePackageCanary({
+  directory: resolve(DATA_DIR, 'skills'), controlFile: resolve(DATA_DIR, STYLE_PACKAGE_CANARY_FILE),
+  shadow: STYLE_PACKAGE_SHADOW, runner: SESSION_AGENT_SKILL_SHADOW_RUNNER,
+  controlStore: STYLE_PACKAGE_PIN_STORE, writesEnabled: skillPromotionWritesEnabled,
+  allowsSession: sessionId => STYLE_PACKAGE_SHADOW_ENABLED && SESSION_AGENT_SKILL_SHADOW_RUNTIME_CONFIG.allowsSession(sessionId),
+});
 
 /** Resolve one exact provider/model profile at a ticket boundary; callers keep that immutable
  * value for budget derivation and ticket issuance instead of observing a mid-call UI switch. */
 function modelRuntimeProfileFor(
-  cfg: ReturnType<typeof loadProviderConfig>,
+  cfg: { readonly providerId: string; readonly model: string },
   client: ChatCompletionClient = registryProviderClient,
 ) {
   let capabilities: { readonly stream: boolean; readonly tools: boolean } | undefined;
@@ -912,10 +2043,13 @@ function modelRuntimeProfileFor(
 }
 
 /** 包装任意生产客户端；只旁路写脱敏用量，绝不改变 Provider 请求或业务响应。 */
-function observeServerModelClient(client: ChatCompletionClient): ChatCompletionClient {
+function observeServerModelClient(
+  client: ChatCompletionClient,
+  resolveProviderId: () => string = () => loadProviderConfig().providerId,
+): ChatCompletionClient {
   return new ObservedChatCompletionClient(client, {
     record: (entry) => { MODEL_USAGE_LEDGER.record(entry); },
-    resolveProviderId: () => loadProviderConfig().providerId,
+    resolveProviderId,
     estimateCost: MODEL_USAGE_COST,
     onRecordError: () => {
       if (modelUsageRecordWarningEmitted) return;
@@ -925,17 +2059,269 @@ function observeServerModelClient(client: ChatCompletionClient): ChatCompletionC
   });
 }
 
+function skillAuthorWorkflowModelContext(taskKind: 'skill_compile' | 'skill_evaluate' | 'skill_sample') {
+    if (!PROVIDER_SPI_ENABLED || !MODEL_USAGE_COST || !AGENT_ADMISSION_LEDGER) return null;
+    try {
+        const binding = agentModelBinding();
+        const profile = modelRuntimeProfileFor(binding.selection, binding.client);
+        if (binding.client.capabilities?.().tools !== true) return null;
+        const budgetProfile = agentTaskBudgetProfile(taskKind, process.env, {}, profile);
+        // Only this digest persists: keys, endpoint configuration and descriptors never enter the job or prompt.
+        const modelBindingDigest = 'sha256:' + createHash('sha256').update(JSON.stringify({
+            selection: binding.selection, profile, budgetProfile,
+            descriptor: providerRegistry.describe(binding.selection.providerId),
+            configurationDigest: createHash('sha256').update(JSON.stringify(loadProviderConfig())).digest('hex'),
+        })).digest('hex');
+        return {
+            broker: AGENT_ADMISSION_BROKER,
+            client: arbitratedAgentClient(binding.client, binding.selection,
+                taskKind === 'skill_compile' ? 'style-compile' : 'quality-judge'),
+            modelId: binding.selection.model,
+            providerId: binding.selection.providerId, modelBindingDigest, budgetProfile, auditRequired: true,
+            onLeaseClosed: (entry: AdmittedModelLeaseAudit) => recordAgentRuntimeLease(entry, false),
+            estimateCostMicrousd: (usage: Parameters<NonNullable<typeof MODEL_USAGE_COST>>[0],
+                call: Parameters<NonNullable<typeof MODEL_USAGE_COST>>[1]) => MODEL_USAGE_COST!(usage, call)?.costMicrousd,
+        };
+    } catch { return null; }
+}
+
+function skillAuthorWorkflowSourceAllowed(
+    rawSessionId: string, taskKind: 'skill_compile' | 'skill_evaluate' | 'skill_sample' | 'skill_quality',
+) {
+    if (!sessionDeletionAdmissionOpen(rawSessionId)
+        || !agentAdmissionAllowsSession(parseAgentAdmissionRuntimeConfig(process.env), rawSessionId)) return false;
+    if (agentTicketControl({
+        sessionId: rawSessionId, lane: 'learning', taskKind,
+        policyVersion: taskKind === 'skill_compile' ? SKILL_COMPILE_POLICY_VERSION
+            : taskKind === 'skill_evaluate' ? SKILL_EVALUATE_POLICY_VERSION
+            : taskKind === 'skill_sample' ? SKILL_SAMPLE_POLICY_VERSION : SKILL_QUALITY_POLICY_VERSION,
+    }) === false) return false;
+    const path = resolveSessionDatabase(DATA_DIR, rawSessionId + '.db');
+    return path !== null && existsSync(path);
+}
+
+const SKILL_COMPILE_RUNTIME = openSkillCompileRuntime({
+    dataDir: DATA_DIR, candidates: AGENT_SKILL_CANDIDATE_RUNTIME, enabled: skillCompileEnabled,
+    resolveModel: () => skillAuthorWorkflowModelContext('skill_compile'),
+    sourceAllowed: (rawSessionId) => skillAuthorWorkflowSourceAllowed(rawSessionId, 'skill_compile'),
+    isSessionDeleted: (rawSessionId) => SESSION_DELETION_JOURNAL.isBlocked(rawSessionId),
+    onFailure: (code) => console.warn('[AgentSkillCompile] ' + code + '（原Agent继续，模型不重放）'),
+});
+
+const SKILL_EVALUATE_RUNTIME = openSkillEvaluateRuntime({
+    dataDir: DATA_DIR, enabled: skillEvaluateEnabled,
+    resolveModel: () => skillAuthorWorkflowModelContext('skill_evaluate'),
+    sourceAllowed: (rawSessionId) => skillAuthorWorkflowSourceAllowed(rawSessionId, 'skill_evaluate'),
+    resolvePlan: (compileJobId) => {
+        const source = SKILL_COMPILE_RUNTIME?.readEvaluationInput(compileJobId);
+        return source ? createSkillEvaluatePlan(source) : null;
+    },
+    isSessionDeleted: (rawSessionId) => SESSION_DELETION_JOURNAL.isBlocked(rawSessionId),
+    onFailure: (code) => console.warn('[AgentSkillEvaluate] ' + code + '（原Agent继续，模型不重放）'),
+});
+
+const CANDIDATE_EVALUATION_SAMPLE_HOST = new CandidateEvaluationSampleHost({
+    dataDir: DATA_DIR,
+    resolveCurrent: (compileJobId) => {
+        const retained = SKILL_COMPILE_RUNTIME?.readEvaluationInput(compileJobId);
+        const model = skillAuthorWorkflowModelContext('skill_sample');
+        if (!retained || !model) return null;
+        return {
+            evaluatePlan: createSkillEvaluatePlan(retained),
+            modelId: model.modelId,
+            modelBindingDigest: model.modelBindingDigest,
+            budgetProfile: model.budgetProfile,
+        };
+    },
+    isSessionDeleted: (rawSessionId) => SESSION_DELETION_JOURNAL.isBlocked(rawSessionId),
+});
+
+const SKILL_SAMPLE_RUNTIME = openSkillSampleRuntime({
+    dataDir: DATA_DIR, enabled: skillSampleEnabled, suiteEnabled: skillSampleSuiteEnabled,
+    resolveModel: () => skillAuthorWorkflowModelContext('skill_sample'),
+    sourceAllowed: (rawSessionId) => skillAuthorWorkflowSourceAllowed(rawSessionId, 'skill_sample'),
+    resolvePlan: (compileJobId) => {
+        const source = SKILL_COMPILE_RUNTIME?.readEvaluationInput(compileJobId);
+        return source ? createSkillSamplePlan(createSkillEvaluatePlan(source)) : null;
+    },
+    resolveCompletedPlan: (compileJobId) => {
+        const source = SKILL_COMPILE_RUNTIME?.readCompletedEvidenceInput(compileJobId);
+        return source ? createSkillSamplePlan(createSkillEvaluatePlan(source)) : null;
+    },
+    resolveDispatchSidecarFactory: (input) => CANDIDATE_EVALUATION_SAMPLE_HOST.resolve(input),
+    isSessionDeleted: (rawSessionId) => SESSION_DELETION_JOURNAL.isBlocked(rawSessionId),
+    onFailure: (code) => console.warn('[AgentSkillSample] ' + code + '（原Agent继续，模型不重放）'),
+});
+
+function skillQualityAuthorityForSource(source: SkillSampleQualityInput) {
+    if (credentialLockdownActive()) return null;
+    const generation = skillAuthorWorkflowModelContext('skill_sample');
+    if (!generation || generation.modelId !== source.generation.modelId
+        || generation.modelBindingDigest !== source.generation.modelBindingDigest) return null;
+    const resolved = resolveSkillQualityAuthority({
+        env: process.env,
+        generation: {
+            providerId: generation.providerId,
+            modelId: generation.modelId,
+            modelBindingDigest: generation.modelBindingDigest,
+        },
+        broker: AGENT_ADMISSION_BROKER,
+        estimateCostMicrousd: generation.estimateCostMicrousd,
+        onLeaseClosed: generation.onLeaseClosed,
+        describeProvider: (providerId) => providerRegistry.describe(providerId),
+        createClient: (selection) => {
+            const client = createRegistryProviderClient({
+                registry: providerRegistry,
+                resolveSelection: () => ({ providerId: selection.providerId, model: selection.model }),
+            });
+            return observeServerModelClient(client, () => selection.providerId);
+        },
+        resolveModelProfile: (selection, client) => modelRuntimeProfileFor(selection, client),
+    });
+    return resolved ? Object.freeze({
+        generation: resolved.generation,
+        judges: resolved.judges,
+        perJudgeBudgetDigest: resolved.perJudgeBudgetDigest,
+    }) : null;
+}
+
+const SKILL_QUALITY_RUNTIME = openSkillQualityRuntime({
+    dataDir: DATA_DIR,
+    enabled: skillQualityEnabled,
+    sourceAllowed: (rawSessionId) => skillAuthorWorkflowSourceAllowed(rawSessionId, 'skill_quality'),
+    resolveSource: (sampleSuiteId) => SKILL_SAMPLE_RUNTIME?.readQualityInput(sampleSuiteId) ?? null,
+    resolveCompletedSource: (sampleSuiteId) => SKILL_SAMPLE_RUNTIME?.readCompletedQualityInput(sampleSuiteId) ?? null,
+    resolveAuthority: skillQualityAuthorityForSource,
+    isSessionDeleted: (rawSessionId) => SESSION_DELETION_JOURNAL.isBlocked(rawSessionId),
+    onFailure: (code) => console.warn('[AgentSkillQuality] ' + code + '（原Agent继续，模型不重放）'),
+});
+
+/**
+ * P17 D-Q3a2c：Channel 发布写权限的显式开关（默认关闭）。
+ * 关着的时候：库不存在 ⇒ 路由 503 且不建库；库已存在 ⇒ 只读可用（体检/指针/历史），
+ * `promote` / `retire` 一律 `skill-promotion-disabled`。
+ */
+function skillPromotionWritesEnabled(): boolean {
+    return process.env.JG_SKILL_PROMOTION_STORES === '1';
+}
+
+/**
+ * P17 D-Q3a2b2：Candidate 评测批次库（发布侧汇合的证据源）。默认不建库：
+ * 只有显式 opt-in 或库已存在时才打开。
+ *
+ * `sourceCurrent` 逐次复验会话、Candidate/source revision、当前模型绑定与预算 epoch；
+ * 任一漂移都会触发 Store 的单调 revocation，旧批次不会复活。
+ * join 本身另有独立校验：Sample/Quality 的 suite 摘要必须逐字相等，候选必须 validated/rev2。
+ */
+const SKILL_EVALUATION_BATCH_STORE = (skillPromotionWritesEnabled()
+    || existsSync(resolve(DATA_DIR, CANDIDATE_EVALUATION_BATCH_DB_FILE)))
+    ? new CandidateEvaluationBatchStore({
+        dataDir: DATA_DIR,
+        isSessionDeleted: (rawSessionId) => SESSION_DELETION_JOURNAL.isBlocked(rawSessionId),
+        sourceCurrent: (source) => {
+            if (SESSION_DELETION_JOURNAL.isBlocked(source.rawSessionId)) return false;
+            const candidate = AGENT_SKILL_CANDIDATE_RUNTIME?.readCandidate(source.candidateId)?.candidate;
+            const model = skillAuthorWorkflowModelContext('skill_sample');
+            if (!candidate || !model || source.compileJobId === null || source.sampleSuiteId === null) {
+                return false;
+            }
+            const retained = SKILL_COMPILE_RUNTIME?.readCompletedEvidenceInput(source.compileJobId);
+            if (!retained) return false;
+            try {
+                const currentCompileSource = candidateEvaluationSampleSourceFromCurrent({
+                    evaluatePlan: createSkillEvaluatePlan(retained),
+                    sampleSuiteId: source.sampleSuiteId,
+                    modelId: model.modelId,
+                    modelBindingDigest: model.modelBindingDigest,
+                    budgetProfile: model.budgetProfile,
+                });
+                return candidateEvaluationCompletedSourceIdentityCurrent({
+                    source,
+                    currentCompileSource,
+                    candidate,
+                    modelId: model.modelId,
+                    modelBindingDigest: model.modelBindingDigest,
+                    budgetProfile: model.budgetProfile,
+                });
+            } catch { return false; }
+        },
+    })
+    : null;
+
+const SKILL_PROMOTION_RUNTIME = openSkillPromotionRuntime({
+    dataDir: DATA_DIR,
+    enabled: skillPromotionWritesEnabled,
+    styleCompileLiveEnabled: () => styleCompileSkillLiveEnabled(process.env),
+    // 裁决由 Quality 的离线回执确定性重算；只读、不含正文。
+    readQualityReceipt: (suiteId) => SKILL_QUALITY_RUNTIME?.readOfflineReceipt(suiteId) ?? null,
+    // 三源汇合：Sample 存储层 suite × Candidate 批次 × Quality 存储层 suite。
+    // 任一 runtime 未启用时对应端口返回 null，join 会以 source-missing 失败（不猜）。
+    joinPorts: {
+        readSampleSuite: (suiteId) => SKILL_SAMPLE_RUNTIME?.readStoredSuite(suiteId) ?? null,
+        readQualitySuite: (suiteId) => SKILL_QUALITY_RUNTIME?.readCompletedEvidenceSuite(suiteId) ?? null,
+        readBatch: (batchId) => SKILL_EVALUATION_BATCH_STORE?.readBatch(batchId)
+            ?? CANDIDATE_EVALUATION_SAMPLE_HOST.readBatch(batchId),
+        readBatchReadOnly: (batchId) => SKILL_EVALUATION_BATCH_STORE?.readCurrentBatchWithoutRevocation(batchId) ?? null,
+        listBatches: (candidateId, cursor) => {
+            if (!SKILL_EVALUATION_BATCH_STORE) throw new Error('skill-evidence-discovery-unavailable');
+            return SKILL_EVALUATION_BATCH_STORE.listCompletedForCandidate(candidateId, cursor);
+        },
+        listQualities: (sampleSuiteId, cursor) => {
+            if (!SKILL_QUALITY_RUNTIME) throw new Error('skill-evidence-discovery-unavailable');
+            return SKILL_QUALITY_RUNTIME.listCompletedEvidenceForSample(sampleSuiteId, cursor);
+        },
+    },
+    onFailure: (code) => console.warn('[AgentSkillPromotion] ' + code + '（发布面保持不可用）'),
+});
+
 function interactiveHarnessForSession(
   rawSessionId: string,
-): import('../../tools/cli/session.ts').SessionArgs['interactiveHarness'] {
+): import('../../packages/session/src/session.ts').SessionArgs['interactiveHarness'] {
   if (!INTERACTIVE_RUNTIME.enabled || INTERACTIVE_RUNTIME.lane === 'off' || !INTERACTIVE_CALL_LEDGER) return undefined;
-  const cfg = loadProviderConfig();
+  let runtimeProfile: ReturnType<typeof modelRuntimeProfileFor>;
+  try {
+    const binding = agentModelBinding();
+    runtimeProfile = modelRuntimeProfileFor(binding.selection, binding.client);
+  } catch {
+    // Keep the harness recoverable after a later config repair, but the per-turn
+    // resolveRuntime below still fails closed while the Agent selection is invalid.
+    runtimeProfile = modelRuntimeProfileFor(loadProviderConfig(), registryProviderClient);
+  }
   const budgetProfile = interactiveBudgetProfileForAutonomy(
     INTERACTIVE_RUNTIME.budgetProfile!.autonomyProfile,
     process.env,
-    modelRuntimeProfileFor(cfg),
+    runtimeProfile,
   );
   return {
+    resolveRuntime: () => {
+      const current = agentModelBinding();
+      const transport = arbitratedAgentClient(current.client, current.selection, 'interactive-prelude');
+      const operationHost = sessionProviderRuntime().activeHostForSession(rawSessionId);
+      const client: ChatCompletionClient = operationHost ? {
+        complete: (request, signal, call) => {
+          if (request.model !== undefined && request.model !== current.selection.model) throw new Error('turn-operation-model-mismatch');
+          if (!call?.runId) throw new Error('turn-operation-run-required');
+          return operationHost.wrap(call.runId, 'prelude', transport)
+            .complete({ ...request, model: current.selection.model }, signal, call);
+        },
+        stream: (request, onDelta, onToolArg, signal, call) => {
+          if (request.model !== undefined && request.model !== current.selection.model) throw new Error('turn-operation-model-mismatch');
+          if (!call?.runId) throw new Error('turn-operation-run-required');
+          return operationHost.wrap(call.runId, 'prelude', transport)
+            .stream({ ...request, model: current.selection.model }, onDelta, onToolArg, signal, call);
+        },
+        ...(transport.capabilities ? { capabilities: transport.capabilities.bind(transport) } : {}),
+        modelName: () => current.selection.model,
+      } : transport;
+      return {
+        client,
+        budgetProfile: interactiveBudgetProfileForAutonomy(
+          INTERACTIVE_RUNTIME.budgetProfile!.autonomyProfile,
+          process.env,
+          modelRuntimeProfileFor(current.selection, current.client),
+        ),
+      };
+    },
     lane: INTERACTIVE_RUNTIME.lane,
     budgetProfile,
     inputMicrousdPerMillionTokens: INTERACTIVE_RUNTIME.inputMicrousdPerMillionTokens!,
@@ -945,9 +2331,735 @@ function interactiveHarnessForSession(
   };
 }
 
-function agentAdmissionForSession(rawSessionId: string): import('../../tools/cli/session.ts').SessionArgs['agentAdmission'] {
+type StyleProposalInput = Parameters<NonNullable<NonNullable<SessionArgs['agentAdmission']>['requestStyleProposal']>>[0];
+type StyleProposalOutcome = Awaited<ReturnType<NonNullable<NonNullable<SessionArgs['agentAdmission']>['requestStyleProposal']>>>;
+type PreparedStyleProposalOutcome = Exclude<StyleProposalOutcome, { status: 'created' }>
+  | Readonly<{ status: 'prepared'; commit(): StyleProposalOutcome }>;
+
+/** Ephemeral binding only: never persist endpoint configuration or credentials in a Style job. */
+function styleProposalModelBindingDigest(
+  selection: ReturnType<typeof agentModelBinding>['selection'],
+  client: ChatCompletionClient,
+  budgetProfile: ReturnType<typeof agentTaskBudgetProfile>,
+): string {
+  return sha256Digest(JSON.stringify({
+    selection, profile: modelRuntimeProfileFor(selection, client), budgetProfile,
+    descriptor: providerRegistry.describe(selection.providerId),
+    configurationDigest: sha256Digest(JSON.stringify(loadProviderConfig())),
+  }));
+}
+
+/** A host configuration snapshot, never a dispatch ticket or permission to retry. */
+function captureStyleCompileBindingForSession(rawSessionId: string, contentMode: 'nsf' | 'nsfw'):
+  import('../../packages/memory/public/style-compile-intent-outbox.ts').StyleCompileBinding | null {
+  try {
+    if (!sessions.get(rawSessionId) || !sessionDeletionAdmissionOpen(rawSessionId) || !MODEL_USAGE_COST) return null;
+    const admission = parseAgentAdmissionRuntimeConfig(process.env);
+    const privacy = parseLearningTextRuntimeConfig(process.env);
+    if (!privacy.styleEnabled || !agentAdmissionAllowsSession(admission, rawSessionId)
+      || !agentCapabilityTicketAllowed(AGENT_CONTROL_STORE, {
+        taskKind: 'style_compile', policyVersion: 'p14-q7-style-compiler-v1' })) return null;
+    const runtime = parseAgentLaneRuntimeConfig(process.env);
+    const control = AGENT_CONTROL_STORE.get('learning');
+    const ticketSessionId = opaqueLearningToken('session', rawSessionId);
+    const decision = evaluateAgentLaneRollout({ lane: 'learning',
+      sessionId: runtime.managed ? agentLaneRolloutBucketIdentity(runtime, ticketSessionId) : ticketSessionId,
+      desiredState: runtime.managed ? control.desiredState : 'on',
+      hostCeiling: runtime.managed ? runtime.ceilings.learning : 'on',
+      evidence: AGENT_CONTROL_STORE.evidence('learning'),
+    });
+    if (control.desiredState === 'killed' || decision.shouldKill || (runtime.managed && !decision.allowed)) return null;
+    const model = agentModelBinding();
+    const profile = modelRuntimeProfileFor(model.selection, model.client);
+    const budget = agentTaskBudgetProfile('style_compile', process.env, {}, profile);
+    return normalizeStyleCompileBinding({ version: 'style-compile-binding-v1',
+      policyVersion: 'p14-q7-style-compiler-v1', providerId: model.selection.providerId, modelId: model.selection.model,
+      authorityDigest: sha256Digest(JSON.stringify({ version: 'style-runtime-authority-v1', ticketSessionId, contentMode,
+        admission: { mode: admission.mode, sessionScope: admission.sessionScope,
+          sessionAllowlist: [...admission.sessionAllowlist].sort() },
+        styleEnabled: privacy.styleEnabled, managed: runtime.managed,
+        cohort: runtime.cohort,
+        rolloutIdentity: runtime.managed ? agentLaneRolloutBucketIdentity(runtime, ticketSessionId) : ticketSessionId,
+        desiredState: control.desiredState, ceiling: runtime.managed ? runtime.ceilings.learning : 'on',
+      })),
+      modelBindingDigest: styleProposalModelBindingDigest(model.selection, model.client, budget),
+      modelProfileDigest: sha256Digest(JSON.stringify(profile)), budgetProfileDigest: agentBudgetProfileDigest(budget),
+    });
+  } catch { return null; }
+}
+
+/** Model work is read-only; only the returned synchronous commit may create a disabled proposal. */
+async function prepareStyleProposalForSession(
+  rawSessionId: string, candidate: StyleProposalInput,
+  execution?: Readonly<{ store: StyleCompileJobStore; job: import('./skill-hub/style-compile-job-store.ts').StyleCompileJobRecord }>,
+): Promise<PreparedStyleProposalOutcome> {
+  // The caller retains its arguments across await: do not let aliases change ownership or evidence.
+  let input: StyleProposalInput;
+  try {
+    input = Object.freeze({ ...candidate,
+      samples: Object.freeze(candidate.samples.map((sample) => Object.freeze({ ...sample }))),
+      forbiddenIdentityTerms: Object.freeze([...candidate.forbiddenIdentityTerms]),
+      scope: Object.freeze({ ...candidate.scope }),
+      ...(candidate.originalBinding !== undefined
+        ? { originalBinding: normalizeStyleCompileBinding(candidate.originalBinding) } : {}),
+    });
+  } catch { return Object.freeze({ status: 'skipped', reasonCode: 'style-admission-closed' }); }
+  let liveAdmission;
+  let livePrivacy;
+  try {
+    liveAdmission = parseAgentAdmissionRuntimeConfig(process.env);
+    livePrivacy = parseLearningTextRuntimeConfig(process.env);
+  } catch {
+    return Object.freeze({ status: 'skipped', reasonCode: 'style-runtime-config-invalid' });
+  }
+  const sampleChars = input.samples.reduce((sum, sample) => sum + sample.prose.length, 0);
+  const pilot = STYLE_COMPILE_RUNTIME_CONFIG.pilot;
+  if (!livePrivacy.styleEnabled || !agentAdmissionAllowsSession(liveAdmission, rawSessionId)
+    || (pilot && rawSessionId !== pilot.sessionId)
+    || input.rawSessionId !== rawSessionId || input.signal?.aborted
+    || input.runId === 'missing-run' || !MODEL_USAGE_COST
+    || input.samples.length < 1 || input.samples.length > 8 || sampleChars > 100_000) {
+    return Object.freeze({ status: 'skipped', reasonCode: 'style-admission-closed' });
+  }
+  const authority = styleProposalSourceAuthority(rawSessionId, input);
+  if (!authority) return Object.freeze({ status: 'skipped', reasonCode: 'style-admission-closed' });
+  const originalBindingCurrent = (): boolean => !input.originalBinding
+    || JSON.stringify(captureStyleCompileBindingForSession(rawSessionId, input.contentMode)) === JSON.stringify(input.originalBinding);
+  if (!originalBindingCurrent()) return Object.freeze({ status: 'skipped', reasonCode: 'style-admission-closed' });
+  const { selection: provider, client: rawStyleClient } = agentModelBinding();
+  const budgetProfile = agentTaskBudgetProfile(
+    'style_compile', process.env, {}, modelRuntimeProfileFor(provider, rawStyleClient),
+  );
+  const bindingDigest = styleProposalModelBindingDigest(provider, rawStyleClient, budgetProfile);
+  if (pilot && (provider.providerId !== pilot.providerId || provider.model !== pilot.modelId)) {
+    return Object.freeze({ status: 'skipped', reasonCode: 'style-admission-closed' });
+  }
+  if (input.originalBinding && input.originalBinding.modelBindingDigest !== bindingDigest) {
+    return Object.freeze({ status: 'skipped', reasonCode: 'style-admission-closed' });
+  }
+  let styleSkillSource: StyleCompileSkillSourceSnapshotV1 | null = null;
+  const stillAuthorized = (): boolean => {
+    try {
+      if (input.signal?.aborted || !parseLearningTextRuntimeConfig(process.env).styleEnabled
+        || !agentAdmissionAllowsSession(parseAgentAdmissionRuntimeConfig(process.env), rawSessionId)
+        || !originalBindingCurrent()
+        || (styleSkillSource !== null && !isStyleCompileSkillSourceCurrent(styleSkillSource))) return false;
+      if (pilot && (!styleCompileBackgroundAllowed()
+        || parseStyleCompileRuntimeConfig(process.env).pilot?.policyDigest !== pilot.policyDigest
+        || Date.now() >= Date.parse(pilot.expiresAt))) return false;
+      const current = styleProposalSourceAuthority(rawSessionId, input);
+      if (!current || current.session !== authority.session || current.sourceDigest !== authority.sourceDigest) return false;
+      const model = agentModelBinding();
+      const budget = agentTaskBudgetProfile('style_compile', process.env, {},
+        modelRuntimeProfileFor(model.selection, model.client));
+      return styleProposalModelBindingDigest(model.selection, model.client, budget) === bindingDigest;
+    } catch { return false; }
+  };
+  // Only the original executing durable job may acquire the new Style source. Legacy sync remains unchanged.
+  const styleSkillRequested = Boolean(execution && styleCompileSkillLiveEnabled(process.env));
+  if (styleSkillRequested && !AGENT_CLOSURE_STORE) {
+    return Object.freeze({ status: 'skipped', reasonCode: 'style-admission-closed' });
+  }
+  if (styleSkillRequested && execution) {
+    try {
+      styleSkillSource = captureStyleCompileSkillSource({ rawSessionId, session: authority.session,
+        store: execution.store, job: execution.job, input,
+        isSessionOpen: () => sessionDeletionAdmissionOpen(rawSessionId) && sessions.get(rawSessionId) === authority.session });
+    } catch { return Object.freeze({ status: 'skipped', reasonCode: 'style-admission-closed' }); }
+  }
+  // P17-01.3: arbitration owns background preemption and the physical Provider lifetime.
+  const pilotClient = pilot ? createStyleCompilePilotClient({ client: rawStyleClient, policy: pilot,
+    rawSessionId, providerId: provider.providerId, modelId: provider.model,
+    reservationDigest: sha256Digest(JSON.stringify(['style-pilot-call-v1', rawSessionId, input.runId,
+      input.sourceRevision, input.sourceDigest])), maxInputTokens: budgetProfile.agentInputBudgetTokens,
+    isCurrent: stillAuthorized,
+    reserve: (reservation) => {
+      if (!STYLE_COMPILE_RUNTIME) throw new Error('style-pilot-runtime-closed');
+      STYLE_COMPILE_RUNTIME.reservePilotBudget(reservation);
+    },
+    halt: (pilotIdDigest) => {
+      if (!STYLE_COMPILE_RUNTIME) throw new Error('style-pilot-runtime-closed');
+      STYLE_COMPILE_RUNTIME.haltPilotBudget(pilotIdDigest);
+    },
+  }) : rawStyleClient;
+  let styleDispatchLease: import('./agent-admission-broker.ts').AgentAdmissionLease | null = null;
+  const client = styleSkillRequested
+    ? arbitratedAgentClient(pilotClient, provider, 'style-compile', undefined, () => {
+      if (!stillAuthorized() || !styleDispatchLease || skillHost?.authorizeDispatch(styleDispatchLease) !== true
+        || skillCall?.authorizeFixedRequest() !== true) throw new Error('style-skill-source-current-lost');
+    })
+    : arbitratedAgentClient(pilotClient, provider, 'style-compile');
+  const modelRequest = buildStyleCompilationModelRequest({
+    profileVersion: input.profileVersion, samples: input.samples,
+    maxOutputTokens: budgetProfile.agentOutputBudgetTokens,
+  });
+  const tools = [...(modelRequest.tools ?? [])];
+  const fixedRequest = { ...modelRequest, model: provider.model };
+  let skillCall: ReturnType<typeof createStyleCompileSkillLiveCall> | null = null;
+  let skillHost: ReturnType<typeof createStyleCompileSkillHostAuthority> | null = null;
+  if (styleSkillSource) {
+    const source = styleSkillSource;
+    skillHost = createStyleCompileSkillHostAuthority({ source, broker: AGENT_ADMISSION_BROKER,
+      controlStore: AGENT_CONTROL_STORE, readLaneRuntime: () => parseAgentLaneRuntimeConfig(process.env),
+      readEligibility: (lease) => ({ allowed: stillAuthorized() && lease.budgetProfileDigest === agentBudgetProfileDigest(budgetProfile),
+        revision: bindingDigest }), liveEnabled: () => styleCompileSkillLiveEnabled(process.env),
+      safetyAuthority: { readForLease: (lease, current) => {
+        const dbPath = resolveSessionDatabase(DATA_DIR, `${rawSessionId}.db`);
+        return dbPath ? { sessionId: lease.sessionId, sourceRevision: current.sourceRevision,
+          state: NSFW_SCENE_SAFETY_CONTROL.read({ dbPath, sessionId: rawSessionId,
+            manifest: authority.session.getWorldbookSourceManifest() }) } : null;
+      } },
+    });
+    skillCall = createStyleCompileSkillLiveCall({ broker: AGENT_ADMISSION_BROKER, source,
+      authority: skillHost.authority, profileVersion: input.profileVersion, samples: input.samples, request: fixedRequest });
+  }
+  const estimateCost = MODEL_USAGE_COST;
+  const gateway = new AdmittedModelGateway(AGENT_ADMISSION_BROKER, client, {
+    estimateCostMicrousd: (usage, call) => estimateCost(usage, call)?.costMicrousd,
+    onLeaseClosed: recordAgentRuntimeLease, auditRequired: true,
+    ...(styleSkillRequested ? {
+      prepareRequestRequired: true,
+      prepareRequest: skillCall?.prepareRequest ?? (async () => null),
+      authorizeDispatch: (lease) => {
+        styleDispatchLease = lease;
+        return skillHost?.authorizeDispatch(lease) === true && skillCall?.authorizeFixedRequest() === true;
+      },
+    } : {}),
+  });
+  const ticket = AGENT_ADMISSION_BROKER.issue({
+    runId: input.runId, parentRunId: input.runId, sessionId: input.ticketSessionId,
+    sourceRevision: input.sourceRevision, lane: 'learning', taskKind: 'style_compile',
+    policyVersion: 'p14-q7-style-compiler-v1', modelId: provider.model,
+    budgetProfileDigest: agentBudgetProfileDigest(budgetProfile), toolSetDigest: agentToolSetDigest(tools),
+    mode: input.contentMode,
+    reasonCodes: [input.explicitRequest ? 'explicit-style-save' : 'style-evidence-threshold'],
+    evidenceDigests: [input.sourceDigest], noveltyDigest: input.sourceDigest, expectedBenefit: 'style-learning',
+    limits: admissionLimitsFromBudgetProfile(budgetProfile), deadlineMs: Date.now() + budgetProfile.maxWallMs,
+    allowedTools: [STYLE_DRAFT_TOOL_NAME], fullSkillSnapshots: [],
+    cooldownKey: `style:${input.ticketSessionId}:${input.profileVersion}`,
+    idempotencyKey: `admit:${input.runId}:style:${input.sourceDigest.slice(-16)}`, fallback: 'skip-optional-agent',
+  });
+  const lease = gateway.open({
+    binding: {
+      ticketId: ticket.ticketId, runId: ticket.runId, parentRunId: ticket.parentRunId,
+      sessionId: ticket.sessionId, sourceRevision: ticket.sourceRevision, lane: ticket.lane,
+      taskKind: ticket.taskKind, policyVersion: ticket.policyVersion, mode: ticket.mode, budgetProfile,
+    },
+    modelId: provider.model, tools,
+  });
+  let response: import('../../packages/proxy/public/client.ts').ChatResponse;
+  let skillProof: ReturnType<ReturnType<typeof createStyleCompileSkillLiveCall>['sealOutput']> = null;
+  try {
+    response = await lease.complete(fixedRequest, input.signal);
+    try { skillProof = skillCall?.sealOutput(response) ?? null; }
+    catch { /* Optional provenance cannot change the original parsed draft or create another request. */ }
+  } finally { skillCall?.abandon(); }
+  // Provider work already happened: reject (consume the old attempt), never report a no-call skip.
+  const fenced = () => Object.freeze({
+    status: 'rejected' as const, reasonCode: 'style-proposal-store-rejected' as const,
+  });
+  if (styleSkillRequested && !skillProof) return fenced();
+  if (!stillAuthorized()) return fenced();
+  const parsed = parseLearnedStyleModelResponse(response);
+  if (!parsed.ok) {
+    console.warn('[StyleCompile] ' + parsed.reasonCode);
+    return Object.freeze({ status: 'rejected', reasonCode: parsed.reasonCode });
+  }
+  const draft = parsed.draft;
+  let evaluation: ReturnType<typeof evaluateLearnedStyleDraft>;
+  try {
+    evaluation = evaluateLearnedStyleDraft({ draft, samples: input.samples,
+      forbiddenIdentityTerms: input.forbiddenIdentityTerms });
+  } catch { return fenced(); }
+  let committed: StyleProposalOutcome | undefined;
+  let commitStarted = false;
+  return Object.freeze({ status: 'prepared', commit: (): StyleProposalOutcome => {
+    if (committed) return committed;
+    if (commitStarted) return fenced();
+    commitStarted = true;
+    // No await between this authority read and business write; job CAS can wrap this commit later.
+    if (!stillAuthorized()) return (committed = fenced());
+    try {
+      const proposal = LEARNED_STYLE_PROPOSALS.create({
+        draft, sourceDigest: input.sourceDigest, profileVersion: input.profileVersion, model: provider.model,
+        policyVersion: 'p14-q7-style-compiler-v1', evaluation, scope: input.scope,
+      });
+      if (skillProof && styleSkillSource) {
+        try {
+          commitStyleCompileSkillSourceReceipt({ rawSessionId, session: authority.session, source: styleSkillSource,
+            proof: skillProof, proposalId: proposal.id, readProposal: (id) => LEARNED_STYLE_PROPOSALS.read(id),
+            isCurrentSession: () => sessionDeletionAdmissionOpen(rawSessionId) && sessions.get(rawSessionId) === authority.session });
+        } catch { console.warn('[StyleCompile] style-skill-source-write-failed'); }
+      }
+      // disabled -> validated only. Activation/readback are separate operator observations.
+      try {
+        const lineage = proposal.versions[0];
+        // Closure lineage is permanently v1. An idempotent create() may find this source
+        // at v2+, but that does not prove the original v1 run/sourceRevision for backfill.
+        if (lineage?.sourceDigest === input.sourceDigest && lineage.profileVersion === input.profileVersion
+          && lineage.model === provider.model && lineage.policyVersion === 'p14-q7-style-compiler-v1') {
+          AGENT_CLOSURE_RECORDER?.beginStyleCompile({
+            proposalId: proposal.id, sessionId: rawSessionId, sourceRevision: input.sourceRevision,
+            sourceDigest: lineage.sourceDigest, profileVersion: input.profileVersion,
+            policyVersion: 'p14-q7-style-compiler-v1', sessionKind: agentSessionKind(rawSessionId),
+          });
+        }
+      } catch {
+        // A sidecar failure cannot turn an already-created proposal into a no-effect failure.
+        // No validation evidence is fabricated; durable recovery must read back the real Store.
+        console.warn('[StyleCompile] style-proposal-closure-write-failed');
+      }
+      return (committed = Object.freeze({ status: 'created', proposalId: proposal.id }));
+    } catch {
+      console.warn('[StyleCompile] style-proposal-store-rejected');
+      return (committed = fenced());
+    }
+  } });
+}
+
+/** Real business composition; lifecycle/cutover remains explicit and is not started here. */
+function createServerStyleCompilePipeline(store: StyleCompileJobStore) {
+  return createStyleCompilePipeline({ store, now: () => new Date().toISOString(),
+    resolveSession: (id) => sessions.get(id) ?? null,
+    isSessionDeleted: (id) => !sessionDeletionAdmissionOpen(id),
+    prepare: (id, input, job) => prepareStyleProposalForSession(id, input, job ? { store, job } : undefined),
+    readProposal: (id) => LEARNED_STYLE_PROPOSALS.read(id),
+  });
+}
+
+/** A restart selects delivery; live revocation may close it, never rebind an in-flight turn. */
+function styleCompileBackgroundAllowed(): boolean {
+  try {
+    const live = parseStyleCompileRuntimeConfig(process.env);
+    return STYLE_COMPILE_RUNTIME_CONFIG.enabled && styleCompileStartupReady && !shuttingDown && releaseAdmissionOpen()
+      && live.enabled && live.pilot?.policyDigest === STYLE_COMPILE_RUNTIME_CONFIG.pilot?.policyDigest;
+  } catch { return false; }
+}
+
+/** Open historical metadata even after rollback to sync; that mode never claims model work. */
+function createServerStyleCompileRuntime(): StyleCompileRuntime | null {
+  const dataDir = resolve(DATA_DIR, STYLE_COMPILE_JOB_DATA_DIRECTORY);
+  if (!STYLE_COMPILE_RUNTIME_CONFIG.enabled && !existsSync(resolve(dataDir, STYLE_COMPILE_JOB_DB_FILE))) return null;
+  const store = new StyleCompileJobStore({ dataDir, now: () => new Date().toISOString() });
+  try {
+    return startStyleCompileRuntime({ store, pipeline: createServerStyleCompilePipeline(store),
+      listSessionIds: (input) => scanStyleCompileRecoverySessions({ dataDir: DATA_DIR, ...input,
+        resolveDatabase: (file) => resolveSessionDatabase(DATA_DIR, file), allowed: sessionDeletionAdmissionOpen }),
+      loadSession: loadSessionById, sourceAllowed: sessionDeletionAdmissionOpen,
+      isPrivacyCommitted: (id) => SESSION_DELETION_JOURNAL.isPrivacyCommitted(id),
+      isSessionAvailable: (id) => !sessions.get(id)?.isBusy() && turnJobs.getActiveForSession(id) === null
+        && maintenanceHarness?.isPostTurnBackgroundReady(id) === true,
+      mode: () => styleCompileBackgroundAllowed() ? 'background' : 'off',
+      ownerId: `style.${SERVER_INSTANCE_ID}`, now: () => new Date().toISOString(),
+      intervalMs: STYLE_COMPILE_RUNTIME_CONFIG.intervalMs, leaseMs: STYLE_COMPILE_RUNTIME_CONFIG.leaseMs,
+      sessionLimit: STYLE_COMPILE_RUNTIME_CONFIG.sessionPageSize, intentPageSize: STYLE_COMPILE_RUNTIME_CONFIG.intentPageSize,
+      jobLimit: STYLE_COMPILE_RUNTIME_CONFIG.jobsPerTick, runOnStart: false,
+      timers: {
+        setInterval: (callback, ms) => { const timer = setInterval(callback, ms); timer.unref(); return timer; },
+        clearInterval: (handle) => clearInterval(handle as ReturnType<typeof setInterval>),
+      }, logger: (code) => console.warn(code),
+    });
+  } catch (error) { store.close(); throw error; }
+}
+
+/** Mutually exclusive delivery captured for both newly created and restored Sessions. */
+function styleCompileAdmissionForSession(rawSessionId: string) {
+  return {
+    ...(STYLE_COMPILE_RUNTIME_CONFIG.enabled ? {
+      styleCompileDelivery: 'outbox' as const,
+      observeStyleCompileIntent: (input: { rawSessionId: string; runId: string; packetDigest: string }) => {
+        if (input.rawSessionId === rawSessionId) STYLE_COMPILE_RUNTIME?.wakeSession(rawSessionId);
+      },
+    } : {}),
+    captureStyleCompileBinding: (input: { rawSessionId: string; contentMode: 'nsf' | 'nsfw' }) =>
+      input.rawSessionId === rawSessionId ? captureStyleCompileBindingForSession(rawSessionId, input.contentMode) : null,
+    requestStyleProposal: async (input: StyleProposalInput) => {
+      const prepared = await prepareStyleProposalForSession(rawSessionId, input);
+      return prepared.status === 'prepared' ? prepared.commit() : prepared;
+    },
+  };
+}
+
+function learnedStyleAdoptionForSession(rawSessionId: string): NonNullable<SessionArgs['commitLearnedStyleAdoption']> {
+  return (consumption) => {
+    const session = sessions.get(rawSessionId);
+    if (!session || consumption.rawSessionId !== rawSessionId || !sessionDeletionAdmissionOpen(rawSessionId)) {
+      throw new Error('style-compile-adoption-session-unavailable');
+    }
+    commitStyleCompileSkillAdoption({ rawSessionId, session, consumption,
+      readProposal: (id) => LEARNED_STYLE_PROPOSALS.read(id),
+      isCurrentSession: () => sessions.get(rawSessionId) === session && sessionDeletionAdmissionOpen(rawSessionId),
+    });
+  };
+}
+
+function foregroundSkillHostForSession(
+  rawSessionId: string,
+  session: ChatSession,
+  readEligibility: Parameters<typeof createForegroundSkillHostAuthority>[0]['readEligibility'],
+  liveEnabled: () => boolean = () => agentSkillLiveEnabled(process.env),
+) {
+  return createForegroundSkillHostAuthority({ turnAuthority: session, controlStore: AGENT_CONTROL_STORE,
+    readLaneRuntime: () => parseAgentLaneRuntimeConfig(process.env), readEligibility, liveEnabled,
+    isCurrentSession: () => sessionDeletionAdmissionOpen(rawSessionId) && sessions.get(rawSessionId) === session,
+    safetyAuthority: { readForLease: (lease, turn) => {
+      const dbPath = resolveSessionDatabase(DATA_DIR, `${rawSessionId}.db`);
+      if (!dbPath) return null;
+      return { sessionId: lease.sessionId, sourceRevision: turn.sourceRevision,
+        state: NSFW_SCENE_SAFETY_CONTROL.read({ dbPath, sessionId: rawSessionId,
+          manifest: session.getWorldbookSourceManifest() }) };
+    } },
+  });
+}
+
+function variableProposalSkillForSession(rawSessionId: string): SessionArgs['variableProposalSkill'] {
+  return async (input) => {
+    if (!variableProposalSkillLiveEnabled(process.env)) return null;
+    if (!AGENT_CLOSURE_STORE || !AGENT_ADMISSION_LEDGER || !MODEL_USAGE_COST
+      || input.rawSessionId !== rawSessionId || input.signal.aborted) {
+      throw new Error('variable-proposal-skill-unavailable');
+    }
+    const session = sessions.get(rawSessionId);
+    if (!session || !sessionDeletionAdmissionOpen(rawSessionId)) {
+      throw new Error('variable-proposal-skill-session-unavailable');
+    }
+    const current = () => {
+      const turn = session.readAgentSkillTurnContext(input.runId);
+      return variableProposalSkillLiveEnabled(process.env) && !input.signal.aborted
+        && sessionDeletionAdmissionOpen(rawSessionId) && sessions.get(rawSessionId) === session
+        && turn?.sessionId === opaqueLearningToken('session', rawSessionId)
+        && turn.sourceRevision === input.source.sourceRevision && turn.contentMode === input.contentMode
+        && input.source.runId === input.runId && input.source.round === input.round
+        && input.source.contentMode === input.contentMode && session.getHistoryEpoch() === input.source.historyEpoch;
+    };
+    const live = parseAgentAdmissionRuntimeConfig(process.env);
+    if (!current() || !agentAdmissionAllowsSession(live, rawSessionId)) {
+      throw new Error('variable-proposal-skill-admission-denied');
+    }
+    const { selection: provider, client } = agentModelBinding();
+    const readBudget = () => {
+      const base = agentTaskBudgetProfile('interactive_prelude', process.env,
+        { maxOutputTokens: input.source.maxOutputTokens }, modelRuntimeProfileFor(provider, client));
+      return normalizeAgentBudgetProfile({ ...base, maxSteps: 1, maxModelCalls: 1, maxToolCalls: 0, maxWrites: 0,
+        agentInputBudgetTokens: Math.min(4_000, base.agentInputBudgetTokens), maxToolResultChars: 0 });
+    };
+    const budgetProfile = readBudget();
+    const request = buildVariableProposalSkillRequest({ source: input.source, specs: input.specs,
+      values: input.values, userInput: input.userInput, model: provider.model });
+    const host = foregroundSkillHostForSession(rawSessionId, session, (lease) => {
+      const budget = readBudget();
+      return { revision: agentBudgetProfileDigest(budget), allowed: current()
+        && agentAdmissionAllowsSession(parseAgentAdmissionRuntimeConfig(process.env), rawSessionId)
+        && agentBudgetProfileDigest(budget) === lease.budgetProfileDigest };
+    }, () => variableProposalSkillLiveEnabled(process.env));
+    const skillCall = createVariableProposalSkillLiveCall({ broker: AGENT_ADMISSION_BROKER,
+      rawSessionId, source: input.source, specs: input.specs, values: input.values, userInput: input.userInput,
+      request, authority: host.authority });
+    let physicalLease: AgentAdmissionLease | undefined;
+    let closedAudit: AdmittedModelLeaseAudit | undefined;
+    let auditRecorded = false;
+    const recordClosedAudit = () => {
+      if (!closedAudit || auditRecorded) return false;
+      auditRecorded = true;
+      recordAgentRuntimeLease(closedAudit);
+      return true;
+    };
+    const gateway = new AdmittedModelGateway(AGENT_ADMISSION_BROKER,
+      turnOperationClientForServer(rawSessionId, input.runId, 'prelude', arbitratedAgentClient(client, provider, 'interactive-prelude', undefined, () => {
+        if (!physicalLease || !AGENT_ADMISSION_BROKER.mayDispatchLease(physicalLease)
+          || !current() || !host.authorizeDispatch(physicalLease)
+          || !skillCall.authorizeFixedRequest() || !skillCall.authorizeCurrentContext(physicalLease)) {
+          throw new AdmittedModelGatewayError('gateway-dispatch-authority-denied');
+        }
+      })), {
+        estimateCostMicrousd: (usage, call) => MODEL_USAGE_COST(usage, call)?.costMicrousd,
+        onLeaseClosed: (audit) => { closedAudit = audit; }, auditRequired: true, prepareRequestRequired: true,
+        prepareRequest: skillCall.prepareRequest,
+        authorizeDispatch: (lease) => { physicalLease = lease; return current() && host.authorizeDispatch(lease); },
+      });
+    const ticket = AGENT_ADMISSION_BROKER.issue({
+      runId: input.runId, parentRunId: input.runId, sessionId: opaqueLearningToken('session', rawSessionId),
+      sourceRevision: input.source.sourceRevision, lane: 'interactive', taskKind: 'interactive_prelude',
+      policyVersion: input.source.policyVersion, modelId: provider.model,
+      budgetProfileDigest: agentBudgetProfileDigest(budgetProfile), toolSetDigest: agentToolSetDigest([]),
+      mode: input.contentMode, reasonCodes: ['variable-proposal-staged'], evidenceDigests: [input.source.sourceDigest],
+      noveltyDigest: input.source.sourceDigest, expectedBenefit: 'state-correctness',
+      limits: admissionLimitsFromBudgetProfile(budgetProfile), deadlineMs: Date.now() + budgetProfile.maxWallMs,
+      allowedTools: [], fullSkillSnapshots: [], cooldownKey: `variable-proposal:${input.runId}`,
+      idempotencyKey: `admit:${input.runId}:variable-proposal`, fallback: 'skip-optional-agent',
+    });
+    try {
+      const response = await gateway.complete({ binding: { ticketId: ticket.ticketId, runId: ticket.runId,
+        parentRunId: ticket.parentRunId, sessionId: ticket.sessionId, sourceRevision: ticket.sourceRevision,
+        lane: ticket.lane, taskKind: ticket.taskKind, policyVersion: ticket.policyVersion, mode: ticket.mode,
+        budgetProfile }, request, signal: input.signal });
+      const candidate = typeof response.content === 'string'
+        ? parseVariableProposalSkillOutput(response.content, input.specs, input.source.maxCandidateCount) : null;
+      if (!candidate) throw new Error('variable-proposal-skill-output-invalid');
+      if (!current() || !physicalLease
+        || !skillCall.sealOutput(response.content, candidate.candidateDigest)) {
+        throw new Error('variable-proposal-skill-authority-denied');
+      }
+      const lease = physicalLease;
+      const permissionSnapshot = () => {
+        const turn = session.readAgentSkillTurnContext(input.runId);
+        if (!turn || !host.authorizeDispatch(lease)) return null;
+        const lane = AGENT_CONTROL_STORE.get('interactive');
+        const capabilities = ['interactive.prelude', 'interactive.director', 'interactive.variableProposal'] as const;
+        const controls = capabilities.map((id) => AGENT_CONTROL_STORE.capabilityControl(id));
+        if (lane.desiredState === 'off' || lane.desiredState === 'killed' || lane.killedReason !== null
+          || controls.some((control) => control.killedReason !== null)) return null;
+        const safety = input.contentMode === 'nsfw' ? host.authority.safetyAuthority.readForLease(lease, turn) : null;
+        if (input.contentMode === 'nsfw' && (!safety || !safety.state.enabled
+          || safety.state.reasonCode !== 'active' || safety.state.adultAttestation !== 'verified'
+          || !safety.state.participantsAdult || safety.state.consent !== 'confirmed'
+          || !Number.isSafeInteger(safety.state.revision) || safety.state.revision < 1
+          || safety.state.sourceRevision !== turn.worldbookSourceRevision)) return null;
+        // Pin runtime policy independently of this successful call's own quota accounting.
+        const laneRuntime = parseAgentLaneRuntimeConfig(process.env);
+        return JSON.stringify({ lane, controls, safety, laneRuntime });
+      };
+      const permission = permissionSnapshot();
+      if (!permission || !recordClosedAudit() || !current() || permissionSnapshot() !== permission) {
+        throw new Error('variable-proposal-skill-authority-denied');
+      }
+      return { request, content: response.content, seal: ({ candidateDigest }) => current()
+        && candidateDigest === candidate.candidateDigest && permissionSnapshot() === permission };
+    } catch (error) {
+      skillCall.abandon();
+      throw error;
+    } finally {
+      if (!auditRecorded && closedAudit) recordClosedAudit();
+    }
+  };
+}
+
+/** Read accepted lineage, not the moving interactive revision; changed representatives fail closed. */
+function styleProposalSourceAuthority(rawSessionId: string, input: StyleProposalInput):
+  Readonly<{ session: ChatSession; sourceDigest: string }> | null {
+  try {
+    const session = sessions.get(rawSessionId);
+    if (!session || !sessionDeletionAdmissionOpen(rawSessionId) || input.rawSessionId !== rawSessionId
+      || input.runId === 'missing-run' || input.ticketSessionId !== opaqueLearningToken('session', rawSessionId)
+      || !agentCapabilityTicketAllowed(AGENT_CONTROL_STORE, {
+        taskKind: 'style_compile', policyVersion: 'p14-q7-style-compiler-v1' })) return null;
+    // Source rechecks are pure reads. Ticket admission owns any persistent rollout kill transition.
+    const laneRuntime = parseAgentLaneRuntimeConfig(process.env);
+    const laneControl = AGENT_CONTROL_STORE.get('learning');
+    if (laneControl.desiredState === 'killed') return null;
+    const laneDecision = evaluateAgentLaneRollout({
+      lane: 'learning',
+      sessionId: laneRuntime.managed
+        ? agentLaneRolloutBucketIdentity(laneRuntime, input.ticketSessionId) : input.ticketSessionId,
+      desiredState: laneRuntime.managed ? laneControl.desiredState : 'on',
+      hostCeiling: laneRuntime.managed ? laneRuntime.ceilings.learning : 'on',
+      evidence: AGENT_CONTROL_STORE.evidence('learning'),
+    });
+    if (laneDecision.shouldKill || (laneRuntime.managed && !laneDecision.allowed)) return null;
+    const scope = session.learnedStyleProposalScope(input.contentMode);
+    if (Object.keys(input.scope).sort().join(',') !== 'baseStyleSkillId,cardId,contentMode,sessionId'
+      || scope.sessionId !== input.ticketSessionId || input.scope.sessionId !== scope.sessionId
+      || input.scope.cardId !== scope.cardId || input.scope.contentMode !== scope.contentMode
+      || input.scope.baseStyleSkillId !== scope.baseStyleSkillId) return null;
+    const retainedIntent = session.readStyleCompileIntent(input.runId);
+    // Once a durable intent exists, deleting optional fields must never downgrade it to the legacy path.
+    if (retainedIntent || input.intentPacketDigest !== undefined) {
+      if (!retainedIntent || !input.intentPacketDigest || !input.originalBinding
+        || retainedIntent.packetDigest !== input.intentPacketDigest
+        || !/^sha256:[a-f0-9]{64}$/u.test(input.intentPacketDigest)) return null;
+      const original = session.styleCompileIntentRequest(input.runId, input.intentPacketDigest);
+      if (!original) return null;
+      const metadata = (value: StyleProposalInput) => ({ rawSessionId: value.rawSessionId,
+        ticketSessionId: value.ticketSessionId, runId: value.runId, sourceRevision: value.sourceRevision,
+        contentMode: value.contentMode, sourceDigest: value.sourceDigest, profileVersion: value.profileVersion,
+        explicitRequest: value.explicitRequest, scope: value.scope, originalBinding: value.originalBinding,
+        intentPacketDigest: value.intentPacketDigest,
+        samples: value.samples.map((sample) => ({ sourceRevision: sample.sourceRevision, proseDigest: sha256Digest(sample.prose) })),
+        forbiddenIdentityDigest: sha256Digest(JSON.stringify(value.forbiddenIdentityTerms)),
+      });
+      if (JSON.stringify(metadata(original)) !== JSON.stringify(metadata(input))) return null;
+      return Object.freeze({ session, sourceDigest: sha256Digest(JSON.stringify({
+        version: 'style-intent-source-authority-v1', packetDigest: input.intentPacketDigest, source: metadata(original),
+      })) });
+    }
+    const marker = session.turnOutcome(input.runId);
+    if (!marker || marker.runId !== input.runId || marker.sessionId !== rawSessionId
+      || marker.action !== 'turn' || marker.revision !== input.sourceRevision
+      || marker.revision !== `round-${marker.round}-assistant-${marker.assistantMessageId}`) return null;
+    const epoch = session.getHistoryEpoch();
+    const profile = /^style-profile-v1-(0|[1-9]\d*)$/u.exec(input.profileVersion);
+    const acceptedSamples = profile ? Number(profile[1]) : NaN;
+    if (!Number.isSafeInteger(epoch) || epoch < 0 || !Number.isSafeInteger(acceptedSamples)
+      || !/^sha256:[a-f0-9]{64}$/u.test(input.sourceDigest)) return null;
+    const db = session.getMemory().mem.db;
+    type EvidenceRow = {
+      event_id: string; run_id: string | null; round: number; assistant_message_id: number | null;
+      source_revision: string; subject_digest: string; features_json: string; payload_digest: string;
+    };
+    const anchors = db.prepare(`SELECT * FROM learning_outbox WHERE event_kind='turn_accepted_weak'
+      AND run_id=? AND session_id=? AND card_id=? AND content_mode=? AND source_revision=?
+      AND round=? AND assistant_message_id=? LIMIT 2`).all(opaqueLearningToken('run', input.runId),
+      scope.sessionId, scope.cardId, input.contentMode, input.sourceRevision,
+      marker.round, marker.assistantMessageId) as EvidenceRow[];
+    if (anchors.length !== 1) return null;
+    const anchor = anchors[0]!;
+    const anchorFeatures = JSON.parse(anchor.features_json) as Record<string, unknown>;
+    const styleSkillId = anchorFeatures.styleSkillId;
+    if (anchorFeatures.styleEvidenceVersion !== 'style-evidence-v1' || anchorFeatures.styleAcceptance !== 'weak'
+      || typeof styleSkillId !== 'string' || !/^style:sha256:[a-f0-9]{64}$/u.test(styleSkillId)) return null;
+    // Tombstones invalidate lineage across mode switches, but never across session ownership.
+    const tombstoned = db.prepare(`SELECT 1 FROM learning_outbox WHERE session_id=? AND
+      ((event_kind='delete' AND source_revision=?) OR (event_kind='regenerate'
+        AND json_extract(features_json,'$.replacedSourceRevision')=?)) LIMIT 1`);
+    if (tombstoned.get(scope.sessionId, input.sourceRevision, input.sourceRevision)) return null;
+    const accepted = db.prepare(`SELECT sample.* FROM learning_outbox sample
+      WHERE sample.event_kind='turn_accepted_weak' AND sample.session_id=? AND sample.card_id=?
+        AND sample.content_mode=? AND sample.source_revision IS NOT NULL
+        AND json_extract(sample.features_json,'$.styleAcceptance')='weak'
+        AND json_extract(sample.features_json,'$.styleSkillId')=?
+        AND json_type(sample.features_json,'$.proseDigest')='text'
+        AND NOT EXISTS (SELECT 1 FROM learning_outbox tombstone WHERE tombstone.session_id=sample.session_id
+          AND ((tombstone.event_kind='delete' AND tombstone.source_revision=sample.source_revision)
+            OR (tombstone.event_kind='regenerate'
+              AND json_extract(tombstone.features_json,'$.replacedSourceRevision')=sample.source_revision)))
+      ORDER BY sample.round DESC,sample.event_id DESC LIMIT 8`).all(
+      scope.sessionId, scope.cardId, input.contentMode, styleSkillId) as EvidenceRow[];
+    if (accepted.length < 1 || input.samples.length !== accepted.length) return null;
+    const evidence: Array<{ eventId: string; payloadDigest: string; proseDigest: string }> = [];
+    for (const [index, row] of accepted.entries()) {
+      const features = JSON.parse(row.features_json) as Record<string, unknown>;
+      const message = row.assistant_message_id === null ? undefined : db.prepare(
+        "SELECT content FROM chat_log WHERE id=? AND round=? AND role='assistant' LIMIT 1",
+      ).get(row.assistant_message_id, row.round) as { content: string } | undefined;
+      if (!message || features.styleEvidenceVersion !== 'style-evidence-v1'
+        || typeof features.proseDigest !== 'string' || sha256Digest(message.content) !== features.proseDigest
+        || !/^sha256:[a-f0-9]{64}$/u.test(row.payload_digest)
+        || input.samples[index]!.sourceRevision !== row.source_revision
+        || input.samples[index]!.prose !== message.content) return null;
+      evidence.push({ eventId: row.event_id, payloadDigest: row.payload_digest, proseDigest: features.proseDigest });
+    }
+    // The source itself may no longer be among the latest eight representatives.
+    const anchorMessage = db.prepare("SELECT content FROM chat_log WHERE id=? AND round=? AND role='assistant'")
+      .get(marker.assistantMessageId, marker.round) as { content: string } | undefined;
+    if (!anchorMessage || sha256Digest(anchorMessage.content) !== anchorFeatures.proseDigest
+      || !/^sha256:[a-f0-9]{64}$/u.test(anchor.payload_digest)) return null;
+    const legacySourceDigest = sha256Digest(JSON.stringify({ acceptedSamples,
+      representatives: accepted.map((row) => ({ revision: row.source_revision, subject: row.subject_digest }))
+        .sort((left, right) => left.revision.localeCompare(right.revision)),
+    }));
+    if (legacySourceDigest !== input.sourceDigest) return null;
+    const baselines = ['style-proposal-count', 'style-proposal-attempt-count'].map((key) => {
+      const row = db.prepare('SELECT value FROM session_control WHERE session_key=? AND control_key=?')
+        .get(rawSessionId, `${key}:${input.contentMode}`) as { value: string } | undefined;
+      if (row && (!/^(0|[1-9]\d*)$/u.test(row.value) || !Number.isSafeInteger(Number(row.value)))) {
+        throw new Error('style-source-baseline-invalid');
+      }
+      return row?.value ?? null;
+    });
+    return Object.freeze({ session, sourceDigest: sha256Digest(JSON.stringify({
+      version: 'style-source-authority-v1', scope, epoch, marker, styleSkillId,
+      anchor: { eventId: anchor.event_id, payloadDigest: anchor.payload_digest,
+        proseDigest: anchorFeatures.proseDigest },
+      profileVersion: input.profileVersion, sourceDigest: input.sourceDigest, evidence, baselines,
+      explicitRequest: input.explicitRequest,
+      forbiddenIdentityDigest: sha256Digest(JSON.stringify(input.forbiddenIdentityTerms)),
+    })) });
+  } catch { return null; }
+}
+
+function agentAdmissionForSession(rawSessionId: string): import('../../packages/session/src/session.ts').SessionArgs['agentAdmission'] {
   if ((!AGENT_ADMISSION_RUNTIME.enabled && !CONTEXT_COMPILER_RUNTIME.enabled)
     || !AGENT_ADMISSION_LEDGER) return undefined;
+  let pendingPreferenceProof: ReturnType<ReturnType<typeof createLearningPreferenceSkillLiveCall>['sealOutput']> = null;
+  let pendingBranchProof: ReturnType<ReturnType<typeof createBranchPreferenceSkillLiveCall>['sealOutput']> = null;
+  let branchCommitHost: Readonly<{
+    session: ChatSession; authority: ReturnType<typeof createBranchPreferenceSkillSourceCommitAuthority>;
+  }> | null = null;
+  const branchCommitAuthority = () => {
+    const session = sessions.get(rawSessionId);
+    if (!session || !sessionDeletionAdmissionOpen(rawSessionId)) return null;
+    if (branchCommitHost?.session === session) return branchCommitHost.authority;
+    const authority = createBranchPreferenceSkillSourceCommitAuthority({ rawSessionId, session,
+      isCurrentSession: () => sessionDeletionAdmissionOpen(rawSessionId) && sessions.get(rawSessionId) === session });
+    branchCommitHost = Object.freeze({ session, authority });
+    return authority;
+  };
+  let preferenceCommitHost: Readonly<{
+    session: ChatSession; authority: ReturnType<typeof createLearningPreferenceSkillSourceCommitAuthority>;
+  }> | null = null;
+  const preferenceCommitAuthority = () => {
+    const session = sessions.get(rawSessionId);
+    if (!session || !sessionDeletionAdmissionOpen(rawSessionId)) return null;
+    if (preferenceCommitHost?.session === session) return preferenceCommitHost.authority;
+    const authority = createLearningPreferenceSkillSourceCommitAuthority({ rawSessionId, session,
+      isCurrentSession: () => sessionDeletionAdmissionOpen(rawSessionId) && sessions.get(rawSessionId) === session });
+    preferenceCommitHost = Object.freeze({ session, authority });
+    return authority;
+  };
+  let pendingCriticSkill: ReturnType<typeof createCriticSkillLiveCall> | null = null;
+  let pendingPreludeSkill: ReturnType<typeof createPreludeSkillLiveCall> | null = null;
+  let pendingCriticSkillCurrent: (() => boolean) | null = null;
+  let pendingPreludeSkillCurrent: (() => boolean) | null = null;
+  let memoryConsumptionHost: { session: ChatSession; authority: MaintenanceMemoryConsumptionAuthority } | null = null;
+  let summaryConsumptionHost: { session: ChatSession; authority: MaintenanceSummaryConsumptionAuthority } | null = null;
+  const consumptionAllowed = (session: ChatSession, mode: 'nsf' | 'nsfw', consumerRunId: string,
+    taskKind: 'memory_consolidation' | 'rolling_summary'): boolean => {
+    const live = taskKind === 'rolling_summary'
+      ? maintenanceSummarySkillLiveEnabled(process.env) : maintenanceMemorySkillLiveEnabled(process.env);
+    if (!live || sessions.get(rawSessionId) !== session || !sessionDeletionAdmissionOpen(rawSessionId)
+      || !maintenanceJobs.settings(rawSessionId).effectiveEnabled
+      || !maintenanceAdmissionAllowsSession(MAINTENANCE_ADMISSION_RUNTIME, rawSessionId)) return false;
+    // Adoption only observes current permission; decide()/execution gates may write a kill.
+    const runtime = parseAgentLaneRuntimeConfig(process.env);
+    const control = AGENT_CONTROL_STORE.get('maintenance');
+    const decision = evaluateAgentLaneRollout({
+      lane: 'maintenance', desiredState: runtime.managed ? control.desiredState : 'on',
+      sessionId: runtime.managed ? agentLaneRolloutBucketIdentity(runtime, rawSessionId) : rawSessionId,
+      hostCeiling: runtime.managed ? runtime.ceilings.maintenance : 'on',
+      evidence: AGENT_CONTROL_STORE.evidence('maintenance'),
+    });
+    if (control.desiredState === 'killed' || decision.shouldKill || (runtime.managed && !decision.allowed)
+      || !agentCapabilityTicketAllowed(AGENT_CONTROL_STORE, { taskKind, policyVersion: MAINTENANCE_POLICY_VERSION })) {
+      return false;
+    }
+    const turn = session.readAgentSkillTurnContext(consumerRunId);
+    if (!turn || turn.contentMode !== mode) return false;
+    if (mode === 'nsf') return true;
+    const path = resolveSessionDatabase(DATA_DIR, `${rawSessionId}.db`);
+    if (!path) return false;
+    const safety = NSFW_SCENE_SAFETY_CONTROL.read({ dbPath: path, sessionId: rawSessionId,
+      manifest: session.getWorldbookSourceManifest() });
+    return safety.enabled && safety.adultAttestation === 'verified'
+      && safety.participantsAdult && safety.consent === 'confirmed';
+  };
+  const memoryConsumptionAuthority = () => {
+    const session = sessions.get(rawSessionId);
+    if (!session || !AGENT_CLOSURE_STORE || !maintenanceMemorySkillLiveEnabled(process.env)) return null;
+    if (memoryConsumptionHost?.session === session) return memoryConsumptionHost.authority;
+    const committer = new MemorySummaryMaintenanceCommitter({
+      sessionId: rawSessionId, memory: session.getMemory().mem,
+    }, () => { throw new Error('memory-consumption-current-revision-forbidden'); });
+    const authority = new MaintenanceMemoryConsumptionAuthority({
+      sessionId: rawSessionId, manager: maintenanceJobs, committer,
+      allowed: (mode, runId) => consumptionAllowed(session, mode, runId, 'memory_consolidation'),
+    });
+    memoryConsumptionHost = { session, authority };
+    return authority;
+  };
+  const summaryConsumptionAuthority = () => {
+    const session = sessions.get(rawSessionId);
+    if (!session || !AGENT_CLOSURE_STORE || !maintenanceSummarySkillLiveEnabled(process.env)) return null;
+    if (summaryConsumptionHost?.session === session) return summaryConsumptionHost.authority;
+    const committer = new MemorySummaryMaintenanceCommitter({
+      sessionId: rawSessionId, memory: session.getMemory().mem,
+    }, () => { throw new Error('summary-consumption-current-revision-forbidden'); });
+    const authority = new MaintenanceSummaryConsumptionAuthority({
+      sessionId: rawSessionId, manager: maintenanceJobs, committer,
+      allowed: (mode, runId) => consumptionAllowed(session, mode, runId, 'rolling_summary'),
+    });
+    summaryConsumptionHost = { session, authority };
+    return authority;
+  };
   const runPreferenceLearningCall = async (input: {
     client: ChatCompletionClient;
     rawSessionId: string;
@@ -955,6 +3067,10 @@ function agentAdmissionForSession(rawSessionId: string): import('../../tools/cli
     runId: string;
     sourceRevision: string;
     contentMode: 'nsf' | 'nsfw';
+    userPrompt?: string;
+    userInput?: string;
+    branches?: readonly string[];
+    candidates?: readonly import('../../packages/agent-policy/public/branch-preference.ts').SemanticBranchCandidate[];
     signal?: AbortSignal;
   }, request: {
     policyVersion: string;
@@ -965,6 +3081,8 @@ function agentAdmissionForSession(rawSessionId: string): import('../../tools/cli
     modelRequest: import('../../packages/proxy/src/client.ts').ChatRequest;
     maxOutputTokens: number;
   }): Promise<string | null> => {
+    if (learningPreferenceSkillPolicyAllowed(request.policyVersion)) pendingPreferenceProof = null;
+    if (branchPreferenceSkillPolicyAllowed(request.policyVersion)) pendingBranchProof = null;
     let liveAdmission;
     let livePrivacy;
     try {
@@ -976,19 +3094,101 @@ function agentAdmissionForSession(rawSessionId: string): import('../../tools/cli
     if (!livePrivacy.preferenceEnabled
       || !agentAdmissionAllowsSession(liveAdmission, input.rawSessionId)
       || input.runId === 'missing-run' || !MODEL_USAGE_COST) return null;
-    const provider = loadProviderConfig();
+    const { selection: provider, client: rawPreferenceClient } = agentModelBinding();
+    // P17-01.3：偏好抽取是后台（learning），走全局仲裁；被前台抢占后结果作废。
+    const client = turnOperationClientForServer(rawSessionId, input.runId, 'prelude',
+      arbitratedAgentClient(rawPreferenceClient, provider, 'learning'));
     const budgetProfile = agentTaskBudgetProfile(
       'preference_extract',
       process.env,
       { maxOutputTokens: request.maxOutputTokens },
-      modelRuntimeProfileFor(provider, input.client),
+      modelRuntimeProfileFor(provider, client),
     );
     const tools: Record<string, unknown>[] = [];
     const evidenceDigest = sha256Digest(JSON.stringify(request.evidence));
-    const gateway = new AdmittedModelGateway(AGENT_ADMISSION_BROKER, input.client, {
+    const modelRequest = {
+      model: provider.model, ...request.modelRequest, max_tokens: budgetProfile.agentOutputBudgetTokens,
+    };
+    const skillEnabled = () => learningPreferenceSkillPolicyAllowed(request.policyVersion)
+      ? learningPreferenceSkillLiveEnabled(process.env)
+      : branchPreferenceSkillPolicyAllowed(request.policyVersion) && branchPreferenceSkillLiveEnabled(process.env);
+    const skillRequested = Boolean(AGENT_CLOSURE_STORE && (
+      (learningPreferenceSkillLiveEnabled(process.env) && learningPreferenceSkillPolicyAllowed(request.policyVersion))
+      || (branchPreferenceSkillLiveEnabled(process.env) && branchPreferenceSkillPolicyAllowed(request.policyVersion))));
+    const session = skillRequested ? sessions.get(rawSessionId) : undefined;
+    const skillHost = session ? foregroundSkillHostForSession(rawSessionId, session, (lease) => {
+      const current = parseAgentAdmissionRuntimeConfig(process.env);
+      const privacy = parseLearningTextRuntimeConfig(process.env);
+      const budget = agentTaskBudgetProfile('preference_extract', process.env,
+        { maxOutputTokens: request.maxOutputTokens }, modelRuntimeProfileFor(provider, client));
+      return { revision: agentBudgetProfileDigest(budget), allowed: privacy.preferenceEnabled
+        && agentAdmissionAllowsSession(current, rawSessionId)
+        && agentBudgetProfileDigest(budget) === lease.budgetProfileDigest };
+    }, skillEnabled) : null;
+    let skillCall: ReturnType<typeof createLearningPreferenceSkillLiveCall>
+      | ReturnType<typeof createBranchPreferenceSkillLiveCall> | null = null;
+    let authorizeSkillDispatch: ReturnType<typeof createLearningPreferenceSkillDispatchAuthority> | null = null;
+    if (session && skillHost && learningPreferenceSkillPolicyAllowed(request.policyVersion)
+      && typeof input.userPrompt === 'string') {
+      try {
+        const source = captureLearningPreferenceSkillSource({ runId: input.runId, sourceAuthority: session });
+        const isSessionOpen = () => sessionDeletionAdmissionOpen(rawSessionId)
+          && sessions.get(rawSessionId) === session;
+        const skillSourceAuthority = createLearningPreferenceSkillSourceAuthority({
+          source, sourceAuthority: session, isSessionOpen, leaseAuthority: AGENT_ADMISSION_BROKER,
+        });
+        const safetyAuthority = { readForLease: (lease: import('./agent-admission-broker.ts').AgentAdmissionLease,
+          current: import('./skill-hub/context-authority.ts').ServerAgentSkillContextSourceV1) => {
+          const turn = session.readAgentSkillTurnContext(lease.parentRunId);
+          return turn && turn.sourceRevision === current.sourceRevision
+            ? skillHost.authority.safetyAuthority.readForLease(lease, turn) : null;
+        } };
+        authorizeSkillDispatch = createLearningPreferenceSkillDispatchAuthority({
+          sourceAuthority: skillSourceAuthority, authorizeHost: skillHost.authorizeDispatch, safetyAuthority,
+        });
+        skillCall = createLearningPreferenceSkillLiveCall({
+          broker: AGENT_ADMISSION_BROKER, source, userPrompt: input.userPrompt, request: modelRequest,
+          authority: { ...skillHost.authority, sourceAuthority: session, isSessionOpen, safetyAuthority },
+        });
+      } catch {
+        // Invalid fixed inputs are not a Skill-readiness fallback. The registered source must still match.
+        authorizeSkillDispatch = null;
+      }
+    }
+    if (session && skillHost && branchPreferenceSkillPolicyAllowed(request.policyVersion)
+      && typeof input.userInput === 'string' && input.branches && input.candidates) {
+      try {
+        const source = captureBranchPreferenceSkillSource({ runId: input.runId, sourceAuthority: session });
+        const isSessionOpen = () => sessionDeletionAdmissionOpen(rawSessionId)
+          && sessions.get(rawSessionId) === session;
+        const skillSourceAuthority = createBranchPreferenceSkillSourceAuthority({
+          source, sourceAuthority: session, isSessionOpen, leaseAuthority: AGENT_ADMISSION_BROKER,
+        });
+        const safetyAuthority = { readForLease: (lease: import('./agent-admission-broker.ts').AgentAdmissionLease,
+          current: import('./skill-hub/context-authority.ts').ServerAgentSkillContextSourceV1) => {
+          const turn = session.readAgentSkillTurnContext(lease.parentRunId);
+          return turn && turn.sourceRevision === current.sourceRevision
+            ? skillHost.authority.safetyAuthority.readForLease(lease, turn) : null;
+        } };
+        authorizeSkillDispatch = createBranchPreferenceSkillDispatchAuthority({
+          sourceAuthority: skillSourceAuthority, authorizeHost: skillHost.authorizeDispatch, safetyAuthority,
+        });
+        skillCall = createBranchPreferenceSkillLiveCall({
+          broker: AGENT_ADMISSION_BROKER, source, editedInput: input.userInput,
+          branches: input.branches, candidates: input.candidates, request: modelRequest,
+          authority: { ...skillHost.authority, sourceAuthority: session, isSessionOpen, safetyAuthority },
+        });
+      } catch { authorizeSkillDispatch = null; }
+    }
+    const gateway = new AdmittedModelGateway(AGENT_ADMISSION_BROKER, client, {
       estimateCostMicrousd: (usage, call) => MODEL_USAGE_COST(usage, call)?.costMicrousd,
       onLeaseClosed: recordAgentRuntimeLease,
       auditRequired: true,
+      ...(skillRequested ? {
+        prepareRequest: skillCall?.prepareRequest ?? (async () => null),
+        authorizeDispatch: (lease) => authorizeSkillDispatch?.(lease) === true
+          && (skillCall?.authorizeFixedRequest() ?? true),
+      } : {}),
     });
     const ticket = AGENT_ADMISSION_BROKER.issue({
       runId: input.runId,
@@ -1031,16 +3231,54 @@ function agentAdmissionForSession(rawSessionId: string): import('../../tools/cli
       modelId: provider.model,
       tools,
     });
-    const response = await lease.complete({
-      model: provider.model,
-      ...request.modelRequest,
-      max_tokens: budgetProfile.agentOutputBudgetTokens,
-    }, input.signal);
-    return response.content;
+    try {
+      const response = await lease.complete(modelRequest, input.signal);
+      lease.finish('completed');
+      try {
+        const proof = skillCall?.sealOutput(response.content);
+        if (proof?.version === 'learning-preference-skill-proof-v1') pendingPreferenceProof = proof;
+        else if (proof?.version === 'branch-preference-skill-proof-v1') pendingBranchProof = proof;
+      }
+      catch { /* Output provenance is optional and cannot discard a valid classifier response. */ }
+      return response.content;
+    } finally {
+      skillCall?.abandon();
+    }
   };
   return {
+    preparePreferenceSkillSource: (input) => {
+      const proof = pendingPreferenceProof;
+      pendingPreferenceProof = null;
+      return preferenceCommitAuthority()?.prepare(proof, input) ?? null;
+    },
+    commitPreferenceSkillSource: (input) => preferenceCommitAuthority()?.commit(input) ?? null,
+    prepareBranchPreferenceSkillSource: (input) => {
+      const proof = pendingBranchProof;
+      pendingBranchProof = null;
+      return branchCommitAuthority()?.prepare(proof, input) ?? null;
+    },
+    commitBranchPreferenceSkillSource: (input) => branchCommitAuthority()?.commit(input) ?? null,
+    observeBranchPreferenceSkillSource: () => {
+      try { scheduleBranchAttributionEvidence(rawSessionId); }
+      catch { console.warn('[AgentEvidence] BRANCH_ATTRIBUTION_DELIVERY_PENDING'); }
+    },
+    observePreferenceSkillSource: () => {
+      try { schedulePreferenceInferenceEvidence(rawSessionId); }
+      catch { console.warn('[AgentEvidence] PREFERENCE_INFERENCE_DELIVERY_PENDING'); }
+      LEARNING_PREFERENCE_SOURCE_SCHEDULER?.schedule(rawSessionId);
+    },
     // The server-side usage observer persists Provider usage whenever the selected Provider returns it.
     providerReportsUsage: true,
+    preludeSkillRequired: () => {
+      if (!AGENT_ADMISSION_RUNTIME.executionEnabled || !preludeSkillLiveEnabled(process.env)) return false;
+      try { return agentAdmissionAllowsSession(parseAgentAdmissionRuntimeConfig(process.env), rawSessionId); }
+      catch { return false; }
+    },
+    criticSkillRequired: () => {
+      if (!AGENT_ADMISSION_RUNTIME.executionEnabled || !criticSkillLiveEnabled(process.env)) return false;
+      try { return agentAdmissionAllowsSession(parseAgentAdmissionRuntimeConfig(process.env), rawSessionId); }
+      catch { return false; }
+    },
     observeRuntime: (input) => {
       recordAgentControlObservation({
         lane: 'interactive',
@@ -1092,121 +3330,353 @@ function agentAdmissionForSession(rawSessionId: string): import('../../tools/cli
     },
     audit: (entry) => { AGENT_ADMISSION_LEDGER.record(entry); },
     auditDirectorCritic: (entry) => { AGENT_ADMISSION_LEDGER.recordDirectorCritic(entry); },
-    ...(CONTEXT_COMPILER_RUNTIME.enabled && MODEL_USAGE_COST ? {
-      compileContext: async (input) => {
-        let live;
-        const provider = loadProviderConfig();
-        try {
-          live = parseContextCompilerRuntimeConfig(
-            process.env,
-            modelRuntimeProfileFor(provider, input.client),
-          );
-        } catch { return null; }
-        if (!contextCompilerAllowsSession(live, input.rawSessionId)
-          || !live.budgetProfile || input.runId === 'missing-run') return null;
-        try {
-          const sourceDigest = contextCompilerSourceDigest(input.sources);
-          const cached = CONTEXT_CAPSULE_CACHE.get(sourceDigest, input.targetTokens);
-          if (cached) return cached;
-
-          // One Provider call is the hard ceiling. Multi-batch inputs defer to the next
-          // deterministic fallback rather than compiling an incomplete, misleading capsule.
-          const batches = partitionContextCompilerSources(
-            input.sources,
-            Math.max(256, live.budgetProfile.agentInputBudgetTokens - 1_500),
-          );
-          if (batches.length !== 1) return null;
-          const compiled = buildContextCompilerModelRequest({
-            sources: batches[0]!,
-            targetTokens: input.targetTokens,
-            maxInputTokens: live.budgetProfile.agentInputBudgetTokens,
-            maxOutputTokens: live.budgetProfile.agentOutputBudgetTokens,
-          });
-          const tools: Record<string, unknown>[] = [];
-          const gateway = new AdmittedModelGateway(AGENT_ADMISSION_BROKER, input.client, {
-            estimateCostMicrousd: (usage, call) => MODEL_USAGE_COST(usage, call)?.costMicrousd,
-            onLeaseClosed: recordAgentRuntimeLease,
-            auditRequired: true,
-          });
-          const ticket = AGENT_ADMISSION_BROKER.issue({
-            runId: input.runId,
-            parentRunId: input.runId,
-            sessionId: input.ticketSessionId,
-            sourceRevision: input.sourceRevision,
-            lane: 'interactive',
-            taskKind: 'context_compiler',
-            policyVersion: CONTEXT_COMPILER_POLICY_VERSION,
-            modelId: provider.model,
-            budgetProfileDigest: agentBudgetProfileDigest(live.budgetProfile),
-            toolSetDigest: agentToolSetDigest(tools),
-            mode: input.contentMode,
-            reasonCodes: ['elastic-context-recovery-required'],
-            evidenceDigests: [compiled.expectation.sourceDigest],
-            noveltyDigest: compiled.expectation.sourceDigest,
-            expectedBenefit: 'context-recovery',
-            limits: admissionLimitsFromBudgetProfile(live.budgetProfile),
-            deadlineMs: Date.now() + live.budgetProfile.maxWallMs,
-            allowedTools: [],
-            fullSkillSnapshots: [],
-            cooldownKey: `context-compiler:${input.ticketSessionId}`,
-            idempotencyKey: `admit:${input.runId.slice(0, 120)}:context:${sourceDigest.slice(-16)}`,
-            fallback: 'continue-deterministic',
-          });
-          const response = await gateway.complete({
-            binding: {
-              ticketId: ticket.ticketId,
-              runId: ticket.runId,
-              parentRunId: ticket.parentRunId,
-              sessionId: ticket.sessionId,
-              sourceRevision: ticket.sourceRevision,
-              lane: ticket.lane,
-              taskKind: ticket.taskKind,
-              policyVersion: ticket.policyVersion,
-              mode: ticket.mode,
-              budgetProfile: live.budgetProfile,
-            },
-            request: { ...compiled.request, model: provider.model },
-            signal: input.signal,
-          });
-          const capsule = parseContextCapsule(response.content ?? '', compiled.expectation);
-          CONTEXT_CAPSULE_CACHE.set(capsule);
-          return capsule;
-        } catch {
-          return null;
-        }
+    // Memory/Summary adoption has its own live/source authority, independent of Context Compiler execution.
+    prepareMemoryConsumption: (input) => memoryConsumptionAuthority()?.prepare(input) ?? null,
+    commitMemoryConsumption: (input) => memoryConsumptionHost?.authority.commit(input) ?? [],
+    observeMemoryConsumption: () => {
+      MAINTENANCE_MEMORY_CONSUMPTION_SCHEDULER?.schedule(rawSessionId);
+      MAINTENANCE_MEMORY_EVIDENCE_SCHEDULER?.schedule(rawSessionId);
+    },
+    prepareSummaryConsumption: (input) => summaryConsumptionAuthority()?.prepare(input) ?? null,
+    commitSummaryConsumption: (input) => summaryConsumptionHost?.authority.commit(input) ?? [],
+    observeSummaryConsumption: () => {
+      MAINTENANCE_SUMMARY_CONSUMPTION_SCHEDULER?.schedule(rawSessionId);
+      MAINTENANCE_SUMMARY_EVIDENCE_SCHEDULER?.schedule(rawSessionId);
+    },
+    ...(CONTEXT_COMPILER_RUNTIME.mode === 'shadow' && MODEL_USAGE_COST ? {
+      contextCompilerShadowEnabled: () => {
+        try { return contextCompilerAllowsShadowSession(parseContextCompilerRuntimeConfig(process.env), rawSessionId); }
+        catch { throw new Error('context-shadow-runtime-invalid'); }
+      },
+      contextCompilerShadowSourceRead: () => CONTEXT_COMPILER_SHADOW_RUNNER.recordSourceRead(),
+      offerContextCompilerShadow: (input) => {
+        if (input.rawSessionId !== rawSessionId || !sessionDeletionAdmissionOpen(rawSessionId)) return;
+        const identity = Object.freeze({ runId: input.runId, sourceRevision: input.sourceRevision,
+          contentMode: input.contentMode, historyEpoch: input.historyEpoch, baselineRequestDigest: input.baselineRequestDigest });
+        const owner = sessions.get(rawSessionId);
+        if (!owner || owner.getHistoryEpoch() !== identity.historyEpoch) return;
+        const shadowConfig = parseContextCompilerRuntimeConfig(process.env);
+        if (!contextCompilerAllowsShadowSession(shadowConfig, rawSessionId)) return;
+        const captured = parseContextCompilerInput({ version: CONTEXT_COMPILER_INPUT_VERSION,
+          sources: input.sources, targetTokens: input.targetTokens });
+        const manifest = contextCompilerInputManifest(captured);
+        const snapshot = snapshotForSession(owner).snapshotToken;
+        const worldbook = owner.getWorldbookSourceManifest(true);
+        const safetyDigest = () => {
+          if (identity.contentMode !== 'nsfw') return 'nsf';
+          const dbPath = resolveSessionDatabase(DATA_DIR, `${rawSessionId}.db`);
+          if (!dbPath) throw new Error('context-shadow-source-invalid');
+          const safety = NSFW_SCENE_SAFETY_CONTROL.resolveSnapshot({ dbPath, sessionId: rawSessionId,
+            manifest: owner.getWorldbookSourceManifest(true) });
+          if (!safety) throw new Error('context-shadow-safety-revoked');
+          return sha256Digest(JSON.stringify(safety));
+        };
+        const expectedSafety = safetyDigest();
+        const initialBinding = agentModelBinding();
+        const provider = Object.freeze({ providerId: initialBinding.selection.providerId, model: initialBinding.selection.model });
+        const client = initialBinding.client;
+        const registration = providerRegistry.bindingToken(provider.providerId);
+        if (!registration) throw new Error('context-shadow-provider-unavailable');
+        const initialRuntime = parseContextCompilerRuntimeConfig(process.env, modelRuntimeProfileFor(provider, client));
+        if (!contextCompilerAllowsShadowSession(initialRuntime, rawSessionId) || !initialRuntime.budgetProfile)
+          throw new Error('context-shadow-admission-denied');
+        const expectedBudgetDigest = agentBudgetProfileDigest(initialRuntime.budgetProfile);
+        const inputRate = process.env.JG_HARNESS_INPUT_MICROUSD_PER_MTOK;
+        const outputRate = process.env.JG_HARNESS_OUTPUT_MICROUSD_PER_MTOK;
+        if (inputRate !== CONTEXT_COMPILER_SHADOW_RATES.input || outputRate !== CONTEXT_COMPILER_SHADOW_RATES.output)
+          throw new Error('context-shadow-pricing-stale');
+        // Ephemeral only: never publish or persist provider configuration or credentials.
+        const providerBinding = () => sha256Digest(JSON.stringify({ configuration: loadProviderConfig(),
+          descriptor: providerRegistry.describe(provider.providerId) }));
+        const expectedProviderBinding = providerBinding();
+        const current = () => {
+          if (!sessionDeletionAdmissionOpen(rawSessionId) || sessions.get(rawSessionId) !== owner
+            || !contextCompilerAllowsShadowSession(parseContextCompilerRuntimeConfig(process.env), rawSessionId)
+            || owner.getHistoryEpoch() !== identity.historyEpoch || snapshotForSession(owner).snapshotToken !== snapshot
+            || owner.getWorldbookSourceManifest(true).sourceRevision !== worldbook.sourceRevision
+            || safetyDigest() !== expectedSafety) throw new Error('context-shadow-source-stale');
+        };
+        const guard = () => {
+          current();
+          const selected = agentModelBinding().selection;
+          const runtime = parseContextCompilerRuntimeConfig(process.env, modelRuntimeProfileFor(provider, client));
+          if (selected.providerId !== provider.providerId || selected.model !== provider.model
+            || providerRegistry.bindingToken(provider.providerId) !== registration
+            || providerBinding() !== expectedProviderBinding
+            || process.env.JG_HARNESS_INPUT_MICROUSD_PER_MTOK !== inputRate
+            || process.env.JG_HARNESS_OUTPUT_MICROUSD_PER_MTOK !== outputRate
+            || !contextCompilerAllowsShadowSession(runtime, rawSessionId) || !runtime.budgetProfile
+            || agentBudgetProfileDigest(runtime.budgetProfile) !== expectedBudgetDigest
+            || contextCompilerInputManifest(captured).inputDigest !== manifest.inputDigest)
+            throw new Error('context-shadow-binding-stale');
+        };
+        CONTEXT_COMPILER_SHADOW_RUNNER.enqueue({ sessionId: rawSessionId, work: async (signal, markSent) => {
+          guard();
+          const live = initialRuntime;
+          if (!contextCompilerAllowsShadowSession(live, rawSessionId) || !live.budgetProfile)
+            throw new Error('context-shadow-admission-denied');
+          const batches = partitionContextCompilerSources(captured.sources,
+            Math.max(256, live.budgetProfile.agentInputBudgetTokens - 1_500));
+          if (batches.length !== 1) throw new Error('context-shadow-input-budget-exhausted');
+          const compiled = buildContextCompilerShadowRequest({ sources: batches[0]!, targetTokens: captured.targetTokens,
+            maxInputTokens: live.budgetProfile.agentInputBudgetTokens, maxOutputTokens: live.budgetProfile.agentOutputBudgetTokens });
+          const counted: ChatCompletionClient = { ...client,
+            complete: (request, signal, call) => client.complete(request, signal, { ...call,
+              beforeAdapterDispatch: () => { guard(); markSent(); } }),
+            stream: (...args) => client.stream(...args) };
+          const gateway = new AdmittedModelGateway(AGENT_ADMISSION_BROKER,
+            arbitratedAgentClient(counted, provider, 'context-compiler-shadow', undefined, guard), {
+              estimateCostMicrousd: (usage, call) => MODEL_USAGE_COST(usage, call)?.costMicrousd,
+              onLeaseClosed: recordAgentRuntimeLease, auditRequired: true,
+            });
+          const sessionId = opaqueLearningToken('session', rawSessionId);
+          const ticket = AGENT_ADMISSION_BROKER.issue({ runId: identity.runId, parentRunId: identity.runId,
+            sessionId, sourceRevision: identity.sourceRevision, lane: 'interactive', taskKind: 'context_compiler',
+            policyVersion: CONTEXT_COMPILER_SHADOW_POLICY_VERSION, modelId: provider.model,
+            budgetProfileDigest: agentBudgetProfileDigest(live.budgetProfile), toolSetDigest: agentToolSetDigest([]),
+            mode: identity.contentMode, reasonCodes: ['elastic-context-recovery-required'], evidenceDigests: [manifest.sourceDigest],
+            noveltyDigest: manifest.inputDigest, expectedBenefit: 'context-recovery',
+            limits: admissionLimitsFromBudgetProfile(live.budgetProfile), deadlineMs: Date.now() + live.budgetProfile.maxWallMs,
+            allowedTools: [], fullSkillSnapshots: [], cooldownKey: `context-shadow:${sessionId}`,
+            idempotencyKey: `shadow:${identity.runId.slice(0, 120)}:${manifest.inputDigest.slice(-16)}`, fallback: 'continue-deterministic' });
+          const modelRequest = { ...compiled.request, model: provider.model };
+          const response = await gateway.complete({ binding: { ticketId: ticket.ticketId, runId: ticket.runId,
+            parentRunId: ticket.parentRunId, sessionId: ticket.sessionId, sourceRevision: ticket.sourceRevision,
+            lane: ticket.lane, taskKind: ticket.taskKind, policyVersion: ticket.policyVersion, mode: ticket.mode,
+            budgetProfile: live.budgetProfile }, request: modelRequest, signal });
+          if (response.finishReason !== 'stop' || response.toolCalls.length !== 0 || typeof response.content !== 'string')
+            throw new Error('context-shadow-output-invalid');
+          const capsule = parseContextCapsule(response.content, compiled.expectation);
+          guard();
+          if (!response.usage) throw new Error('context-shadow-usage-unavailable');
+          return { baselineRequestDigest: identity.baselineRequestDigest, inputDigest: manifest.inputDigest,
+            sourceDigest: manifest.sourceDigest, sourceDigests: captured.sources.map(source => source.sourceDigest),
+            sourceTokens: captured.sources.map(source => estimateTokens(source.text)),
+            shadowRequestDigest: sha256Digest(JSON.stringify(modelRequest)), capsuleDigest: sha256Digest(JSON.stringify(capsule)),
+            targetTokens: captured.targetTokens, promptTokens: response.usage.prompt_tokens,
+            completionTokens: response.usage.completion_tokens };
+        } });
+      },
+    } : {}),
+    ...((CONTEXT_COMPILER_RUNTIME.mode === 'test-session' || CONTEXT_COMPILER_RUNTIME.mode === 'canary') && MODEL_USAGE_COST ? {
+      ...createContextCompilerSessionHost({ env: process.env, CONTEXT_COMPILER_RUNTIME, CONTEXT_COMPILER_CANARY,
+        CONTEXT_CAPSULE_CACHE, AGENT_ADMISSION_BROKER, AGENT_CLOSURE_STORE, AGENT_CLOSURE_RECORDER,
+        MODEL_USAGE_COST, SKILL_CONSUMPTION_SCHEDULER, sessions, sessionDeletionAdmissionOpen, agentModelBinding,
+        modelRuntimeProfileFor, contextCompilerRuntimeAllows,
+        operationHost: () => sessionProviderRuntime().activeHostForSession(rawSessionId),
+        turnOperationClientForServer, foregroundSkillHostForSession, arbitratedAgentClient, providerRegistry,
+        readProviderGeneration: () => providerConfigurationGeneration, loadProviderConfig, recordAgentRuntimeLease,
+        parseContextCompilerRuntimeConfig, partitionContextCompilerSources, createContextCompilerSkillLiveCall,
+      }, rawSessionId),
+      // P16 C3：交互类工件的消费回执。session 只在回合提交成功之后发，
+      // 所以这里不需要再判定"是否真的被用上"——提交本身就证明它进了这一回合。
+      observeInteractiveTurn: (input) => {
+        AGENT_CLOSURE_RECORDER?.observeInteractiveTurn({
+          ...input,
+          executionClass: executionClassForLearningSession(agentSessionKind(input.rawSessionId)),
+        });
+      },
+      // P16 C3.3：方向/偏好沉淀的沉淀与应用回执。来源判定与交互/学习 lane 同一套
+      // （按会话种类），CAS 仍归学习层自管。
+      // P16 W2（用户裁定：变量提案=写入）：同回合完成提案/应用/回读/消费全链。
+      observeVariableProposalApplied: (input) => {
+        AGENT_CLOSURE_RECORDER?.recordVariableProposalApplied({
+          ...input,
+          executionClass: executionClassForLearningSession(agentSessionKind(input.rawSessionId)),
+        });
+      },
+      // P16 W3（用户裁定：AQL 建议进报表）：advisory，记到 validated 为止。
+      // P16 E1（用户裁定：不再跳过效果观测）：负向/不确定由会话侧窗口结算产生。
+      observeEffect: (input) => {
+        if (shuttingDown || !AGENT_CLOSURE_RECORDER || !AGENT_CLOSURE_STORE || !sessionDeletionAdmissionOpen(rawSessionId))
+          throw new Error('effect-observer-unavailable');
+        const original = AGENT_CLOSURE_STORE.get(input.operationId);
+        const consumed = original?.events.filter(event => event.type === 'context-consumed'
+          && event.consumerRunId === input.consumerRunId && event.artifactDigest === input.artifactDigest) ?? [];
+        if (!original || original.sessionId !== rawSessionId || consumed.length !== 1)
+          throw new Error('effect-observer-consumer-unavailable');
+        AGENT_CLOSURE_RECORDER.observeEffect(input);
+        if (shuttingDown || !sessionDeletionAdmissionOpen(rawSessionId)) throw new Error('effect-observer-fenced');
+        const current = AGENT_CLOSURE_STORE.get(input.operationId);
+        const matching = current?.events.filter(event => event.type === 'context-consumed'
+          && event.consumerRunId === input.consumerRunId && event.artifactDigest === input.artifactDigest) ?? [];
+        if (!current || current.sessionId !== rawSessionId || matching.length !== 1
+          || JSON.stringify(matching[0]) !== JSON.stringify(consumed[0])) throw new Error('effect-observer-source-drift');
+        try { scheduleReportedEffectEvidence(rawSessionId); }
+        catch { console.warn('[AgentEvidence] REPORTED_EFFECT_DELIVERY_PENDING'); }
+      },
+      observeAqlReplan: (input) => {
+        AGENT_CLOSURE_RECORDER?.observeAqlReplan({
+          ...input,
+          executionClass: executionClassForLearningSession(agentSessionKind(input.rawSessionId)),
+        });
+      },
+      observeDirectionConsolidation: (input) => {
+        AGENT_CLOSURE_RECORDER?.beginDirectionConsolidation({
+          ...input,
+          executionClass: executionClassForLearningSession(agentSessionKind(input.rawSessionId)),
+        });
+      },
+      observeDirectionApplication: (input) => {
+        AGENT_CLOSURE_RECORDER?.observeDirectionApplication({
+          ...input,
+          executionClass: executionClassForLearningSession(agentSessionKind(input.rawSessionId)),
+        });
       },
     } : {}),
     ...(AGENT_ADMISSION_RUNTIME.executionEnabled
       && MODEL_USAGE_COST
       ? {
           requestAqlReplan: async (input) => {
-            let live;
-            try { live = parseAgentAdmissionRuntimeConfig(process.env); } catch { return null; }
-            if (!agentAdmissionAllowsSession(live, input.rawSessionId)
-              || input.runId === 'missing-run' || !MODEL_USAGE_COST) return null;
-            const provider = loadProviderConfig();
+            const skillLive = aqlReplanSkillLiveEnabled(process.env);
+            const {
+              rawSessionId,
+              ticketSessionId,
+              runId,
+              sourceRevision,
+              contentMode,
+              prompt,
+              signal,
+              isCurrent: readCurrent,
+            } = input;
+            const inputSnapshot = parseAqlReplanInput(input.inputSnapshot);
+            const inputCurrent = (): boolean => {
+              try {
+                return (
+                  !signal?.aborted &&
+                  readCurrent() === true &&
+                  agentAdmissionAllowsSession(parseAgentAdmissionRuntimeConfig(process.env), rawSessionId)
+                );
+              } catch {
+                return false;
+              }
+            };
+            let summaryEvidence: ReturnType<typeof captureAqlSummaryRequestEvidence> = null;
+            let skillSource: ReturnType<typeof captureAqlReplanSkillSource> | null = null;
+            const current = (): boolean => inputCurrent()
+              && (summaryEvidence === null || isAqlSummaryRequestEvidenceCurrent(summaryEvidence))
+              && (skillSource === null || (aqlReplanSkillLiveEnabled(process.env)
+                && isAqlReplanSkillSourceCurrent(skillSource)));
+            if (
+              !inputSnapshot ||
+              renderAqlReplanInput(inputSnapshot) !== prompt ||
+              typeof readCurrent !== 'function' ||
+              runId === 'missing-run' ||
+              !MODEL_USAGE_COST ||
+              !current()
+            ) {
+              if (skillLive) throw new Error('aql-replan-skill-input-unavailable');
+              return null;
+            }
+            const skillSession = skillLive ? sessions.get(rawSessionId) : null;
+            if (skillLive) {
+              if (!AGENT_CLOSURE_STORE || !skillSession || !sessionDeletionAdmissionOpen(rawSessionId)) {
+                throw new Error('aql-replan-skill-source-unavailable');
+              }
+              skillSource = captureAqlReplanSkillSource({ session: skillSession, runId });
+              if (skillSource.sessionId !== ticketSessionId || skillSource.round !== input.round
+                || skillSource.sourceRevision !== sourceRevision || skillSource.contentMode !== contentMode
+                || skillSource.inputDigest !== sha256Digest(prompt)) {
+                throw new Error('aql-replan-skill-input-mismatch');
+              }
+            }
+            // Optional historical request-use evidence, never the assistant-only
+            // Summary consumption protocol or an AQL suggestion adoption claim.
+            try {
+              const summarySession = sessions.get(rawSessionId);
+              if (summarySession && inputSnapshot.longterm && sessionDeletionAdmissionOpen(rawSessionId)) {
+                const memory = summarySession.getMemory().mem;
+                const committer = new MemorySummaryMaintenanceCommitter({ sessionId: rawSessionId, memory },
+                  () => { throw new Error('aql-summary-request-current-revision-forbidden'); });
+                summaryEvidence = captureAqlSummaryRequestEvidence({
+                  rawSessionId, runId, round: input.round, contentMode, sourceRevision, prompt,
+                  renderedSummary: inputSnapshot.longterm, memory, committer,
+                  isCurrent: () => inputCurrent() && sessions.get(rawSessionId) === summarySession
+                    && summarySession.getMemory().mem === memory && sessionDeletionAdmissionOpen(rawSessionId),
+                });
+              }
+            } catch { /* Unproven/legacy source keeps its original advisory request, without a receipt. */ }
+            if (!current()) {
+              if (skillLive) throw new Error('aql-replan-skill-source-stale');
+              return null;
+            }
+            const { selection: provider, client } = agentModelBinding();
             const budgetProfile = agentTaskBudgetProfile(
-              'aql_replan', process.env, {}, modelRuntimeProfileFor(provider, input.client),
+              'aql_replan',
+              process.env,
+              {},
+              modelRuntimeProfileFor(provider, client),
             );
-            const tools: Record<string, unknown>[] = [];
-            const evidenceDigest = sha256Digest(input.prompt);
-            const gateway = new AdmittedModelGateway(AGENT_ADMISSION_BROKER, input.client, {
-              estimateCostMicrousd: (usage, call) => MODEL_USAGE_COST(usage, call)?.costMicrousd,
-              onLeaseClosed: recordAgentRuntimeLease,
-              auditRequired: true,
+            const tools = aqlReplanNativeTools('managed');
+            const evidenceDigest = sha256Digest(prompt);
+            const request = buildAqlReplanRequest(prompt, {
+              variant: 'managed', model: provider.model, maxTokens: budgetProfile.agentOutputBudgetTokens,
             });
+            const skillHost = skillSource && skillSession ? createAqlReplanSkillHostAuthority({
+              source: skillSource, broker: AGENT_ADMISSION_BROKER, controlStore: AGENT_CONTROL_STORE,
+              readLaneRuntime: () => parseAgentLaneRuntimeConfig(process.env),
+              liveEnabled: () => aqlReplanSkillLiveEnabled(process.env),
+              readEligibility: (lease) => ({
+                allowed: current() && sessions.get(rawSessionId) === skillSession
+                  && sessionDeletionAdmissionOpen(rawSessionId) && agentCapabilityTicketAllowed(AGENT_CONTROL_STORE, lease),
+                revision: sha256Digest(JSON.stringify([skillSource!.sourceDigest,
+                  sessions.get(rawSessionId) === skillSession, sessionDeletionAdmissionOpen(rawSessionId)])),
+              }),
+              safetyAuthority: { readForLease: (lease, source) => {
+                const dbPath = resolveSessionDatabase(DATA_DIR, `${rawSessionId}.db`);
+                if (!dbPath) return null;
+                return { sessionId: lease.sessionId, sourceRevision: source.sourceRevision,
+                  state: NSFW_SCENE_SAFETY_CONTROL.read({ dbPath, sessionId: rawSessionId,
+                    manifest: skillSession.getWorldbookSourceManifest() }) };
+              } },
+            }) : null;
+            const skillCall = skillSource && skillHost ? createAqlReplanSkillLiveCall({
+              broker: AGENT_ADMISSION_BROKER, source: skillSource, prompt, request, authority: skillHost.authority,
+            }) : null;
+            const canDispatch = (lease: AgentAdmissionLease): boolean => current()
+              && (!skillLive || !!(skillCall && skillHost && skillHost.authorizeDispatch(lease)
+                && skillCall.authorizeFixedRequest() && skillCall.authorizeCurrentContext(lease)));
+            let physicalLease: AgentAdmissionLease | undefined;
+            let closedAudit: AdmittedModelLeaseAudit | undefined;
+            let auditRecorded = false;
+            const recordClosedAudit = () => {
+              if (!closedAudit || auditRecorded) return false;
+              auditRecorded = true;
+              recordAgentRuntimeLease(closedAudit);
+              return true;
+            };
+            const gateway = new AdmittedModelGateway(
+              AGENT_ADMISSION_BROKER,
+              arbitratedAgentClient(client, provider, 'aql-replan', undefined, () => {
+                // The arbiter may have queued after the Gateway guard. Recheck at
+                // the existing physical handoff without aborting the committed turn.
+                if (!physicalLease || !AGENT_ADMISSION_BROKER.mayDispatchLease(physicalLease) || !canDispatch(physicalLease)) {
+                  throw new AdmittedModelGatewayError('gateway-dispatch-authority-denied');
+                }
+              }),
+              {
+                estimateCostMicrousd: (usage, call) => MODEL_USAGE_COST(usage, call)?.costMicrousd,
+                onLeaseClosed: skillLive ? (audit) => { closedAudit = audit; } : recordAgentRuntimeLease,
+                auditRequired: true,
+                ...(skillCall ? { prepareRequestRequired: true, prepareRequest: skillCall.prepareRequest } : {}),
+                authorizeDispatch: (lease) => {
+                  physicalLease = lease;
+                  return canDispatch(lease);
+                },
+              },
+            );
             const ticket = AGENT_ADMISSION_BROKER.issue({
-              runId: input.runId,
-              parentRunId: input.runId,
-              sessionId: input.ticketSessionId,
-              sourceRevision: input.sourceRevision,
+              runId,
+              parentRunId: runId,
+              sessionId: ticketSessionId,
+              sourceRevision,
               lane: 'interactive',
               taskKind: 'aql_replan',
               policyVersion: 'p14-q9r-aql-replan-interactive-v1',
               modelId: provider.model,
               budgetProfileDigest: agentBudgetProfileDigest(budgetProfile),
               toolSetDigest: agentToolSetDigest(tools),
-              mode: input.contentMode,
+              mode: contentMode,
               reasonCodes: ['regenerate-replan-threshold'],
               evidenceDigests: [evidenceDigest],
               noveltyDigest: evidenceDigest,
@@ -1215,8 +3685,8 @@ function agentAdmissionForSession(rawSessionId: string): import('../../tools/cli
               deadlineMs: Date.now() + budgetProfile.maxWallMs,
               allowedTools: [],
               fullSkillSnapshots: [],
-              cooldownKey: `aql-replan:${input.ticketSessionId}`,
-              idempotencyKey: `admit:${input.runId.slice(0, 120)}:aql-replan`,
+              cooldownKey: `aql-replan:${ticketSessionId}`,
+              idempotencyKey: `admit:${runId.slice(0, 120)}:aql-replan`,
               fallback: 'skip-optional-agent',
             });
             try {
@@ -1233,23 +3703,51 @@ function agentAdmissionForSession(rawSessionId: string): import('../../tools/cli
                   mode: ticket.mode,
                   budgetProfile,
                 },
-                request: {
-                  model: provider.model,
-                  messages: [
-                    { role: 'system', content: '你是剧本导演。只输出不超过 200 字的重写方向，不解释、不调用工具、不改数据库。' },
-                    { role: 'user', content: `=== 当前剧情上下文 ===\n${input.prompt}` },
-                  ],
-                  temperature: 0.6,
-                  max_tokens: budgetProfile.agentOutputBudgetTokens,
-                },
-                signal: input.signal,
+                request,
+                signal,
               });
+              // Session owns the final trim/slice and its pre-truncation length log.
+              if (!current() || typeof response.content !== 'string' || !parseAqlReplanOutput(response.content)) {
+                if (skillLive) throw new Error('aql-replan-skill-output-invalid');
+                return null;
+              }
+              if (skillCall && skillSession) {
+                const proof = skillCall.sealOutput(response.content);
+                const permission = physicalLease && skillHost?.permissionSnapshot(physicalLease);
+                if (!proof || !permission || !recordClosedAudit() || !current()
+                  || skillHost!.permissionSnapshot(physicalLease!) !== permission) {
+                  throw new Error('aql-replan-skill-proof-invalid');
+                }
+                commitAqlReplanSkillSourceReceipt({ rawSessionId, session: skillSession, proof,
+                  isCurrentSession: () => current() && sessions.get(rawSessionId) === skillSession
+                    && sessionDeletionAdmissionOpen(rawSessionId)
+                    && skillHost!.permissionSnapshot(physicalLease!) === permission });
+                try { scheduleAqlAdvisoryEvidence(rawSessionId); }
+                catch { console.warn('[AgentEvidence] AQL_ADVISORY_DELIVERY_PENDING'); }
+              }
+              if (summaryEvidence) {
+                try { commitAqlSummaryRequestEvidence(summaryEvidence, { request, output: response.content }); }
+                catch { /* Optional metadata cannot reverse the already completed turn or retry a model. */ }
+              }
+              if (!current()) {
+                if (skillLive) throw new Error('aql-replan-skill-source-stale');
+                return null;
+              }
               return response.content;
             } catch {
+              skillCall?.abandon();
+              if (skillLive) throw new Error('aql-replan-skill-request-failed');
               return null;
+            } finally {
+              if (skillLive && closedAudit && !auditRecorded) {
+                try { recordClosedAudit(); }
+                catch { throw new Error('aql-replan-skill-audit-failed'); }
+              }
             }
           },
           admitInteractivePrelude: (input) => {
+            pendingPreludeSkill = null;
+            pendingPreludeSkillCurrent = null;
             // Re-read only at a new turn boundary. Changing the global switch to off or
             // removing this session from the allowlist immediately returns to legacy.
             let live;
@@ -1260,20 +3758,59 @@ function agentAdmissionForSession(rawSessionId: string): import('../../tools/cli
               || input.audit.runId !== input.runId
               || input.audit.sessionId !== input.ticketSessionId
               || input.audit.sourceRevision !== input.sourceRevision) return null;
-            const provider = loadProviderConfig();
+            const skillRequired = preludeSkillLiveEnabled(process.env);
+            const session = sessions.get(rawSessionId);
+            if (skillRequired && (!AGENT_CLOSURE_STORE || !session)) {
+              throw new Error('skill-prelude-host-required');
+            }
+            const { selection: provider, client: agentTransport } = agentModelBinding();
             const budgetProfile = agentTaskBudgetProfile(
-              'interactive_prelude', process.env, {}, modelRuntimeProfileFor(provider, input.client),
+              'interactive_prelude', process.env, {}, modelRuntimeProfileFor(provider, agentTransport),
             );
-            const tools = [...INTERACTIVE_NATIVE_TOOLS];
+            // Bind the exact per-session tool projection that the runner will send. Global policy
+            // entries whose paths/types are absent from this session must not retain write authority.
+            const tools = [...effectiveInteractiveNativeTools(input.variableSpecs)];
             const allowedTools = tools.map((entry) => {
               const fn = (entry as { function?: { name?: unknown } }).function;
               if (typeof fn?.name !== 'string') throw new Error('interactive-tool-contract-invalid');
               return fn.name;
             });
-            const gateway = new AdmittedModelGateway(AGENT_ADMISSION_BROKER, input.client, {
+            const policyVersion = input.audit.decision.verdict === 'would-admit'
+              ? input.audit.decision.policyVersion : input.director.policyVersion;
+            const skillHost = AGENT_CLOSURE_STORE && skillRequired && session
+              ? foregroundSkillHostForSession(rawSessionId, session, (lease) => {
+                const current = parseAgentAdmissionRuntimeConfig(process.env);
+                const budget = agentTaskBudgetProfile('interactive_prelude', process.env, {},
+                  modelRuntimeProfileFor(provider, agentTransport));
+                return { revision: agentBudgetProfileDigest(budget), allowed: agentAdmissionAllowsSession(current, rawSessionId)
+                  && agentBudgetProfileDigest(budget) === lease.budgetProfileDigest };
+              }, () => preludeSkillLiveEnabled(process.env)) : null;
+            const skillCall = skillHost ? createPreludeSkillLiveCall({ broker: AGENT_ADMISSION_BROKER, policyVersion,
+              identity: { rawSessionId: input.rawSessionId, runId: input.runId, sourceRevision: input.sourceRevision },
+              executionClass: skillHost.executionClass('interactive', input.ticketSessionId), authority: skillHost.authority,
+              captureSource: true }) : null;
+            if (skillRequired && (!skillHost || !skillCall)) throw new Error('skill-prelude-host-required');
+            let physicalLease: AgentAdmissionLease | undefined;
+            let dispatchPermission: string | null | undefined;
+            let closedAudit: AdmittedModelLeaseAudit | undefined;
+            let auditRecorded = false;
+            const recordClosedAudit = () => {
+              if (closedAudit && !auditRecorded) { auditRecorded = true; recordAgentRuntimeLease(closedAudit); }
+            };
+            // P17-01.3：interactive_prelude 前台调用走全局仲裁。
+            const gateway = new AdmittedModelGateway(AGENT_ADMISSION_BROKER,
+              turnOperationClientForServer(rawSessionId, input.runId, 'prelude',
+                arbitratedAgentClient(agentTransport, provider, 'interactive-prelude')), {
               estimateCostMicrousd: (usage, call) => MODEL_USAGE_COST(usage, call)?.costMicrousd,
-              onLeaseClosed: recordAgentRuntimeLease,
+              onLeaseClosed: skillRequired ? (audit) => { closedAudit = audit; } : recordAgentRuntimeLease,
               auditRequired: true,
+              ...(skillRequired ? { prepareRequestRequired: true } : {}),
+              ...(skillCall ? { prepareRequest: skillCall.prepareRequest, authorizeDispatch: (lease) => {
+                physicalLease = lease;
+                const current = skillHost!.permissionSnapshot(lease);
+                if (dispatchPermission === undefined) dispatchPermission = current;
+                return !!current && current === dispatchPermission && skillHost!.authorizeDispatch(lease);
+              } } : {}),
             });
             const ticket = AGENT_ADMISSION_BROKER.issue({
               runId: input.runId,
@@ -1282,9 +3819,7 @@ function agentAdmissionForSession(rawSessionId: string): import('../../tools/cli
               sourceRevision: input.sourceRevision,
               lane: 'interactive',
               taskKind: 'interactive_prelude',
-              policyVersion: input.audit.decision.verdict === 'would-admit'
-                ? input.audit.decision.policyVersion
-                : input.director.policyVersion,
+              policyVersion,
               modelId: provider.model,
               budgetProfileDigest: agentBudgetProfileDigest(budgetProfile),
               toolSetDigest: agentToolSetDigest(tools),
@@ -1329,10 +3864,27 @@ function agentAdmissionForSession(rawSessionId: string): import('../../tools/cli
               budgetProfile,
             } as const;
             const lease = gateway.open({ binding, modelId: provider.model, tools });
+            let lastGatewayErrorCode: AdmittedModelGatewayErrorCode | undefined;
+            const preserveGatewayError = async <T>(work: () => Promise<T>): Promise<T> => {
+              try {
+                return await work();
+              } catch (error) {
+                // Persist only the Gateway's fixed reason vocabulary. Provider messages,
+                // prompts and arbitrary thrown text must never enter the control ledger.
+                if (error instanceof AdmittedModelGatewayError) {
+                  lastGatewayErrorCode = safeAdmittedModelGatewayErrorCode(error);
+                }
+                throw error;
+              }
+            };
             const client: ChatCompletionClient = {
-              complete: (request, signal) => lease.complete({ ...request, model: provider.model }, signal),
-              stream: (request, onDelta, onToolArg, signal) => lease.stream(
-                { ...request, model: provider.model }, onDelta, onToolArg, signal,
+              complete: (request, signal) => preserveGatewayError(
+                () => lease.complete({ ...request, model: provider.model }, signal),
+              ),
+              stream: (request, onDelta, onToolArg, signal) => preserveGatewayError(
+                () => lease.stream(
+                  { ...request, model: provider.model }, onDelta, onToolArg, signal,
+                ),
               ),
               capabilities: () => ({ stream: true, tools: true }),
               modelName: () => provider.model,
@@ -1340,29 +3892,96 @@ function agentAdmissionForSession(rawSessionId: string): import('../../tools/cli
             return {
               client,
               budgetProfile,
-              finish: (outcome) => lease.finish(
-                outcome,
-                outcome === 'provider_error' ? 'gateway-provider-call-failed'
-                  : outcome === 'cancelled' ? 'gateway-provider-call-cancelled' : undefined,
-              ),
+              ...(skillRequired ? { skillRequired: true as const } : {}),
+              ...(skillCall ? { sealArtifact: (result) => {
+                const sealed = skillCall.sealArtifact(result);
+                if (skillRequired && !sealed) throw new Error('skill-prelude-proof-required');
+                pendingPreludeSkill = skillCall;
+                pendingPreludeSkillCurrent = () => !!dispatchPermission && !!physicalLease
+                  && skillHost!.permissionSnapshot(physicalLease) === dispatchPermission;
+                if (skillRequired && !pendingPreludeSkillCurrent()) throw new Error('skill-prelude-permission-stale');
+              } } : {}),
+              finish: (outcome) => {
+                if (outcome !== 'completed') { skillCall?.abandon(); pendingPreludeSkill = null; }
+                try {
+                  lease.finish(outcome,
+                    outcome === 'provider_error' ? lastGatewayErrorCode ?? 'gateway-provider-call-failed'
+                      : outcome === 'cancelled' ? 'gateway-provider-call-cancelled' : undefined);
+                } finally { if (skillRequired) recordClosedAudit(); }
+                if (skillRequired && outcome === 'completed' && (!closedAudit || !pendingPreludeSkillCurrent?.())) {
+                  pendingPreludeSkill = null; throw new Error('skill-prelude-permission-stale');
+                }
+              },
             };
           },
+          preparePreludeConsumption: (used) => {
+            const pending = pendingPreludeSkill;
+            pendingPreludeSkill = null;
+            const current = pendingPreludeSkillCurrent;
+            if ((pending || preludeSkillLiveEnabled(process.env)) && !current?.()) throw new Error('skill-prelude-permission-stale');
+            const payload = pending?.prepareConsumption(used) ?? null;
+            if (preludeSkillLiveEnabled(process.env) && !payload) throw new Error('skill-prelude-proof-required');
+            return payload;
+          },
+          assertPreludeSkillCurrent: () => {
+            if (!pendingPreludeSkillCurrent?.()) throw new Error('skill-prelude-permission-stale');
+          },
+          observePreludeConsumption: () => SKILL_CONSUMPTION_SCHEDULER?.schedule(rawSessionId),
           repairDraft: async (input) => {
+            pendingCriticSkill = null;
+            pendingCriticSkillCurrent = null;
             let live;
             try { live = parseAgentAdmissionRuntimeConfig(process.env); } catch { return null; }
             if (!agentAdmissionAllowsSession(live, input.rawSessionId)
               || input.decision.severity !== 'repairable'
               || input.decision.hardDenyCodes.length > 0
               || input.runId === 'missing-run') return null;
-            const provider = loadProviderConfig();
+            const skillRequired = criticSkillLiveEnabled(process.env);
+            const session = sessions.get(rawSessionId);
+            if (skillRequired && (!AGENT_CLOSURE_STORE || !session)) throw new Error('skill-critic-host-required');
+            const { selection: provider, client } = agentModelBinding();
             const budgetProfile = agentTaskBudgetProfile(
-              'critic_revision', process.env, {}, modelRuntimeProfileFor(provider, input.client),
+              'critic_revision', process.env, {}, modelRuntimeProfileFor(provider, client),
             );
+            const capturedInput = createCriticInput({ decision: input.decision, draft: input.draft,
+              fullSkills: input.fullSkills, maxOutputTokens: budgetProfile.agentOutputBudgetTokens });
+            const request = { ...buildPrecommitCriticRequestFromInput(capturedInput), model: provider.model };
             const tools: Record<string, unknown>[] = [];
-            const gateway = new AdmittedModelGateway(AGENT_ADMISSION_BROKER, input.client, {
+            const skillHost = AGENT_CLOSURE_STORE && skillRequired && session
+              ? foregroundSkillHostForSession(rawSessionId, session, (lease) => {
+                const current = parseAgentAdmissionRuntimeConfig(process.env);
+                const budget = agentTaskBudgetProfile('critic_revision', process.env, {}, modelRuntimeProfileFor(provider, client));
+                return { revision: agentBudgetProfileDigest(budget), allowed: agentAdmissionAllowsSession(current, rawSessionId)
+                  && agentBudgetProfileDigest(budget) === lease.budgetProfileDigest };
+              }, () => criticSkillLiveEnabled(process.env)) : null;
+            const skillCall = skillHost ? createCriticSkillLiveCall({
+              broker: AGENT_ADMISSION_BROKER, policyVersion: input.decision.policyVersion,
+              identity: { rawSessionId: input.rawSessionId, runId: input.runId, sourceRevision: input.sourceRevision,
+                draftDigest: sha256Digest(JSON.stringify(input.draft)), decisionDigest: sha256Digest(JSON.stringify(input.decision)) },
+              executionClass: skillHost.executionClass('critic', input.ticketSessionId), authority: skillHost.authority,
+              sourceManifest: criticInputManifest(capturedInput), sourceRequest: request,
+            }) : null;
+            if (skillRequired && (!skillHost || !skillCall)) throw new Error('skill-critic-host-required');
+            let physicalLease: AgentAdmissionLease | undefined;
+            let dispatchPermission: string | null | undefined;
+            let closedAudit: AdmittedModelLeaseAudit | undefined;
+            let auditRecorded = false;
+            const recordClosedAudit = () => {
+              if (closedAudit && !auditRecorded) { auditRecorded = true; recordAgentRuntimeLease(closedAudit); }
+            };
+            const gateway = new AdmittedModelGateway(AGENT_ADMISSION_BROKER,
+              turnOperationClientForServer(rawSessionId, input.runId, 'critic',
+                arbitratedAgentClient(client, provider, 'critic-revision')), {
               estimateCostMicrousd: (usage, call) => MODEL_USAGE_COST(usage, call)?.costMicrousd,
-              onLeaseClosed: recordAgentRuntimeLease,
+              onLeaseClosed: skillRequired ? (audit) => { closedAudit = audit; } : recordAgentRuntimeLease,
               auditRequired: true,
+              ...(skillRequired ? { prepareRequestRequired: true } : {}),
+              ...(skillCall ? { prepareRequest: skillCall.prepareRequest, authorizeDispatch: (lease) => {
+                physicalLease = lease;
+                const current = skillHost!.permissionSnapshot(lease);
+                if (dispatchPermission === undefined) dispatchPermission = current;
+                return !!current && current === dispatchPermission && skillHost!.authorizeDispatch(lease);
+              } } : {}),
             });
             const ticket = AGENT_ADMISSION_BROKER.issue({
               runId: input.runId,
@@ -1388,7 +4007,8 @@ function agentAdmissionForSession(rawSessionId: string): import('../../tools/cli
               idempotencyKey: `admit:${input.runId}:critic`,
               fallback: 'use-original-draft',
             });
-            const lease = gateway.open({
+            try {
+            const response = await gateway.complete({
               binding: {
                 ticketId: ticket.ticketId,
                 runId: ticket.runId,
@@ -1401,31 +4021,50 @@ function agentAdmissionForSession(rawSessionId: string): import('../../tools/cli
                 mode: ticket.mode,
                 budgetProfile,
               },
-              modelId: provider.model,
-              tools,
+              request, signal: input.signal,
             });
-            const response = await lease.complete({
-              ...buildPrecommitCriticModelRequest({
-                decision: input.decision,
-                draft: input.draft,
-                fullSkills: input.fullSkills,
-                maxOutputTokens: budgetProfile.agentOutputBudgetTokens,
-              }),
-              model: provider.model,
-            }, input.signal);
+            if (skillCall && typeof response.content === 'string') {
+              skillCall.bindResponse(sha256Digest(response.content));
+              pendingCriticSkill = skillCall;
+            }
+            if (skillRequired && !pendingCriticSkill) throw new Error('skill-critic-proof-required');
+            if (skillRequired) {
+              const permission = dispatchPermission;
+              recordClosedAudit();
+              if (!closedAudit || !permission || !physicalLease
+                || skillHost!.permissionSnapshot(physicalLease) !== permission) throw new Error('skill-critic-permission-stale');
+              pendingCriticSkillCurrent = () => skillHost!.permissionSnapshot(physicalLease!) === permission;
+            }
             return response.content;
+            } finally { if (skillRequired) recordClosedAudit(); }
           },
+          prepareCriticConsumption: (used) => {
+            const pending = pendingCriticSkill;
+            pendingCriticSkill = null;
+            const current = pendingCriticSkillCurrent;
+            if ((pending || criticSkillLiveEnabled(process.env)) && !current?.()) throw new Error('skill-critic-permission-stale');
+            const payload = pending?.prepareConsumption(used) ?? null;
+            if (criticSkillLiveEnabled(process.env) && !payload) throw new Error('skill-critic-proof-required');
+            return payload;
+          },
+          assertCriticSkillCurrent: () => {
+            if (!pendingCriticSkillCurrent?.()) throw new Error('skill-critic-permission-stale');
+          },
+          observeCriticConsumption: () => SKILL_CONSUMPTION_SCHEDULER?.schedule(rawSessionId),
           summarizeRolling: async (input) => {
             let live;
             try { live = parseAgentAdmissionRuntimeConfig(process.env); } catch { return null; }
             if (!agentAdmissionAllowsSession(live, input.rawSessionId)
               || input.runId === 'missing-run' || !MODEL_USAGE_COST) return null;
-            const provider = loadProviderConfig();
+            const { selection: provider, client: rawSummaryClient } = agentModelBinding();
+            // P17-01.3：rolling_summary 维护（lane=maintenance）走全局仲裁。
+            const client = turnOperationClientForServer(rawSessionId, input.runId, 'summary',
+              arbitratedAgentClient(rawSummaryClient, provider, 'maintenance'));
             const budgetProfile = foregroundSummaryBudgetProfile(
-              process.env, modelRuntimeProfileFor(provider, input.client),
+              process.env, modelRuntimeProfileFor(provider, client),
             );
-            const tools: Record<string, unknown>[] = [];
-            const gateway = new AdmittedModelGateway(AGENT_ADMISSION_BROKER, input.client, {
+            const tools = [...foregroundSummaryNativeTools()];
+            const gateway = new AdmittedModelGateway(AGENT_ADMISSION_BROKER, client, {
               estimateCostMicrousd: (usage, call) => MODEL_USAGE_COST(usage, call)?.costMicrousd,
               onLeaseClosed: recordAgentRuntimeLease,
               auditRequired: true,
@@ -1470,15 +4109,10 @@ function agentAdmissionForSession(rawSessionId: string): import('../../tools/cli
               modelId: provider.model,
               tools,
             });
-            const response = await lease.complete({
-              model: provider.model,
-              messages: [
-                { role: 'system', content: '你是剧情记忆压缩器，只输出摘要正文，禁止解释、禁止输出对话。' },
-                { role: 'user', content: input.prompt },
-              ],
-              temperature: 0.3,
-              max_tokens: budgetProfile.agentOutputBudgetTokens,
-            }, input.signal);
+            const response = await lease.complete(buildForegroundSummaryModelRequest({
+              model: provider.model, prompt: input.prompt,
+              maxOutputTokens: budgetProfile.agentOutputBudgetTokens,
+            }), input.signal);
             return response.content;
           },
         }
@@ -1494,9 +4128,9 @@ function agentAdmissionForSession(rawSessionId: string): import('../../tools/cli
               evidence: { promptDigest: sha256Digest(input.userPrompt) },
               modelRequest: buildPreferenceExtractionModelRequest({
                 initialPrompt: input.userPrompt,
-                maxOutputTokens: 1_200,
+                maxOutputTokens: 800,
               }),
-              maxOutputTokens: 1_200,
+              maxOutputTokens: 800,
             }),
             attributeBranch: async (input) => runPreferenceLearningCall(input, {
               policyVersion: 'p14-q6-branch-semantic-v1',
@@ -1520,124 +4154,44 @@ function agentAdmissionForSession(rawSessionId: string): import('../../tools/cli
     ...(AGENT_ADMISSION_RUNTIME.executionEnabled
       && MODEL_USAGE_COST
       && LEARNING_TEXT_RUNTIME.styleEnabled ? {
-            requestStyleProposal: async (input) => {
-              let liveAdmission;
-              let livePrivacy;
-              try {
-                liveAdmission = parseAgentAdmissionRuntimeConfig(process.env);
-                livePrivacy = parseLearningTextRuntimeConfig(process.env);
-              } catch {
-                return Object.freeze({
-                  status: 'skipped' as const,
-                  reasonCode: 'style-runtime-config-invalid' as const,
-                });
-              }
-              const sampleChars = input.samples.reduce((sum, sample) => sum + sample.prose.length, 0);
-              if (!livePrivacy.styleEnabled
-                || !agentAdmissionAllowsSession(liveAdmission, input.rawSessionId)
-                || input.runId === 'missing-run' || !MODEL_USAGE_COST
-                || input.samples.length < 1 || input.samples.length > 8 || sampleChars > 100_000) {
-                return Object.freeze({
-                  status: 'skipped' as const,
-                  reasonCode: 'style-admission-closed' as const,
-                });
-              }
-              const provider = loadProviderConfig();
-              const budgetProfile = agentTaskBudgetProfile(
-                'style_compile', process.env, {}, modelRuntimeProfileFor(provider, input.client),
-              );
-              const modelRequest = buildStyleCompilationModelRequest({
-                profileVersion: input.profileVersion,
-                samples: input.samples,
-                maxOutputTokens: budgetProfile.agentOutputBudgetTokens,
-              });
-              const tools = [...(modelRequest.tools ?? [])];
-              const gateway = new AdmittedModelGateway(AGENT_ADMISSION_BROKER, input.client, {
-                estimateCostMicrousd: (usage, call) => MODEL_USAGE_COST(usage, call)?.costMicrousd,
-                onLeaseClosed: recordAgentRuntimeLease,
-                auditRequired: true,
-              });
-              const ticket = AGENT_ADMISSION_BROKER.issue({
-                runId: input.runId,
-                parentRunId: input.runId,
-                sessionId: input.ticketSessionId,
-                sourceRevision: input.sourceRevision,
-                lane: 'learning',
-                taskKind: 'style_compile',
-                policyVersion: 'p14-q7-style-compiler-v1',
-                modelId: provider.model,
-                budgetProfileDigest: agentBudgetProfileDigest(budgetProfile),
-                toolSetDigest: agentToolSetDigest(tools),
-                mode: input.contentMode,
-                reasonCodes: [input.explicitRequest ? 'explicit-style-save' : 'style-evidence-threshold'],
-                evidenceDigests: [input.sourceDigest],
-                noveltyDigest: input.sourceDigest,
-                expectedBenefit: 'style-learning',
-                limits: admissionLimitsFromBudgetProfile(budgetProfile),
-                deadlineMs: Date.now() + budgetProfile.maxWallMs,
-                allowedTools: [STYLE_DRAFT_TOOL_NAME],
-                fullSkillSnapshots: [],
-                cooldownKey: `style:${input.ticketSessionId}:${input.profileVersion}`,
-                idempotencyKey: `admit:${input.runId}:style:${input.sourceDigest.slice(-16)}`,
-                fallback: 'skip-optional-agent',
-              });
-              const lease = gateway.open({
-                binding: {
-                  ticketId: ticket.ticketId,
-                  runId: ticket.runId,
-                  parentRunId: ticket.parentRunId,
-                  sessionId: ticket.sessionId,
-                  sourceRevision: ticket.sourceRevision,
-                  lane: ticket.lane,
-                  taskKind: ticket.taskKind,
-                  policyVersion: ticket.policyVersion,
-                  mode: ticket.mode,
-                  budgetProfile,
-                },
-                modelId: provider.model,
-                tools,
-              });
-              const response = await lease.complete({
-                ...modelRequest,
-                model: provider.model,
-              }, input.signal);
-              const parsed = parseLearnedStyleModelResponse(response);
-              if (!parsed.ok) {
-                // Fixed code only: model output and user prose must never enter server logs.
-                console.warn('[StyleCompile] ' + parsed.reasonCode);
-                return Object.freeze({ status: 'rejected' as const, reasonCode: parsed.reasonCode });
-              }
-              const draft = parsed.draft;
-              try {
-                const evaluation = evaluateLearnedStyleDraft({
-                  draft,
-                  samples: input.samples,
-                  forbiddenIdentityTerms: input.forbiddenIdentityTerms,
-                });
-                const proposal = LEARNED_STYLE_PROPOSALS.create({
-                  draft,
-                  sourceDigest: input.sourceDigest,
-                  profileVersion: input.profileVersion,
-                  model: provider.model,
-                  policyVersion: 'p14-q7-style-compiler-v1',
-                  evaluation,
-                  scope: input.scope,
-                });
-                return Object.freeze({ status: 'created' as const, proposalId: proposal.id });
-              } catch {
-                console.warn('[StyleCompile] style-proposal-store-rejected');
-                return Object.freeze({
-                  status: 'rejected' as const,
-                  reasonCode: 'style-proposal-store-rejected' as const,
-                });
-              }
-            },
+            ...styleCompileAdmissionForSession(rawSessionId),
           } : {}),
   };
 }
 
 const sessionLoadPromises = new Map<string, Promise<ChatSession | undefined>>();
+function toolResultBodyAccessForSession(
+  sessionId: string,
+  readSession: () => ChatSession | undefined,
+): () => { readonly readAllowed: boolean; readonly writeAllowed: boolean; readonly deletionOpen: boolean } {
+  return createToolResultBodyAccess({
+    serverAllowed: () => !shuttingDown,
+    isCurrentSession: () => {
+      const session = readSession();
+      return !!session && sessions.get(sessionId) === session;
+    },
+    deletionOpen: () => sessionDeletionAdmissionOpen(sessionId),
+  });
+}
+function nsfwSceneSkillForSession(rawSessionId: string): NonNullable<SessionArgs['nsfwSceneSkill']> {
+  return createNsfwSceneSkillHost({
+    liveEnabled: () => nsfwSceneSkillLiveEnabled(process.env),
+    readCurrent(source) {
+      if (shuttingDown || source.sessionId !== rawSessionId || !sessionDeletionAdmissionOpen(rawSessionId)) return null;
+      const session = sessions.get(rawSessionId);
+      const dbPath = resolveSessionDatabase(DATA_DIR, `${rawSessionId}.db`);
+      if (!session || !dbPath || session.getHistoryEpoch() !== source.historyEpoch) return null;
+      const manifest = session.getWorldbookSourceManifest(true);
+      const safety = NSFW_SCENE_SAFETY_CONTROL.resolveSnapshot({ dbPath, sessionId: rawSessionId, manifest });
+      if (!safety || manifest.sourceRevision !== source.sourceRevision
+        || nsfwSceneRequestDigest(safety) !== source.safetyDigest) return null;
+      const turn = session.readAgentSkillTurnContext(source.runId);
+      return turn && turn.contentMode === 'nsfw' ? { turn, sessionIdentity: session } : null;
+    },
+  });
+}
 async function loadSessionById(sessionId: string): Promise<ChatSession | undefined> {
+  if (shuttingDown || !sessionDeletionAdmissionOpen(sessionId)) return undefined;
   const loaded = sessions.get(sessionId);
   if (loaded) return loaded;
   const pending = sessionLoadPromises.get(sessionId);
@@ -1645,18 +4199,59 @@ async function loadSessionById(sessionId: string): Promise<ChatSession | undefin
   const promise = (async () => {
     const dbPath = resolveSessionDatabase(DATA_DIR, `${sessionId}.db`);
     if (!dbPath || !existsSync(dbPath)) return undefined;
-    const session = new ChatSession({
+    let session: ChatSession;
+    session = new ChatSession({
       db: dbPath,
       resume: true,
       useBge: false,
-      providerClient: providerClientForServer(),
-      observeProviderClient: observeServerModelClient,
+      ...sessionProviderArgsForServer(sessionId),
+      toolResultBodyAccess: toolResultBodyAccessForSession(sessionId, () => session),
+      skillSelectionObserver: skillSelectionObserverForSession(sessionId),
+      stylePackageShadowRequired: () => STYLE_PACKAGE_SHADOW_ENABLED && SESSION_AGENT_SKILL_SHADOW_RUNTIME_CONFIG.allowsSession(sessionId),
+      stylePackageShadowRejected: input => STYLE_PACKAGE_SHADOW.rejectTurn(input),
+      stylePackageCanary: STYLE_PACKAGE_CANARY,
       learnedStyleResolver: learnedStyleResolverForSession(sessionId),
+      commitLearnedStyleAdoption: learnedStyleAdoptionForSession(sessionId),
+      aqlReplanSkillRequired: () => aqlReplanSkillLiveEnabled(process.env),
       interactiveHarness: interactiveHarnessForSession(sessionId),
       agentAdmission: agentAdmissionForSession(sessionId),
+      variableProposalSkill: variableProposalSkillForSession(sessionId),
+      nsfwSceneSkill: nsfwSceneSkillForSession(sessionId),
+      nsfwSceneSafetyResolver: () => NSFW_SCENE_SAFETY_CONTROL.resolveSnapshot({
+        dbPath,
+        sessionId,
+        manifest: session.getWorldbookSourceManifest(),
+      }),
+      maintenanceHistoryReconcile: ({ sessionId: callbackSessionId, rollbackRound, historyEpoch }) => {
+        if (callbackSessionId !== sessionId || session.getHistoryEpoch() !== historyEpoch) {
+          throw new Error('maintenance-history-reconcile-fence-mismatch');
+        }
+        const committer = new MemorySummaryMaintenanceCommitter({
+          sessionId,
+          memory: session.getMemory().mem,
+        }, () => snapshotForSession(session).snapshotToken);
+        const reconciled = committer.reconcileHistoryRollback(rollbackRound);
+        // This callback runs in the history transaction: wake only after its synchronous
+        // stack exits, then re-read the committed epoch rather than trusting the hint.
+        queueMicrotask(() => STYLE_COMPILE_RUNTIME?.wakeSession(sessionId));
+        if (reconciled.rolledBackRunIds.length > 0) {
+          MAINTENANCE_MEMORY_WRITE_SCHEDULER?.schedule();
+          MAINTENANCE_SUMMARY_WRITE_SCHEDULER?.schedule();
+          queueMicrotask(() => {
+            MAINTENANCE_MEMORY_EVIDENCE_SCHEDULER?.schedule(sessionId);
+            MAINTENANCE_SUMMARY_EVIDENCE_SCHEDULER?.schedule(sessionId);
+          });
+        }
+      },
       quietLogs: ACCESS_MODE === 'secured',
     });
     await session.init();
+    // A deletion reservation may have been acquired while the database was
+    // initializing.  Never publish that now-fenced instance back into memory.
+    if (shuttingDown || !sessionDeletionAdmissionOpen(sessionId)) {
+      try { session.close(); } catch { /* deletion cleanup owns the durable truth */ }
+      return undefined;
+    }
     try {
       reconcileAndHydrateLearning(session);
     } catch {
@@ -1666,6 +4261,31 @@ async function loadSessionById(sessionId: string): Promise<ChatSession | undefin
       }
     }
     sessions.set(sessionId, session);
+    STYLE_COMPILE_RUNTIME?.wakeSession(sessionId);
+    SKILL_CONSUMPTION_SCHEDULER?.schedule(sessionId);
+    LEARNING_PREFERENCE_SOURCE_SCHEDULER?.schedule(sessionId);
+    EXPLICIT_PREFERENCE_EVIDENCE_SCHEDULER?.schedule(sessionId);
+    CLOSURE_SKILL_EVIDENCE_SCHEDULER?.schedule(sessionId);
+    MAINTENANCE_MEMORY_EVIDENCE_SCHEDULER?.schedule(sessionId);
+    MAINTENANCE_SUMMARY_EVIDENCE_SCHEDULER?.schedule(sessionId);
+    MAINTENANCE_PROPOSAL_REJECTION_EVIDENCE_SCHEDULER?.schedule(sessionId);
+    MAINTENANCE_PROPOSAL_APPROVAL_EVIDENCE_SCHEDULER?.schedule(sessionId);
+    ARC_COMMIT_EVIDENCE_SCHEDULER?.schedule(sessionId);
+    WORLDBOOK_APPLY_EVIDENCE_SCHEDULER?.schedule(sessionId);
+    NPC_OPERATION_EVIDENCE_SCHEDULER?.schedule(sessionId);
+    REGENERATION_EVIDENCE_SCHEDULER?.schedule(sessionId);
+    STYLE_COMPILE_ADOPTION_EVIDENCE_SCHEDULER?.schedule(sessionId);
+    VARIABLE_APPLY_EVIDENCE_SCHEDULER?.schedule(sessionId);
+    VARIABLE_INVALIDATION_EVIDENCE_SCHEDULER?.schedule(sessionId);
+    REPORTED_EFFECT_EVIDENCE_SCHEDULER?.schedule(sessionId);
+    BRANCH_MODIFIED_EVIDENCE_SCHEDULER?.schedule(sessionId);
+    BRANCH_ATTRIBUTION_EVIDENCE_SCHEDULER?.schedule(sessionId);
+    PREFERENCE_INFERENCE_EVIDENCE_SCHEDULER?.schedule(sessionId);
+    AQL_ADVISORY_EVIDENCE_SCHEDULER?.schedule(sessionId);
+    NSFW_SCENE_EVIDENCE_SCHEDULER?.schedule(sessionId);
+    MAINTENANCE_MEMORY_CONSUMPTION_SCHEDULER?.schedule(sessionId);
+    MAINTENANCE_SUMMARY_CONSUMPTION_SCHEDULER?.schedule(sessionId);
+    MAINTENANCE_SUMMARY_WRITE_SCHEDULER?.schedule();
     setTimeout(() => void session.warmRetrievalChannels(), 0);
     return session;
   })();
@@ -1675,6 +4295,259 @@ async function loadSessionById(sessionId: string): Promise<ChatSession | undefin
   } finally {
     if (sessionLoadPromises.get(sessionId) === promise) sessionLoadPromises.delete(sessionId);
   }
+}
+
+function maintenanceProposalControlFor(
+  proposalSessionId: string,
+  proposalSession: ChatSession,
+): MaintenanceProposalControl {
+  if (!ARC_PROJECTIONS) throw new Error('maintenance-proposal-control-unavailable');
+  const currentRevision = (sessionId: string): string => {
+    if (sessionId !== proposalSessionId) throw new Error('maintenance-proposal-session-conflict');
+    return snapshotForSession(proposalSession).snapshotToken;
+  };
+  const npcBackup = new NpcMaintenanceApplyBackupStore({
+    dataDir: DATA_DIR,
+    currentRevision,
+  });
+  const memorySummary = new MemorySummaryMaintenanceCommitter({
+    sessionId: proposalSessionId,
+    memory: proposalSession.getMemory().mem,
+  }, currentRevision);
+  return new MaintenanceProposalControl({
+    manager: maintenanceJobs,
+    arcStore: ARC_PROJECTIONS,
+    currentRevision,
+    prepareNpcApply: (pending) => npcBackup.prepare({
+      sessionId: pending.sessionId,
+      sourceRevision: pending.sourceRevision,
+    }),
+    recoverMemorySummaryProposal: (pending) => pending.taskKind === 'memory_consolidation'
+      ? withMaintenanceMemoryWriteWake(() => memorySummary.recover(pending),
+        () => MAINTENANCE_MEMORY_WRITE_SCHEDULER?.schedule())
+      : withMaintenanceSummaryWriteWake(() => memorySummary.recover(pending),
+        () => MAINTENANCE_SUMMARY_WRITE_SCHEDULER?.schedule()),
+    applyMemorySummaryProposal: (pending) => pending.taskKind === 'memory_consolidation'
+      ? withMaintenanceMemoryWriteWake(() => memorySummary.commit(pending),
+        () => MAINTENANCE_MEMORY_WRITE_SCHEDULER?.schedule())
+      : withMaintenanceSummaryWriteWake(() => memorySummary.commit(pending),
+        () => MAINTENANCE_SUMMARY_WRITE_SCHEDULER?.schedule()),
+    rollbackMemorySummaryProposal: (anchor) => withMaintenanceMemoryWriteWake(() => {
+      const result = memorySummary.rollback(anchor);
+      // Optional evidence recovery cannot change the already committed rollback outcome.
+      for (const scheduler of [MAINTENANCE_MEMORY_EVIDENCE_SCHEDULER, MAINTENANCE_SUMMARY_EVIDENCE_SCHEDULER]) {
+        try { scheduler?.schedule(proposalSessionId); } catch { /* retained receipts recover on the next wake */ }
+      }
+      return result;
+    },
+      () => {
+        MAINTENANCE_MEMORY_WRITE_SCHEDULER?.schedule();
+        MAINTENANCE_SUMMARY_WRITE_SCHEDULER?.schedule();
+      }),
+    observeProposalTransition: (proposal) => {
+      if (proposal.taskKind === 'branch_index' && ['applied', 'rolled_back'].includes(proposal.status)) {
+        try { scheduleArcCommitEvidence(proposal.sessionId); }
+        catch { console.warn('[AgentEvidence] ARC_COMMIT_DELIVERY_PENDING'); }
+      }
+      if (proposal.taskKind === 'npc_state' && ['applied', 'rolled_back'].includes(proposal.status)) {
+        try { scheduleNpcOperationEvidence(proposal.sessionId); }
+        catch { console.warn('[AgentEvidence] NPC_OPERATION_DELIVERY_PENDING'); }
+      }
+      if (proposal.status === 'applied' || proposal.status === 'rolled_back') {
+        try { scheduleMaintenanceProposalApprovalEvidence(proposal.sessionId, proposal.proposalId); }
+        catch { /* Original decision metadata remains available for startup recovery. */ }
+      }
+      if (proposal.status === 'rejected') {
+        try { scheduleMaintenanceProposalRejectionEvidence(proposal.sessionId, proposal.proposalId); }
+        catch { /* Original committed rejection remains available for startup recovery. */ }
+      }
+      const job = maintenanceJobs.get(proposal.jobRunId);
+      let summaryOwnsEvidence = false;
+      if (proposal.taskKind === 'rolling_summary') {
+        try { summaryOwnsEvidence = maintenanceJobs.readSummarySkillProvenance(proposal.jobRunId) !== null; }
+        catch { summaryOwnsEvidence = true; AGENT_CLOSURE_DEGRADED = true; }
+      }
+      if (job && !summaryOwnsEvidence) AGENT_CLOSURE_RECORDER?.observeMaintenanceProposal(job, proposal);
+      if (proposal.taskKind === 'memory_consolidation') MAINTENANCE_MEMORY_WRITE_SCHEDULER?.schedule();
+      if (proposal.taskKind === 'rolling_summary') MAINTENANCE_SUMMARY_WRITE_SCHEDULER?.schedule();
+    },
+    ...createNpcMaintenanceProposalAdapters({ dataDir: DATA_DIR, currentRevision }),
+  });
+}
+
+function npcOccupiedFactTargets(
+  projections: ReturnType<ChatSession['getCharacterProjections']>,
+  context: NpcMaintenanceProposalContext,
+): readonly NpcApplyOccupiedFactTarget[] {
+  const allowed = new Set(context.allowedCharacterIds);
+  const targets: NpcApplyOccupiedFactTarget[] = [];
+  for (const projection of projections) {
+    if (!allowed.has(projection.characterId)) continue;
+    for (const field of Object.keys(projection.profile)) {
+      targets.push({ characterId: projection.characterId, scope: 'profile', field });
+    }
+    for (const field of Object.keys(projection.facts)) {
+      targets.push({ characterId: projection.characterId, scope: 'fact', field });
+    }
+  }
+  return Object.freeze(targets.sort((left, right) => (
+    `${left.characterId}\0${left.scope}\0${left.field}`
+      .localeCompare(`${right.characterId}\0${right.scope}\0${right.field}`)
+  )).map((target) => Object.freeze(target)));
+}
+
+function npcMaintenanceReviewItems(
+  pending: import('./maintenance-job-manager.ts').MaintenancePendingProposalRecord,
+  session: ChatSession,
+): readonly PublicMaintenanceProposalReviewItem[] | undefined {
+  if (pending.taskKind !== 'npc_state' || !('allowedCharacterIds' in pending.context)) return undefined;
+  try {
+    const context = pending.context as NpcMaintenanceProposalContext;
+    const proposal = normalizeNpcMaintenanceProposal(pending.proposal.payload, context);
+    const projections = session.getCharacterProjections();
+    const characterNames = new Map(projections.map((projection) => [
+      projection.characterId,
+      projection.identity.name,
+    ]));
+    const policy = evaluateNpcApplyPolicy(proposal, {
+      remainingAutoWrites: NPC_APPLY_POLICY_LIMITS.maxAutoWritesPerProposal,
+      occupiedFactTargets: npcOccupiedFactTargets(projections, context),
+      occupiedRelationshipTargets: npcOccupiedRelationshipTargets(
+        projections, context.allowedCharacterIds,
+      ),
+    });
+    const label = (characterId: string): string => (
+      `${characterNames.get(characterId) ?? '未命名人物'}（${characterId}）`
+    );
+    const candidates = proposal.entries.map((entry, entryIndex) => {
+      const decision = policy.entryDecisions[entryIndex]!;
+      if (entry.kind === 'unresolved') {
+        return {
+          kind: 'unresolved' as const,
+          title: '存在尚未解析到稳定人物的提及',
+          detail: `原因：${entry.reasonCode}；提及摘要：${entry.mentionDigest}`,
+          write: false,
+          decision: decision.verdict,
+          reasonCodes: [...decision.reasonCodes],
+          sourceRefs: [...entry.sourceRefs],
+        };
+      }
+      if (entry.kind === 'identity_resolution') {
+        return {
+          kind: 'identity' as const,
+          title: `为 ${label(entry.characterId)} 添加别名“${entry.alias}”`,
+          detail: `识别键：${entry.mentionKey}；置信度：${entry.confidence}；预期人物版本：${entry.expectedEntityVersion}`,
+          write: true,
+          decision: decision.verdict,
+          reasonCodes: [...decision.reasonCodes],
+          sourceRefs: [...entry.sourceRefs],
+        };
+      }
+      if (entry.kind === 'relationship') {
+        return {
+          kind: 'relationship' as const,
+          title: `${label(entry.characterId)} → ${label(entry.toCharacterId)}：${entry.relationType}`,
+          detail: `视角：${entry.perspective}；状态：${entry.status}；置信度：${entry.confidence}；证据轮次：R${entry.effectiveRound}；预期人物版本：${entry.expectedEntityVersion}`,
+          write: true,
+          decision: decision.verdict,
+          reasonCodes: [...decision.reasonCodes],
+          sourceRefs: [...entry.sourceRefs],
+        };
+      }
+      const serialized = JSON.stringify(entry.value);
+      return {
+        kind: 'fact' as const,
+        title: `${label(entry.characterId)}：${entry.kind}.${entry.field}`,
+        detail: `拟写值：${serialized ?? 'null'}；状态：${entry.status}；置信度：${entry.confidence}；证据轮次：R${entry.effectiveRound}；预期人物版本：${entry.expectedEntityVersion}`,
+        write: true,
+        decision: decision.verdict,
+        reasonCodes: [...decision.reasonCodes],
+        sourceRefs: [...entry.sourceRefs],
+      };
+    });
+    const complete = npcReviewProposalHasCompleteWriteReview(candidates);
+    return Object.freeze(candidates.map((candidate): PublicMaintenanceProposalReviewItem => Object.freeze({
+      kind: candidate.kind,
+      title: boundedNpcReviewText(
+        candidate.title, PUBLIC_MAINTENANCE_REVIEW_TITLE_MAX_CODE_POINTS,
+      ),
+      detail: boundedNpcReviewText(
+        candidate.detail, PUBLIC_MAINTENANCE_REVIEW_DETAIL_MAX_CODE_POINTS,
+      ),
+      applicable: candidate.write && complete,
+      decision: candidate.decision,
+      reasonCodes: Object.freeze([...new Set([
+        ...candidate.reasonCodes,
+        ...(candidate.write && !complete ? ['proposal-review-incomplete'] : []),
+      ])]),
+      sourceRefs: Object.freeze([...candidate.sourceRefs]),
+    })));
+  } catch {
+    // A proposal that no longer passes the current schema must never become a
+    // local blind-approval surface. The caller omits reviewItems and the UI blocks apply.
+    return undefined;
+  }
+}
+
+function maintenanceProposalReviewItems(
+  pending: import('./maintenance-job-manager.ts').MaintenancePendingProposalRecord,
+  session?: ChatSession,
+): readonly PublicMaintenanceProposalReviewItem[] | undefined {
+  if (pending.status !== 'pending') return undefined;
+  const typedReview = typedMaintenanceProposalReviewItems(pending);
+  if (typedReview) return typedReview;
+  if (!session || !shouldExposeDynamicNpcReviewItems({
+    mutationAllowed: true,
+    sessionLoaded: true,
+    taskKind: pending.taskKind,
+    status: pending.status,
+  })) return undefined;
+  return npcMaintenanceReviewItems(pending, session);
+}
+
+async function applyGuardedNpcProposal(job: import('./maintenance-types.ts').PublicMaintenanceJob): Promise<void> {
+  if (job.taskKind !== 'npc_state'
+    || !maintenanceGuardedAutoAllowsNpcSession(MAINTENANCE_APPLY_RUNTIME, job.sessionId)
+    || !maintenanceTaskExecutionAllowed(job.sessionId, 'npc_state')) return;
+  const pending = maintenanceJobs.getProposalForJob(job.runId);
+  if (!pending || pending.status !== 'pending' || pending.taskKind !== 'npc_state'
+    || !('allowedCharacterIds' in pending.context)) return;
+  const session = await loadSessionById(pending.sessionId);
+  if (!session || !maintenanceTaskExecutionAllowed(pending.sessionId, 'npc_state')) return;
+  const context = pending.context as NpcMaintenanceProposalContext;
+  const proposal = normalizeNpcMaintenanceProposal(pending.proposal.payload, context);
+  const projections = session.getCharacterProjections();
+  const occupiedFactTargets = npcOccupiedFactTargets(projections, context);
+  const occupiedRelationshipTargets = npcOccupiedRelationshipTargets(
+    projections, context.allowedCharacterIds,
+  );
+  const decision = evaluateNpcApplyPolicy(proposal, {
+    remainingAutoWrites: NPC_APPLY_POLICY_LIMITS.maxAutoWritesPerProposal,
+    occupiedFactTargets,
+    occupiedRelationshipTargets,
+  });
+  // approve() is synchronous. This final check therefore closes the last
+  // stop/write race without leaving an await between authorization and CAS.
+  if (decision.verdict !== 'auto'
+    || !maintenanceTaskExecutionAllowed(pending.sessionId, 'npc_state')) return;
+  maintenanceProposalControlFor(pending.sessionId, session).approve(
+    pending.proposalId,
+    pending.revision,
+    'guarded-auto-approved',
+    Object.freeze({
+      version: 'npc-guarded-auto-audit-v1' as const,
+      policyVersion: decision.policyVersion,
+      proposalDigest: decision.proposalDigest,
+      reasonCodes: Object.freeze([...decision.reasonCodes]),
+      approvedAutoWrites: decision.approvedAutoWrites,
+      occupiedTargetsDigest: sha256Digest(JSON.stringify({ occupiedFactTargets, occupiedRelationshipTargets })),
+      entryDecisions: Object.freeze(decision.entryDecisions.map((entry) => Object.freeze({
+        entryIndex: entry.entryIndex,
+        verdict: entry.verdict,
+        reasonCodes: Object.freeze([...entry.reasonCodes]),
+      }))),
+    }),
+  );
 }
 
 const WORLDBOOK_REPAIR_CONTROL_PLANE = WORLDBOOK_REPAIR_CONTROL
@@ -1691,6 +4564,50 @@ const WORLDBOOK_REPAIR_CONTROL_PLANE = WORLDBOOK_REPAIR_CONTROL
       },
     })
   : null;
+
+/**
+ * 世界书修正：只把模型产出的提案**登记**到控制面（pending 状态），
+ * **绝不自动 approve / apply** —— 落地必须由本地操作者在审阅弹窗里确认（这正是本功能的设计前提）。
+ * `JG_WORLDBOOK_REPAIR` forward 开关关闭时登记会被控制面拒绝，属预期行为。
+ */
+async function registerWorldbookRepairProposal(
+  input: Parameters<NonNullable<MaintenanceHarnessServiceOptions['onWorldbookRepairProposal']>>[0],
+): Promise<import('./maintenance-harness-service.ts').WorldbookSkillProposalRegistration | void> {
+  if (Object.hasOwn(input, 'worldbookSkillProof')) {
+    if (input.job.taskKind !== 'worldbook_repair' || !WORLDBOOK_REPAIR_CONTROL_PLANE || !WORLDBOOK_REPAIR_CONTROL
+      || !input.worldbookSkillProof || !isWorldbookRepairProposalContext(input.context)
+      || typeof input.assertCurrent !== 'function') throw new Error('maintenance-worldbook-skill-registration-required');
+    input.assertCurrent();
+    const created = await WORLDBOOK_REPAIR_CONTROL_PLANE.create({
+      operationId: `worldbook-repair:${input.job.runId}`, proposal: input.proposal.payload,
+      skillProof: input.worldbookSkillProof, context: input.context, assertCurrent: input.assertCurrent,
+    });
+    input.assertCurrent();
+    const source = WORLDBOOK_REPAIR_CONTROL.readSkillProvenance(created.proposalId);
+    if (!source || source.record.proposalId !== created.proposalId
+      || source.record.operationId !== `worldbook-repair:${input.job.runId}`
+      || source.record.sessionId !== input.job.sessionId || source.record.proposalDigest !== created.proposalDigest
+      || source.record.proof.proofDigest !== input.worldbookSkillProof.proofDigest
+      || source.proposal.status !== 'pending' || source.proposal.revision !== created.revision) {
+      throw new Error('maintenance-worldbook-skill-registration-invalid');
+    }
+    return Object.freeze({ proposalId: created.proposalId, operationId: source.record.operationId,
+      sessionId: source.record.sessionId, proposalDigest: source.record.proof.proposalDigest,
+      proofDigest: source.record.proof.proofDigest });
+  }
+  if (input.job.taskKind !== 'worldbook_repair' || !WORLDBOOK_REPAIR_CONTROL_PLANE) return;
+  if (!isWorldbookRepairProposalContext(input.context)) return;
+  try {
+    // operationId 绑定 runId ⇒ 同一次模型产出重放时控制面返回原结果，不产生重复提案。
+    await WORLDBOOK_REPAIR_CONTROL_PLANE.create({
+      operationId: `worldbook-repair:${input.job.runId}`,
+      proposal: input.proposal.payload,
+    });
+  } catch {
+    // 固定文案：提案/模型/用户内容一律不进日志。forward 开关（JG_WORLDBOOK_REPAIR）关闭时也走这里。
+    console.warn('[worldbook-repair] proposal registration failed detail=redacted');
+  }
+}
 
 /** 插件注册表与其他用户数据共用 JG_USER_DATA_DIR 隔离边界。 */
 const pluginRegistry = new PluginRegistry(PLUGINS_DIR);
@@ -1723,9 +4640,67 @@ const dshHost = new DshPluginHost(async (name) => {
 } : {});
 /**
  * P7-05：失效通知 hub。eventId 是本进程内单调序号；serverInstanceId 随进程重启变化，
- * 客户端据此触发全量 refetch（/api/capabilities 已声明 features.events.replay=false）。
+ * 客户端据此触发全量 refetch；同代际仅提供有界连续 replay，不作为任务历史。
  */
 const eventHub = new InvalidationHub({ serverInstanceId: SERVER_INSTANCE_ID });
+const DIRECTOR_CREATIVE_ENABLED = process.env.JG_DIRECTOR_CREATIVE_ENABLED === '1';
+if (process.env.JG_DIRECTOR_CREATIVE_ENABLED !== undefined && !['0', '1'].includes(process.env.JG_DIRECTOR_CREATIVE_ENABLED))
+    throw new Error('director-config-invalid');
+const DIRECTOR_NSFW_ENABLED = process.env.JG_DIRECTOR_NSFW_ENABLED === '1';
+if (process.env.JG_DIRECTOR_NSFW_ENABLED !== undefined && !['0', '1'].includes(process.env.JG_DIRECTOR_NSFW_ENABLED))
+    throw new Error('director-config-invalid');
+const DIRECTOR_NSFW_PROVIDER_ID = process.env.JG_DIRECTOR_NSFW_PROVIDER_ID?.trim();
+const DIRECTOR_NSFW_MODEL = process.env.JG_DIRECTOR_NSFW_MODEL?.trim();
+const DIRECTOR_NSFW_OBSERVER_MODEL = process.env.JG_DIRECTOR_NSFW_OBSERVER_MODEL?.trim();
+if (DIRECTOR_NSFW_ENABLED && (!DIRECTOR_NSFW_PROVIDER_ID || !DIRECTOR_NSFW_MODEL || DIRECTOR_NSFW_OBSERVER_MODEL !== 'deepseek-flash'))
+    throw new Error('director-nsfw-config-invalid');
+function directorNsfwSafetyDigest(owner: string): string | null {
+    const session = sessions.get(owner);
+    if (!DIRECTOR_NSFW_ENABLED || !session || session.getContentMode() !== 'nsfw' || !sessionDeletionAdmissionOpen(owner) || shuttingDown) return null;
+    try {
+        const dbPath = resolveSessionDatabase(DATA_DIR, `${owner}.db`);
+        if (!dbPath) return null;
+        const manifest = session.getWorldbookSourceManifest(true);
+        const safety = NSFW_SCENE_SAFETY_CONTROL.resolveSnapshot({ dbPath, sessionId: owner, manifest });
+        if (!safety) return null;
+        return `sha256:${createHash('sha256').update(JSON.stringify({ safety, manifest })).digest('hex')}`;
+    } catch { return null; }
+}
+function directorSourceAllowed(owner: string): boolean {
+    if (!sessionDeletionAdmissionOpen(owner) || shuttingDown) return false;
+    const session = sessions.get(owner);
+    return !session || session.getContentMode() === 'nsf' || directorNsfwSafetyDigest(owner) !== null;
+}
+function directorPersistedNsfw(owner: string): boolean {
+    const dbPath = resolveSessionDatabase(DATA_DIR, `${owner}.db`);
+    if (!dbPath || !existsSync(dbPath)) return false;
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+        const row = db.prepare('SELECT config FROM memory_meta WHERE id=1').get();
+        const config = JSON.parse(String(row?.config));
+        if (config.mode !== 'nsf' && config.mode !== 'nsfw') throw new Error('director-source-partition-denied');
+        return config.mode === 'nsfw';
+    } finally { db.close(); }
+}
+const DIRECTOR_CREATIVE_STORE = DIRECTOR_CREATIVE_ENABLED || existsSync(resolve(DATA_DIR, DIRECTOR_CREATIVE_DB_FILE))
+    ? new DirectorCreativeStore({ dataDir: DATA_DIR, allowed: directorSourceAllowed }) : null;
+DIRECTOR_CREATIVE_STORE?.recoverInterrupted();
+const DIRECTOR_CREATIVE_SERVICE = DIRECTOR_CREATIVE_STORE ? new DirectorCreativeService({
+    store: DIRECTOR_CREATIVE_STORE, enabled: () => DIRECTOR_CREATIVE_ENABLED,
+    allowed: directorSourceAllowed,
+    resolveSource: owner => resolveSessionDatabase(DATA_DIR, `${owner}.db`),
+    nsfwSafetyDigest: directorNsfwSafetyDigest,
+    modelBinding: partition => {
+        if (partition === 'nsf') return agentModelBinding();
+        if (!DIRECTOR_NSFW_ENABLED || !DIRECTOR_NSFW_PROVIDER_ID || !DIRECTOR_NSFW_MODEL) throw new Error('director-nsfw-config-invalid');
+        const descriptor = providerRegistry.describe(DIRECTOR_NSFW_PROVIDER_ID);
+        if (!descriptor?.configured) throw new Error('director-nsfw-provider-unavailable');
+        return agentModelBinding({ providerId: DIRECTOR_NSFW_PROVIDER_ID, model: DIRECTOR_NSFW_MODEL });
+    },
+}) : null;
+let agentLoopTaskInvalidationLastWarnAt = 0;
+// The durable outbox is a notification transport, never another task executor.
+// Polling also observes committed writes by other workers using the same Store.
 
 /** TurnJobService 生命周期 → 白名单失效事件（queued/started/finished|failed|cancelled）。 */
 const TURN_JOB_PHASE_EVENT: Record<'queued' | 'running' | 'settled', (job: { status: string }) => EventType> = {
@@ -1737,19 +4712,460 @@ const TURN_JOB_PHASE_EVENT: Record<'queued' | 'running' | 'settled', (job: { sta
 };
 
 const MAINTENANCE_RUNTIME = parseMaintenanceRuntimeConfig();
-const maintenanceJobs = new MaintenanceJobManager({ dataDir: DATA_DIR });
+const maintenanceJobs = new MaintenanceJobManager({ dataDir: DATA_DIR, onSkillProvenanceFailure: () => {
+  AGENT_CLOSURE_DEGRADED = true;
+  console.warn('[maintenance-skill] source persistence failed detail=redacted');
+} });
+const AGENT_LOOP_SUMMARY_APPLY_OUTCOME_READER = new AgentLoopSummaryApplyOutcomeReader({
+  store: AGENT_LOOP_PROJECTION_STORE, manager: maintenanceJobs, allowed: sessionDeletionAdmissionOpen,
+  resolveDatabase: (sessionId) => {
+    if (!sessionDeletionAdmissionOpen(sessionId)) return null;
+    return resolveSessionDatabase(DATA_DIR, `${sessionId}.db`);
+  },
+});
+agentLoopTaskInvalidationDrainer = createAgentLoopTaskInvalidationDrainer({
+    store: AGENT_LOOP_PROJECTION_STORE,
+    summaryApply: AGENT_LOOP_SUMMARY_APPLY_OUTCOME_READER,
+    publish: (input, evidence) => {
+        publishAgentLoopTaskInvalidation(eventHub, input, evidence);
+    },
+    onError: () => {
+        const now = Date.now();
+        if (now - agentLoopTaskInvalidationLastWarnAt < 60_000) return;
+        agentLoopTaskInvalidationLastWarnAt = now;
+        console.warn('[AgentLoop] task 失效通知未投递，原 outbox 保留待重试');
+    },
+});
+const MAINTENANCE_MEMORY_SKILL_SCHEDULER = AGENT_CLOSURE_STORE ? createMaintenanceMemorySkillProposalScheduler({
+  manager: maintenanceJobs, closure: AGENT_CLOSURE_STORE, allowed: sessionDeletionAdmissionOpen,
+  onFailure: () => { AGENT_CLOSURE_DEGRADED = true; },
+}) : null;
+const MAINTENANCE_MEMORY_WRITE_SCHEDULER = AGENT_CLOSURE_STORE ? createMaintenanceMemoryWriteScheduler({
+  manager: maintenanceJobs, closure: AGENT_CLOSURE_STORE, allowed: sessionDeletionAdmissionOpen,
+  open: (sessionId) => {
+    if (!sessionDeletionAdmissionOpen(sessionId)) return null;
+    const path = resolveSessionDatabase(DATA_DIR, `${sessionId}.db`);
+    return path ? openMaintenanceMemoryWriteRecovery(path, sessionId) : null;
+  },
+  onFailure: () => { AGENT_CLOSURE_DEGRADED = true; },
+}) : null;
+const MAINTENANCE_SUMMARY_WRITE_SCHEDULER = AGENT_CLOSURE_STORE ? createMaintenanceSummaryWriteScheduler({
+  manager: maintenanceJobs, closure: AGENT_CLOSURE_STORE, allowed: sessionDeletionAdmissionOpen,
+  open: (sessionId) => {
+    if (!sessionDeletionAdmissionOpen(sessionId)) return null;
+    const path = resolveSessionDatabase(DATA_DIR, `${sessionId}.db`);
+    return path ? openMaintenanceSummaryWriteRecovery(path, sessionId) : null;
+  },
+  onFailure: () => { AGENT_CLOSURE_DEGRADED = true; },
+}) : null;
+const MAINTENANCE_MEMORY_EVIDENCE_SCHEDULER = AGENT_EVIDENCE_LEDGER
+  ? createMaintenanceMemoryEvidenceScheduler({
+    manager: maintenanceJobs, ledger: AGENT_EVIDENCE_LEDGER, allowed: sessionDeletionAdmissionOpen,
+    open: (sessionId) => {
+      if (!sessionDeletionAdmissionOpen(sessionId)) return null;
+      const path = resolveSessionDatabase(DATA_DIR, `${sessionId}.db`);
+      return path ? openMaintenanceMemoryEvidenceSource(path, sessionId) : null;
+    },
+    onFailure: () => console.warn('[AgentEvidence] MEMORY_RECEIPT_DELIVERY_PENDING（原回执保留，等待下次触发）'),
+  }) : null;
+const MAINTENANCE_SUMMARY_EVIDENCE_SCHEDULER = AGENT_EVIDENCE_LEDGER
+  ? createMaintenanceSummaryEvidenceScheduler({
+    manager: maintenanceJobs, ledger: AGENT_EVIDENCE_LEDGER, allowed: sessionDeletionAdmissionOpen,
+    open: (sessionId) => {
+      if (!sessionDeletionAdmissionOpen(sessionId)) return null;
+      const path = resolveSessionDatabase(DATA_DIR, `${sessionId}.db`);
+      return path ? openMaintenanceSummaryEvidenceSource(path, sessionId) : null;
+    },
+    onFailure: () => console.warn('[AgentEvidence] SUMMARY_RECEIPT_DELIVERY_PENDING（原回执保留，等待下次触发）'),
+  }) : null;
+let MAINTENANCE_PROPOSAL_REJECTION_EVIDENCE_SCHEDULER = AGENT_EVIDENCE_LEDGER
+  ? createMaintenanceProposalRejectionEvidenceScheduler({
+    manager: maintenanceJobs, ledger: AGENT_EVIDENCE_LEDGER, allowed: sessionDeletionAdmissionOpen,
+    onFailure: () => console.warn('[AgentEvidence] PROPOSAL_REJECTION_DELIVERY_PENDING（原拒绝回执保留，等待下次触发）'),
+  }) : null;
+let MAINTENANCE_PROPOSAL_APPROVAL_EVIDENCE_SCHEDULER = AGENT_EVIDENCE_LEDGER
+  ? createMaintenanceProposalApprovalEvidenceScheduler({
+    manager: maintenanceJobs, ledger: AGENT_EVIDENCE_LEDGER, allowed: sessionDeletionAdmissionOpen,
+    onFailure: () => console.warn('[AgentEvidence] PROPOSAL_APPROVAL_DELIVERY_PENDING（原审批证据保留，等待下次触发）'),
+  }) : null;
+let REGENERATION_EVIDENCE_SCHEDULER = AGENT_EVIDENCE_LEDGER
+  ? createRegenerationEvidenceScheduler({
+    ledger: AGENT_EVIDENCE_LEDGER, allowed: sessionDeletionAdmissionOpen,
+    open: (sessionId) => {
+      if (!sessionDeletionAdmissionOpen(sessionId)) return null;
+      const path = resolveSessionDatabase(DATA_DIR, `${sessionId}.db`);
+      return path ? openRegenerationEvidenceSource(path, sessionId) : null;
+    },
+    onFailure: () => console.warn('[AgentEvidence] REGENERATION_DELIVERY_PENDING（原重生成事件保留，等待下次触发）'),
+  }) : null;
+/** Open only after validating the original, session-qualified decision. */
+function scheduleMaintenanceProposalApprovalEvidence(rawSessionId: string, proposalId: string): void {
+  if (shuttingDown || !sessionDeletionAdmissionOpen(rawSessionId)) return;
+  if (!MAINTENANCE_PROPOSAL_APPROVAL_EVIDENCE_SCHEDULER) {
+    if (!AGENT_EVIDENCE_LEDGER) {
+      const original = maintenanceJobs.readApprovedProposalEvidence(proposalId);
+      if (!original || original.proposal.sessionId !== rawSessionId
+          || !maintenanceProposalApprovalEvidenceRecord(original.proposal, original.job)
+          || !sessionDeletionAdmissionOpen(rawSessionId)) return;
+      AGENT_EVIDENCE_LEDGER = new AgentEvidenceLedger({ dataDir: DATA_DIR,
+        isSessionDeleted: (id) => SESSION_DELETION_JOURNAL.isBlocked(id) });
+    }
+    MAINTENANCE_PROPOSAL_APPROVAL_EVIDENCE_SCHEDULER = createMaintenanceProposalApprovalEvidenceScheduler({
+      manager: maintenanceJobs, ledger: AGENT_EVIDENCE_LEDGER, allowed: sessionDeletionAdmissionOpen,
+      onFailure: () => console.warn('[AgentEvidence] PROPOSAL_APPROVAL_DELIVERY_PENDING'),
+    });
+  }
+  MAINTENANCE_PROPOSAL_APPROVAL_EVIDENCE_SCHEDULER.schedule(rawSessionId);
+}
+function scheduleMaintenanceProposalRejectionEvidence(rawSessionId: string, proposalId: string): void {
+  if (shuttingDown || !sessionDeletionAdmissionOpen(rawSessionId)) return;
+  if (!MAINTENANCE_PROPOSAL_REJECTION_EVIDENCE_SCHEDULER) {
+    if (!AGENT_EVIDENCE_LEDGER) {
+      const original = maintenanceJobs.readRejectedProposalEvidence(proposalId);
+      if (!original || original.proposal.sessionId !== rawSessionId) return;
+      maintenanceProposalRejectionEvidenceRecord(original.proposal, original.job);
+      if (!sessionDeletionAdmissionOpen(rawSessionId)) return;
+      AGENT_EVIDENCE_LEDGER = new AgentEvidenceLedger({ dataDir: DATA_DIR,
+        isSessionDeleted: (id) => SESSION_DELETION_JOURNAL.isBlocked(id) });
+    }
+    MAINTENANCE_PROPOSAL_REJECTION_EVIDENCE_SCHEDULER = createMaintenanceProposalRejectionEvidenceScheduler({
+      manager: maintenanceJobs, ledger: AGENT_EVIDENCE_LEDGER, allowed: sessionDeletionAdmissionOpen,
+      onFailure: () => console.warn('[AgentEvidence] PROPOSAL_REJECTION_DELIVERY_PENDING'),
+    });
+  }
+  MAINTENANCE_PROPOSAL_REJECTION_EVIDENCE_SCHEDULER.schedule(rawSessionId);
+}
+function scheduleRegenerationEvidence(rawSessionId: string): void {
+  if (shuttingDown || !sessionDeletionAdmissionOpen(rawSessionId)) return;
+  if (!REGENERATION_EVIDENCE_SCHEDULER) {
+    if (!AGENT_EVIDENCE_LEDGER) {
+      const path = resolveSessionDatabase(DATA_DIR, `${rawSessionId}.db`);
+      if (!path || !hasRetainedRegenerationEvidence(path, rawSessionId) || !sessionDeletionAdmissionOpen(rawSessionId)) return;
+      AGENT_EVIDENCE_LEDGER = new AgentEvidenceLedger({ dataDir: DATA_DIR,
+        isSessionDeleted: (id) => SESSION_DELETION_JOURNAL.isBlocked(id) });
+    }
+    REGENERATION_EVIDENCE_SCHEDULER = createRegenerationEvidenceScheduler({
+      ledger: AGENT_EVIDENCE_LEDGER, allowed: sessionDeletionAdmissionOpen,
+      open: (id) => {
+        if (!sessionDeletionAdmissionOpen(id)) return null;
+        const path = resolveSessionDatabase(DATA_DIR, `${id}.db`);
+        return path ? openRegenerationEvidenceSource(path, id) : null;
+      },
+      onFailure: () => console.warn('[AgentEvidence] REGENERATION_DELIVERY_PENDING'),
+    });
+  }
+  REGENERATION_EVIDENCE_SCHEDULER.schedule(rawSessionId);
+}
+/** Recover only original user signals; never open a Session or dispatch a Provider. */
+function recoverEffectWatchForSession(rawSessionId: string): void {
+  if (shuttingDown || !AGENT_CLOSURE_STORE || !AGENT_CLOSURE_RECORDER || !sessionDeletionAdmissionOpen(rawSessionId)) return;
+  const path = resolveSessionDatabase(DATA_DIR, `${rawSessionId}.db`);
+  if (!path || !sessionDeletionAdmissionOpen(rawSessionId)) return;
+  recoverSessionEffectWatch({ path, rawSessionId,
+    allowed: id => !shuttingDown && sessionDeletionAdmissionOpen(id),
+    closure: AGENT_CLOSURE_STORE, recorder: AGENT_CLOSURE_RECORDER,
+    onObserved: id => scheduleReportedEffectEvidence(id) });
+}
+function wakeEffectWatchRecovery(rawSessionId: string): void {
+  if (shuttingDown || !sessionDeletionAdmissionOpen(rawSessionId)) return;
+  queueMicrotask(() => {
+    try { recoverEffectWatchForSession(rawSessionId); }
+    catch { console.warn('[AgentClosure] EFFECT_WATCH_RECOVERY_PENDING'); }
+  });
+}
+let STYLE_COMPILE_ADOPTION_EVIDENCE_SCHEDULER = AGENT_EVIDENCE_LEDGER
+  ? createStyleCompileAdoptionEvidenceScheduler({
+    ledger: AGENT_EVIDENCE_LEDGER, allowed: sessionDeletionAdmissionOpen,
+    resolvePath: (sessionId) => resolveSessionDatabase(DATA_DIR, `${sessionId}.db`),
+    onFailure: () => console.warn('[AgentEvidence] STYLE_ADOPTION_DELIVERY_PENDING'),
+  }) : null;
+let VARIABLE_APPLY_EVIDENCE_SCHEDULER = AGENT_EVIDENCE_LEDGER
+  ? createVariableApplyEvidenceScheduler({
+    ledger: AGENT_EVIDENCE_LEDGER, allowed: sessionDeletionAdmissionOpen,
+    resolvePath: (sessionId) => resolveSessionDatabase(DATA_DIR, `${sessionId}.db`),
+    onFailure: () => console.warn('[AgentEvidence] VARIABLE_APPLY_DELIVERY_PENDING'),
+  }) : null;
+/** A first committed adoption may appear after startup with recording disabled and no Ledger yet. */
+function scheduleStyleCompileAdoptionEvidence(rawSessionId: string): void {
+  if (shuttingDown || !sessionDeletionAdmissionOpen(rawSessionId)) return;
+  if (!STYLE_COMPILE_ADOPTION_EVIDENCE_SCHEDULER) {
+    if (!AGENT_EVIDENCE_LEDGER) {
+      const path = resolveSessionDatabase(DATA_DIR, `${rawSessionId}.db`);
+      if (!path || !hasRetainedStyleCompileAdoptionEvidence(path, rawSessionId)
+          || !sessionDeletionAdmissionOpen(rawSessionId)) return;
+      AGENT_EVIDENCE_LEDGER = new AgentEvidenceLedger({ dataDir: DATA_DIR,
+        isSessionDeleted: (id) => SESSION_DELETION_JOURNAL.isBlocked(id) });
+    }
+    STYLE_COMPILE_ADOPTION_EVIDENCE_SCHEDULER = createStyleCompileAdoptionEvidenceScheduler({
+      ledger: AGENT_EVIDENCE_LEDGER, allowed: sessionDeletionAdmissionOpen,
+      resolvePath: (id) => resolveSessionDatabase(DATA_DIR, `${id}.db`),
+      onFailure: () => console.warn('[AgentEvidence] STYLE_ADOPTION_DELIVERY_PENDING'),
+    });
+  }
+  STYLE_COMPILE_ADOPTION_EVIDENCE_SCHEDULER.schedule(rawSessionId);
+}
+function scheduleVariableApplyEvidence(rawSessionId: string): void {
+  if (shuttingDown || !sessionDeletionAdmissionOpen(rawSessionId)) return;
+  if (!VARIABLE_APPLY_EVIDENCE_SCHEDULER) {
+    if (!AGENT_EVIDENCE_LEDGER) {
+      const path = resolveSessionDatabase(DATA_DIR, `${rawSessionId}.db`);
+      if (!path || !hasRetainedVariableApplyEvidence(path, rawSessionId)
+          || !sessionDeletionAdmissionOpen(rawSessionId)) return;
+      AGENT_EVIDENCE_LEDGER = new AgentEvidenceLedger({ dataDir: DATA_DIR,
+        isSessionDeleted: (id) => SESSION_DELETION_JOURNAL.isBlocked(id) });
+    }
+    VARIABLE_APPLY_EVIDENCE_SCHEDULER = createVariableApplyEvidenceScheduler({
+      ledger: AGENT_EVIDENCE_LEDGER, allowed: sessionDeletionAdmissionOpen,
+      resolvePath: (id) => resolveSessionDatabase(DATA_DIR, `${id}.db`),
+      onFailure: () => console.warn('[AgentEvidence] VARIABLE_APPLY_DELIVERY_PENDING'),
+    });
+  }
+  VARIABLE_APPLY_EVIDENCE_SCHEDULER.schedule(rawSessionId);
+}
+let VARIABLE_INVALIDATION_EVIDENCE_SCHEDULER = AGENT_EVIDENCE_LEDGER
+  ? createVariableInvalidationEvidenceScheduler({ ledger: AGENT_EVIDENCE_LEDGER, allowed: sessionDeletionAdmissionOpen,
+    resolvePath: (id) => resolveSessionDatabase(DATA_DIR, `${id}.db`),
+    onFailure: () => console.warn('[AgentEvidence] VARIABLE_INVALIDATION_DELIVERY_PENDING') }) : null;
+function scheduleVariableInvalidationEvidence(rawSessionId: string): void {
+  if (shuttingDown || !sessionDeletionAdmissionOpen(rawSessionId)) return;
+  if (!VARIABLE_INVALIDATION_EVIDENCE_SCHEDULER) {
+    if (!AGENT_EVIDENCE_LEDGER) {
+      const path = resolveSessionDatabase(DATA_DIR, `${rawSessionId}.db`);
+      if (!path || !hasRetainedVariableInvalidationEvidence(path, rawSessionId) || !sessionDeletionAdmissionOpen(rawSessionId)) return;
+      AGENT_EVIDENCE_LEDGER = new AgentEvidenceLedger({ dataDir: DATA_DIR,
+        isSessionDeleted: (id) => SESSION_DELETION_JOURNAL.isBlocked(id) });
+    }
+    VARIABLE_INVALIDATION_EVIDENCE_SCHEDULER = createVariableInvalidationEvidenceScheduler({ ledger: AGENT_EVIDENCE_LEDGER,
+      allowed: sessionDeletionAdmissionOpen, resolvePath: (id) => resolveSessionDatabase(DATA_DIR, `${id}.db`),
+      onFailure: () => console.warn('[AgentEvidence] VARIABLE_INVALIDATION_DELIVERY_PENDING') });
+  }
+  VARIABLE_INVALIDATION_EVIDENCE_SCHEDULER.schedule(rawSessionId);
+}
+let REPORTED_EFFECT_EVIDENCE_SCHEDULER = AGENT_EVIDENCE_LEDGER && AGENT_CLOSURE_STORE
+  ? createReportedEffectEvidenceScheduler({ dataDir: DATA_DIR, ledger: AGENT_EVIDENCE_LEDGER,
+    allowed: sessionDeletionAdmissionOpen, onFailure: () => console.warn('[AgentEvidence] REPORTED_EFFECT_DELIVERY_PENDING') }) : null;
+function scheduleReportedEffectEvidence(rawSessionId: string): void {
+  if (shuttingDown || !sessionDeletionAdmissionOpen(rawSessionId) || !AGENT_CLOSURE_STORE) return;
+  if (!REPORTED_EFFECT_EVIDENCE_SCHEDULER) {
+    if (!AGENT_EVIDENCE_LEDGER) {
+      if (!hasRetainedReportedEffects(DATA_DIR, (id) => SESSION_DELETION_JOURNAL.isBlocked(id))
+          || !sessionDeletionAdmissionOpen(rawSessionId)) return;
+      AGENT_EVIDENCE_LEDGER = new AgentEvidenceLedger({ dataDir: DATA_DIR,
+        isSessionDeleted: (id) => SESSION_DELETION_JOURNAL.isBlocked(id) });
+    }
+    REPORTED_EFFECT_EVIDENCE_SCHEDULER = createReportedEffectEvidenceScheduler({ dataDir: DATA_DIR,
+      ledger: AGENT_EVIDENCE_LEDGER, allowed: sessionDeletionAdmissionOpen,
+      onFailure: () => console.warn('[AgentEvidence] REPORTED_EFFECT_DELIVERY_PENDING') });
+  }
+  REPORTED_EFFECT_EVIDENCE_SCHEDULER.schedule(rawSessionId);
+}
+let BRANCH_MODIFIED_EVIDENCE_SCHEDULER = AGENT_EVIDENCE_LEDGER
+  ? createBranchModifiedEvidenceScheduler({ ledger: AGENT_EVIDENCE_LEDGER, allowed: sessionDeletionAdmissionOpen,
+    resolvePath: (id) => resolveSessionDatabase(DATA_DIR, `${id}.db`),
+    onFailure: () => console.warn('[AgentEvidence] BRANCH_MODIFIED_DELIVERY_PENDING') }) : null;
+function scheduleBranchModifiedEvidence(rawSessionId: string): void {
+  if (shuttingDown || !sessionDeletionAdmissionOpen(rawSessionId)) return;
+  if (!BRANCH_MODIFIED_EVIDENCE_SCHEDULER) {
+    if (!AGENT_EVIDENCE_LEDGER) {
+      const path = resolveSessionDatabase(DATA_DIR, `${rawSessionId}.db`);
+      if (!path || !hasRetainedBranchModifiedEvidence(path, rawSessionId) || !sessionDeletionAdmissionOpen(rawSessionId)) return;
+      AGENT_EVIDENCE_LEDGER = new AgentEvidenceLedger({ dataDir: DATA_DIR,
+        isSessionDeleted: (id) => SESSION_DELETION_JOURNAL.isBlocked(id) });
+    }
+    BRANCH_MODIFIED_EVIDENCE_SCHEDULER = createBranchModifiedEvidenceScheduler({ ledger: AGENT_EVIDENCE_LEDGER,
+      allowed: sessionDeletionAdmissionOpen, resolvePath: (id) => resolveSessionDatabase(DATA_DIR, `${id}.db`),
+      onFailure: () => console.warn('[AgentEvidence] BRANCH_MODIFIED_DELIVERY_PENDING') });
+  }
+  BRANCH_MODIFIED_EVIDENCE_SCHEDULER.schedule(rawSessionId);
+}
+let BRANCH_ATTRIBUTION_EVIDENCE_SCHEDULER = AGENT_EVIDENCE_LEDGER
+  ? createBranchAttributionEvidenceScheduler({ ledger: AGENT_EVIDENCE_LEDGER, allowed: sessionDeletionAdmissionOpen,
+    resolvePath: (id) => resolveSessionDatabase(DATA_DIR, `${id}.db`),
+    onFailure: () => console.warn('[AgentEvidence] BRANCH_ATTRIBUTION_DELIVERY_PENDING') }) : null;
+function scheduleBranchAttributionEvidence(rawSessionId: string): void {
+  if (shuttingDown || !sessionDeletionAdmissionOpen(rawSessionId)) return;
+  if (!BRANCH_ATTRIBUTION_EVIDENCE_SCHEDULER) {
+    if (!AGENT_EVIDENCE_LEDGER) {
+      const path = resolveSessionDatabase(DATA_DIR, `${rawSessionId}.db`);
+      if (!path || !hasRetainedBranchAttributionEvidence(path, rawSessionId) || !sessionDeletionAdmissionOpen(rawSessionId)) return;
+      AGENT_EVIDENCE_LEDGER = new AgentEvidenceLedger({ dataDir: DATA_DIR,
+        isSessionDeleted: (id) => SESSION_DELETION_JOURNAL.isBlocked(id) });
+    }
+    BRANCH_ATTRIBUTION_EVIDENCE_SCHEDULER = createBranchAttributionEvidenceScheduler({ ledger: AGENT_EVIDENCE_LEDGER,
+      allowed: sessionDeletionAdmissionOpen, resolvePath: (id) => resolveSessionDatabase(DATA_DIR, `${id}.db`),
+      onFailure: () => console.warn('[AgentEvidence] BRANCH_ATTRIBUTION_DELIVERY_PENDING') });
+  }
+  BRANCH_ATTRIBUTION_EVIDENCE_SCHEDULER.schedule(rawSessionId);
+}
+let PREFERENCE_INFERENCE_EVIDENCE_SCHEDULER = AGENT_EVIDENCE_LEDGER
+  ? createPreferenceInferenceEvidenceScheduler({ ledger: AGENT_EVIDENCE_LEDGER, allowed: sessionDeletionAdmissionOpen,
+    resolvePath: (id) => resolveSessionDatabase(DATA_DIR, `${id}.db`),
+    onFailure: () => console.warn('[AgentEvidence] PREFERENCE_INFERENCE_DELIVERY_PENDING') }) : null;
+function schedulePreferenceInferenceEvidence(rawSessionId: string): void {
+  if (shuttingDown || !sessionDeletionAdmissionOpen(rawSessionId)) return;
+  if (!PREFERENCE_INFERENCE_EVIDENCE_SCHEDULER) {
+    if (!AGENT_EVIDENCE_LEDGER) {
+      const path = resolveSessionDatabase(DATA_DIR, `${rawSessionId}.db`);
+      if (!path || !hasRetainedPreferenceInferenceEvidence(path, rawSessionId) || !sessionDeletionAdmissionOpen(rawSessionId)) return;
+      AGENT_EVIDENCE_LEDGER = new AgentEvidenceLedger({ dataDir: DATA_DIR,
+        isSessionDeleted: (id) => SESSION_DELETION_JOURNAL.isBlocked(id) });
+    }
+    PREFERENCE_INFERENCE_EVIDENCE_SCHEDULER = createPreferenceInferenceEvidenceScheduler({ ledger: AGENT_EVIDENCE_LEDGER,
+      allowed: sessionDeletionAdmissionOpen, resolvePath: (id) => resolveSessionDatabase(DATA_DIR, `${id}.db`),
+      onFailure: () => console.warn('[AgentEvidence] PREFERENCE_INFERENCE_DELIVERY_PENDING') });
+  }
+  PREFERENCE_INFERENCE_EVIDENCE_SCHEDULER.schedule(rawSessionId);
+}
+let AQL_ADVISORY_EVIDENCE_SCHEDULER = AGENT_EVIDENCE_LEDGER
+  ? createAqlAdvisoryEvidenceScheduler({ ledger: AGENT_EVIDENCE_LEDGER, allowed: sessionDeletionAdmissionOpen,
+    resolvePath: (id) => resolveSessionDatabase(DATA_DIR, `${id}.db`),
+    onFailure: () => console.warn('[AgentEvidence] AQL_ADVISORY_DELIVERY_PENDING') }) : null;
+function scheduleAqlAdvisoryEvidence(rawSessionId: string): void {
+  if (shuttingDown || !sessionDeletionAdmissionOpen(rawSessionId)) return;
+  if (!AQL_ADVISORY_EVIDENCE_SCHEDULER) {
+    if (!AGENT_EVIDENCE_LEDGER) {
+      const path = resolveSessionDatabase(DATA_DIR, `${rawSessionId}.db`);
+      if (!path || !hasRetainedAqlAdvisoryEvidence(path, rawSessionId) || !sessionDeletionAdmissionOpen(rawSessionId)) return;
+      AGENT_EVIDENCE_LEDGER = new AgentEvidenceLedger({ dataDir: DATA_DIR,
+        isSessionDeleted: (id) => SESSION_DELETION_JOURNAL.isBlocked(id) });
+    }
+    AQL_ADVISORY_EVIDENCE_SCHEDULER = createAqlAdvisoryEvidenceScheduler({ ledger: AGENT_EVIDENCE_LEDGER,
+      allowed: sessionDeletionAdmissionOpen, resolvePath: (id) => resolveSessionDatabase(DATA_DIR, `${id}.db`),
+      onFailure: () => console.warn('[AgentEvidence] AQL_ADVISORY_DELIVERY_PENDING') });
+  }
+  AQL_ADVISORY_EVIDENCE_SCHEDULER.schedule(rawSessionId);
+}
+let NSFW_SCENE_EVIDENCE_SCHEDULER = AGENT_EVIDENCE_LEDGER
+  ? createNsfwSceneEvidenceScheduler({ ledger: AGENT_EVIDENCE_LEDGER, allowed: sessionDeletionAdmissionOpen,
+    resolvePath: (id) => resolveSessionDatabase(DATA_DIR, `${id}.db`),
+    onFailure: () => console.warn('[AgentEvidence] SCENE_CONSUMPTION_DELIVERY_PENDING') }) : null;
+function scheduleNsfwSceneEvidence(rawSessionId: string): void {
+  if (shuttingDown || !sessionDeletionAdmissionOpen(rawSessionId)) return;
+  if (!NSFW_SCENE_EVIDENCE_SCHEDULER) {
+    if (!AGENT_EVIDENCE_LEDGER) {
+      const path = resolveSessionDatabase(DATA_DIR, `${rawSessionId}.db`);
+      if (!path || !hasRetainedNsfwSceneEvidence(path, rawSessionId) || !sessionDeletionAdmissionOpen(rawSessionId)) return;
+      AGENT_EVIDENCE_LEDGER = new AgentEvidenceLedger({ dataDir: DATA_DIR,
+        isSessionDeleted: (id) => SESSION_DELETION_JOURNAL.isBlocked(id) });
+    }
+    NSFW_SCENE_EVIDENCE_SCHEDULER = createNsfwSceneEvidenceScheduler({ ledger: AGENT_EVIDENCE_LEDGER,
+      allowed: sessionDeletionAdmissionOpen, resolvePath: (id) => resolveSessionDatabase(DATA_DIR, `${id}.db`),
+      onFailure: () => console.warn('[AgentEvidence] SCENE_CONSUMPTION_DELIVERY_PENDING') });
+  }
+  NSFW_SCENE_EVIDENCE_SCHEDULER.schedule(rawSessionId);
+}
+let ARC_COMMIT_EVIDENCE_SCHEDULER = AGENT_EVIDENCE_LEDGER && ARC_PROJECTIONS
+  ? createArcCommitEvidenceScheduler({ manager: maintenanceJobs, arcStore: ARC_PROJECTIONS,
+    ledger: AGENT_EVIDENCE_LEDGER, allowed: sessionDeletionAdmissionOpen,
+    onFailure: () => console.warn('[AgentEvidence] ARC_COMMIT_DELIVERY_PENDING') }) : null;
+function scheduleArcCommitEvidence(rawSessionId: string): void {
+  if (shuttingDown || !sessionDeletionAdmissionOpen(rawSessionId)) return;
+  if (!ARC_PROJECTIONS) throw new Error('arc-evidence-store-unavailable');
+  if (!ARC_COMMIT_EVIDENCE_SCHEDULER) {
+    if (!AGENT_EVIDENCE_LEDGER) {
+      if (!hasRetainedArcCommitEvidence(DATA_DIR, (id) => SESSION_DELETION_JOURNAL.isBlocked(id))
+          || !sessionDeletionAdmissionOpen(rawSessionId)) return;
+      AGENT_EVIDENCE_LEDGER = new AgentEvidenceLedger({ dataDir: DATA_DIR,
+        isSessionDeleted: (id) => SESSION_DELETION_JOURNAL.isBlocked(id) });
+    }
+    ARC_COMMIT_EVIDENCE_SCHEDULER = createArcCommitEvidenceScheduler({ manager: maintenanceJobs,
+      arcStore: ARC_PROJECTIONS, ledger: AGENT_EVIDENCE_LEDGER, allowed: sessionDeletionAdmissionOpen,
+      onFailure: () => console.warn('[AgentEvidence] ARC_COMMIT_DELIVERY_PENDING') });
+  }
+  ARC_COMMIT_EVIDENCE_SCHEDULER.schedule(rawSessionId);
+}
+let WORLDBOOK_APPLY_EVIDENCE_SCHEDULER = AGENT_EVIDENCE_LEDGER && WORLDBOOK_REPAIR_CONTROL
+  ? createWorldbookApplyEvidenceScheduler({ control: WORLDBOOK_REPAIR_CONTROL,
+    ledger: AGENT_EVIDENCE_LEDGER, allowed: sessionDeletionAdmissionOpen,
+    onFailure: () => console.warn('[AgentEvidence] WORLDBOOK_APPLY_DELIVERY_PENDING') }) : null;
+function observeWorldbookApplyTransition(observation: Parameters<NonNullable<ConstructorParameters<typeof WorldbookRepairControl>[0]['observe']>>[0]): void {
+  try { AGENT_CLOSURE_RECORDER?.observeWorldbookRepairTransition(observation); }
+  finally {
+    if (observation.status === 'applied' || observation.status === 'reverted') {
+      try { scheduleWorldbookApplyEvidence(observation.sessionId); }
+      catch { console.warn('[AgentEvidence] WORLDBOOK_APPLY_DELIVERY_PENDING'); }
+    }
+  }
+}
+function scheduleWorldbookApplyEvidence(rawSessionId: string): void {
+  if (shuttingDown || !sessionDeletionAdmissionOpen(rawSessionId)) return;
+  if (!WORLDBOOK_REPAIR_CONTROL) throw new Error('worldbook-evidence-store-unavailable');
+  if (!WORLDBOOK_APPLY_EVIDENCE_SCHEDULER) {
+    if (!AGENT_EVIDENCE_LEDGER) {
+      if (!hasRetainedWorldbookApplyEvidence(DATA_DIR, (id) => SESSION_DELETION_JOURNAL.isBlocked(id))
+          || !sessionDeletionAdmissionOpen(rawSessionId)) return;
+      AGENT_EVIDENCE_LEDGER = new AgentEvidenceLedger({ dataDir: DATA_DIR,
+        isSessionDeleted: (id) => SESSION_DELETION_JOURNAL.isBlocked(id) });
+    }
+    WORLDBOOK_APPLY_EVIDENCE_SCHEDULER = createWorldbookApplyEvidenceScheduler({ control: WORLDBOOK_REPAIR_CONTROL, ledger: AGENT_EVIDENCE_LEDGER, allowed: sessionDeletionAdmissionOpen,
+      onFailure: () => console.warn('[AgentEvidence] WORLDBOOK_APPLY_DELIVERY_PENDING') });
+  }
+  WORLDBOOK_APPLY_EVIDENCE_SCHEDULER.schedule(rawSessionId);
+}
+let NPC_OPERATION_EVIDENCE_SCHEDULER = AGENT_EVIDENCE_LEDGER
+  ? createNpcOperationEvidenceScheduler({ manager: maintenanceJobs, dataDir: DATA_DIR,
+    ledger: AGENT_EVIDENCE_LEDGER, allowed: sessionDeletionAdmissionOpen,
+    onFailure: () => console.warn('[AgentEvidence] NPC_OPERATION_DELIVERY_PENDING') }) : null;
+function scheduleNpcOperationEvidence(rawSessionId: string): void {
+  if (shuttingDown || !sessionDeletionAdmissionOpen(rawSessionId)) return;
+  if (!NPC_OPERATION_EVIDENCE_SCHEDULER) {
+    if (!AGENT_EVIDENCE_LEDGER) {
+      if (!hasRetainedNpcOperationEvidence(DATA_DIR, (id) => SESSION_DELETION_JOURNAL.isBlocked(id))
+          || !sessionDeletionAdmissionOpen(rawSessionId)) return;
+      AGENT_EVIDENCE_LEDGER = new AgentEvidenceLedger({ dataDir: DATA_DIR,
+        isSessionDeleted: (id) => SESSION_DELETION_JOURNAL.isBlocked(id) });
+    }
+    NPC_OPERATION_EVIDENCE_SCHEDULER = createNpcOperationEvidenceScheduler({ manager: maintenanceJobs,
+      dataDir: DATA_DIR, ledger: AGENT_EVIDENCE_LEDGER, allowed: sessionDeletionAdmissionOpen,
+      onFailure: () => console.warn('[AgentEvidence] NPC_OPERATION_DELIVERY_PENDING') });
+  }
+  NPC_OPERATION_EVIDENCE_SCHEDULER.schedule(rawSessionId);
+}
+const MAINTENANCE_MEMORY_CONSUMPTION_SCHEDULER = AGENT_CLOSURE_STORE
+  ? createMaintenanceMemoryConsumptionScheduler({
+    manager: maintenanceJobs, closure: AGENT_CLOSURE_STORE, allowed: sessionDeletionAdmissionOpen,
+    onDelivered: (id) => { scheduleReportedEffectEvidence(id); wakeEffectWatchRecovery(id); },
+    open: (sessionId) => {
+      if (!sessionDeletionAdmissionOpen(sessionId)) return null;
+      const path = resolveSessionDatabase(DATA_DIR, `${sessionId}.db`);
+      return path ? openMaintenanceMemoryConsumptionRecovery(path, sessionId) : null;
+    },
+    onFailure: () => { AGENT_CLOSURE_DEGRADED = true; },
+  }) : null;
+const MAINTENANCE_SUMMARY_CONSUMPTION_SCHEDULER = AGENT_CLOSURE_STORE
+  ? createMaintenanceSummaryConsumptionScheduler({
+    manager: maintenanceJobs, closure: AGENT_CLOSURE_STORE, allowed: sessionDeletionAdmissionOpen,
+    onDelivered: (id) => { scheduleReportedEffectEvidence(id); wakeEffectWatchRecovery(id); },
+    open: (sessionId) => {
+      if (!sessionDeletionAdmissionOpen(sessionId)) return null;
+      const path = resolveSessionDatabase(DATA_DIR, `${sessionId}.db`);
+      return path ? openMaintenanceSummaryConsumptionRecovery(path, sessionId) : null;
+    },
+    onFailure: () => { AGENT_CLOSURE_DEGRADED = true; },
+  }) : null;
 const estimateMaintenanceCost = maintenanceCostEstimator(MAINTENANCE_RUNTIME);
 let maintenanceHarness: MaintenanceHarnessService | undefined;
+let maintenanceDrainPump: MaintenanceDrainPump | undefined;
 let maintenanceAdmissionWarningEmitted = false;
 
 const turnJobs = new TurnJobService({
   dataDir: DATA_DIR,
   serverInstanceId: SERVER_INSTANCE_ID,
   admissionOpen: releaseAdmissionOpen,
+  sessionAdmissionOpen: sessionDeletionAdmissionOpen,
   resolveSession: (sessionId) => sessions.get(sessionId),
   loadSession: loadSessionById,
+  beforeManagerClose: () => settleAgentLoopManagerReadersBeforeClose(),
+  onProgress: ({ job, progress }) => eventHub.publish({ type: 'session.updated',
+    resource: { kind: 'session', id: job.sessionId }, runId: job.runId, requestId: job.requestId,
+    data: { status: `turn-${progress.phase}` } }),
   onJobEvent: ({ job, phase }) => {
-    if (phase === 'queued' || phase === 'running') maintenanceHarness?.preemptSession(job.sessionId);
+    if (phase === 'queued' || phase === 'running') maintenanceHarness?.preemptSession(
+      job.sessionId, MAINTENANCE_RUNTIME.enabled || STYLE_COMPILE_RUNTIME_CONFIG.enabled,
+    );
+    // Metadata only: the bounded observer catches asynchronous failures itself.
+    // Legacy execution never awaits a Coordinator or grants it Provider rights.
+    AGENT_LOOP_RUNTIME.observeTurnJobPhase({ runId: job.runId, phase });
     // 事件只是失效通知：携带公开 job DTO 的 status，绝不携带 prompt/正文/思维链。
     let revision: string | undefined;
     if (phase === 'settled') {
@@ -1767,6 +5183,35 @@ const turnJobs = new TurnJobService({
     });
   },
   onSettled: async ({ job }) => {
+    if (MAINTENANCE_RUNTIME.enabled || STYLE_COMPILE_RUNTIME_CONFIG.enabled) {
+      maintenanceHarness?.markPostTurnSettled(job.sessionId);
+    }
+    STYLE_COMPILE_RUNTIME?.wakeSession(job.sessionId);
+    // A regenerate rollback commits before its replacement Provider call, including failed/cancelled replacements.
+    if (job.action === 'regenerate' || job.status === 'succeeded') {
+      try { scheduleVariableInvalidationEvidence(job.sessionId); }
+      catch { console.warn('[AgentEvidence] VARIABLE_INVALIDATION_DELIVERY_PENDING'); }
+    }
+    if (job.status === 'succeeded') EXPLICIT_PREFERENCE_EVIDENCE_SCHEDULER?.schedule(job.sessionId);
+    if (job.status === 'succeeded') CLOSURE_SKILL_EVIDENCE_SCHEDULER?.schedule(job.sessionId);
+    if (job.status === 'succeeded') MAINTENANCE_MEMORY_EVIDENCE_SCHEDULER?.schedule(job.sessionId);
+    if (job.status === 'succeeded') MAINTENANCE_SUMMARY_EVIDENCE_SCHEDULER?.schedule(job.sessionId);
+    if (job.status === 'succeeded') {
+      try { scheduleRegenerationEvidence(job.sessionId); }
+      catch { console.warn('[AgentEvidence] REGENERATION_DELIVERY_PENDING'); }
+    }
+    if (job.status === 'succeeded') {
+      try { scheduleBranchModifiedEvidence(job.sessionId); }
+      catch { console.warn('[AgentEvidence] BRANCH_MODIFIED_DELIVERY_PENDING'); }
+    }
+    if (job.status === 'succeeded') {
+      try { scheduleStyleCompileAdoptionEvidence(job.sessionId); }
+      catch { console.warn('[AgentEvidence] STYLE_ADOPTION_DELIVERY_PENDING'); }
+      try { scheduleVariableApplyEvidence(job.sessionId); }
+      catch { console.warn('[AgentEvidence] VARIABLE_APPLY_DELIVERY_PENDING'); }
+      try { scheduleNsfwSceneEvidence(job.sessionId); }
+      catch { console.warn('[AgentEvidence] SCENE_CONSUMPTION_DELIVERY_PENDING'); }
+    }
     // 任务终态通知属于服务端执行生命周期，不能依赖某个 SSE 订阅者仍在线。
     const session = sessions.get(job.sessionId);
     if (!session) return;
@@ -1807,6 +5252,17 @@ const turnJobs = new TurnJobService({
           try {
             const evidence = session.maintenanceAdmissionEvidence(job.runId);
             if (evidence) {
+              const admissionNowMs = Date.now();
+              const admissionJobs = [
+                ...maintenanceJobs.list(job.sessionId, 100),
+                ...maintenanceJobs.listAdmissionBudgetWindow(job.sessionId, admissionNowMs),
+              ];
+              const existingJobs = [...new Map(
+                admissionJobs.map((entry) => [entry.runId, entry]),
+              ).values()];
+              const relevantParentRunIds = [...new Set(existingJobs.flatMap((entry) => (
+                entry.parentRunId ? [entry.parentRunId] : []
+              )))];
               const audits = buildMaintenanceAdmissionAudits({
                 parentRunId: job.runId,
                 sessionId: job.sessionId,
@@ -1814,13 +5270,23 @@ const turnJobs = new TurnJobService({
                 observation: evidence.observation,
                 domainEvidence: evidence.domainEvidence,
                 foregroundActive: turnJobs.getActiveForSession(job.sessionId) !== null,
-                existingJobs: maintenanceJobs.list(job.sessionId, 100),
-                priorAdmissions: AGENT_ADMISSION_LEDGER.listMaintenance({ sessionId: job.sessionId }),
-                nowMs: Date.now(),
+                existingJobs,
+                priorAdmissions: AGENT_ADMISSION_LEDGER.listMaintenanceForParentRuns(
+                  job.sessionId,
+                  relevantParentRunIds,
+                ),
+                nowMs: admissionNowMs,
                 sessionBudgetLimit: MAINTENANCE_ADMISSION_RUNTIME.sessionBudgetLimit,
                 dailyBudgetLimit: MAINTENANCE_ADMISSION_RUNTIME.dailyBudgetLimit,
               });
               AGENT_ADMISSION_LEDGER.recordMaintenanceBatch(audits);
+              // The audit batch is now durable. Notify the current session even
+              // when policy, budget, cooldown, or the foreground style slot
+              // leaves no task to enqueue; REST remains the authoritative view.
+              publishMaintenanceLifecycleInvalidation(eventHub, {
+                phase: 'evaluated',
+                job: { sessionId: job.sessionId, runId: job.runId },
+              });
               const selection = schedulePostTurnMaintenance(
                 MAINTENANCE_ADMISSION_RUNTIME,
                 audits,
@@ -1848,7 +5314,7 @@ const turnJobs = new TurnJobService({
           // The shadow admission audit above remains durable when lane control
           // hard-stops execution; an empty result means no job was persisted.
           if (queued.length > 0) {
-            queueMicrotask(() => { void maintenanceHarness?.drainAvailable(2); });
+            maintenanceDrainPump?.request();
           }
         } catch (error) {
           if (!(error instanceof MaintenanceDisabledError)) {
@@ -1864,47 +5330,928 @@ const turnJobs = new TurnJobService({
     }
   },
 });
+type MaintenanceHostJob = Parameters<MaintenanceHarnessServiceOptions['modelFor']>[0];
+type MaintenanceHostBinding = Parameters<MaintenanceHarnessServiceOptions['modelFor']>[1];
+
+/** Public metadata only: budget preview must not allocate another transport before Session load. */
+function readMaintenanceModelProfile(job: MaintenanceHostJob, singleCall = false) {
+  if (!PROVIDER_SPI_ENABLED) throw new Error('agent-provider-registry-disabled');
+  const selection = resolveAgentSelection(), descriptor = providerRegistry.describe(selection.providerId);
+  if (!descriptor?.configured || !descriptor.capabilities.chatCompletions || !descriptor.capabilities.tools) {
+    throw new Error('maintenance-model-host-unavailable');
+  }
+  const runtimeProfile = resolveModelRuntimeProfile({ providerId: selection.providerId, modelId: selection.model,
+    supportsTools: descriptor.capabilities.tools, supportsStreaming: descriptor.capabilities.stream });
+  const fullBudget = maintenanceBudgetProfileForAutonomy('quality-beta', job.taskKind, process.env, runtimeProfile);
+  const budgetProfile = singleCall ? normalizeAgentBudgetProfile({ ...fullBudget, maxModelCalls: 1 }) : fullBudget;
+  return { providerId: selection.providerId, modelId: selection.model, runtimeProfile, budgetProfile };
+}
+
+/** Real live environment only, not a source/dispatch/write grant. The ordinary
+ * Model reader below still requires its original source revision. */
+function readMaintenanceLiveModelHostEnvironment(job: MaintenanceHostJob, singleCall = false): MaintenanceModelHostEnvironment | null {
+  try {
+    if (!agentLoopManagerReadersReady || !PROVIDER_SPI_ENABLED || !releaseAdmissionOpen()
+      || !sessionDeletionAdmissionOpen(job.sessionId) || !maintenanceTaskExecutionAllowed(job.sessionId, job.taskKind)
+      || !maintenanceJobs.settings(job.sessionId).effectiveEnabled
+      || !maintenanceModelModeAllowed(MAINTENANCE_RUNTIME.enabled, MAINTENANCE_APPLY_RUNTIME, job)
+      || turnJobs.getActiveForSession(job.sessionId) !== null || !AGENT_ADMISSION_LEDGER) return null;
+    // Recheck this after every awaited preparation too: AL cannot acquire a legacy Skill proof lifecycle.
+    if (singleCall && ((job.taskKind === 'rolling_summary' && maintenanceSummarySkillLiveEnabled(process.env)
+      && maintenanceSummarySkillPolicyAllowed(job.policyVersion))
+      || (job.taskKind === 'memory_consolidation' && maintenanceMemorySkillLiveEnabled(process.env)
+        && maintenanceMemorySkillPolicyAllowed(job.policyVersion)))) return null;
+    const execution = maintenanceJobs.readExecution(job.runId), session = sessions.get(job.sessionId);
+    if (!execution || !session || execution.executorRoute !== (singleCall ? 'agent-loop' : 'legacy')) return null;
+    const audit = AGENT_ADMISSION_LEDGER.listMaintenance({ parentRunId: job.parentRunId, sessionId: job.sessionId, limit: 32 })
+      .find((entry) => entry.sourceRevision === job.sourceRevision && entry.facts.taskKind === job.taskKind
+        && entry.decision.policyVersion === job.policyVersion && entry.decision.verdict === 'would-admit');
+    if (!audit) return null;
+    const sourceRevision = snapshotForSession(session).snapshotToken;
+    const profile = readMaintenanceModelProfile(job, singleCall);
+    if (sessions.get(job.sessionId) !== session || !sessionDeletionAdmissionOpen(job.sessionId)
+      || snapshotForSession(session).snapshotToken !== sourceRevision) return null;
+    return { execution, sessionIdentity: session, sourceRevision, contentMode: session.getContentMode(),
+      ...profile };
+  } catch { return null; }
+}
+
+/** Synchronous original-source authority readback. No new dispatch may borrow
+ * a post-write live claim to replace its captured source. */
+function readMaintenanceModelHostEnvironment(job: MaintenanceHostJob, singleCall = false): MaintenanceModelHostEnvironment | null {
+  const current = readMaintenanceLiveModelHostEnvironment(job, singleCall);
+  return current?.sourceRevision === job.sourceRevision ? current : null;
+}
+
+/** One existing admitted model factory; no second execution route or Client. */
+function createMaintenanceHostModel(job: MaintenanceHostJob, binding: MaintenanceHostBinding,
+  agentLoop?: Readonly<{ assertCurrent: () => void; assertDispatch: () => void;
+    ceilingBudgetProfile: MaintenanceHostBinding['budgetProfile']; admissionScope: AgentLoopModelAdmissionScope }>) {
+    if (!maintenanceModelModeAllowed(MAINTENANCE_RUNTIME.enabled, MAINTENANCE_APPLY_RUNTIME, job)) {
+      throw new Error('maintenance-production-lane-disabled');
+    }
+    if (!AGENT_ADMISSION_LEDGER) throw new Error('maintenance-admission-ledger-unavailable');
+    const audit = AGENT_ADMISSION_LEDGER.listMaintenance({
+      parentRunId: job.parentRunId,
+      sessionId: job.sessionId,
+      limit: 32,
+    }).find((entry) => entry.sourceRevision === job.sourceRevision
+      && entry.facts.taskKind === job.taskKind
+      && entry.decision.policyVersion === job.policyVersion
+      && entry.decision.verdict === 'would-admit');
+    if (!audit) throw new Error('maintenance-admission-audit-missing');
+    if (!PROVIDER_SPI_ENABLED) throw new Error('agent-provider-registry-disabled');
+    // Validate the actual claim, loaded Session and current profile before constructing a Client.
+    const sourceGuard = createMaintenanceModelHostGuard({ job, execution: binding.execution,
+      verifiedSourceRevision: binding.verifiedSourceRevision, budgetProfile: binding.budgetProfile,
+      expectedExecutorRoute: agentLoop ? 'agent-loop' : 'legacy',
+      readCurrent: () => {
+        const current = readMaintenanceModelHostEnvironment(job, agentLoop !== undefined);
+        if (!current || !agentLoop) return current;
+        if (agentBudgetProfileDigest(current.budgetProfile) !== agentBudgetProfileDigest(agentLoop.ceilingBudgetProfile)) return null;
+        return { ...current, budgetProfile: binding.budgetProfile };
+      },
+      clock: () => new Date().toISOString() });
+    const fixed = sourceGuard.fixed;
+    const session = sessions.get(job.sessionId);
+    if (!session || sourceGuard.assertCurrent().sessionIdentity !== session) throw new Error('maintenance-session-not-loaded');
+    const memorySkillEligible = maintenanceMemorySkillLiveEnabled(process.env)
+      && job.taskKind === 'memory_consolidation' && maintenanceMemorySkillPolicyAllowed(job.policyVersion);
+    const summarySkillEligible = maintenanceSummarySkillLiveEnabled(process.env)
+      && job.taskKind === 'rolling_summary' && maintenanceSummarySkillPolicyAllowed(job.policyVersion);
+    const arcSkillEligible = maintenanceArcSkillLiveEnabled(process.env) && job.taskKind === 'branch_index';
+    if (arcSkillEligible && !maintenanceArcSkillPolicyAllowed(job.policyVersion)) {
+      throw new Error('maintenance-arc-skill-policy-unsupported');
+    }
+    const npcSkillEligible = maintenanceNpcSkillLiveEnabled(process.env) && job.taskKind === 'npc_state';
+    if (npcSkillEligible && !maintenanceNpcSkillPolicyAllowed(job.policyVersion)) {
+      throw new Error('maintenance-npc-skill-policy-unsupported');
+    }
+    const worldbookSkillEligible = maintenanceWorldbookSkillLiveEnabled(process.env) && job.taskKind === 'worldbook_repair';
+    if (worldbookSkillEligible && !maintenanceWorldbookSkillPolicyAllowed(job.policyVersion)) {
+      throw new Error('maintenance-worldbook-skill-policy-unsupported');
+    }
+    if (worldbookSkillEligible && (!WORLDBOOK_REPAIR_CONTROL_PLANE || !WORLDBOOK_REPAIR_CONTROL
+      || !worldbookRepairForwardAllowsSession(WORLDBOOK_REPAIR_RUNTIME, job.sessionId))) {
+      throw new Error('maintenance-worldbook-skill-registration-unavailable');
+    }
+    const requiredSkillEligible = arcSkillEligible || npcSkillEligible || worldbookSkillEligible;
+    // AL has no HarnessResult/proposal-provenance lifecycle yet. Do not silently bypass a live Skill.
+    if (agentLoop && (memorySkillEligible || summarySkillEligible || requiredSkillEligible)) throw new Error('agent-loop-maintenance-skill-lifecycle-unbound');
+    agentLoop?.assertCurrent();
+    const { selection: cfg, client: rawObserved } = agentModelBinding({ providerId: fixed.providerId, model: fixed.modelId });
+    const actualRuntime = modelRuntimeProfileFor(cfg, rawObserved);
+    const actualFullBudget = maintenanceBudgetProfileForAutonomy('quality-beta', job.taskKind, process.env, actualRuntime);
+    const actualCeiling = agentLoop ? normalizeAgentBudgetProfile({ ...actualFullBudget, maxModelCalls: 1 }) : actualFullBudget;
+    if (agentLoop && agentBudgetProfileDigest(actualCeiling) !== agentBudgetProfileDigest(agentLoop.ceilingBudgetProfile)) {
+      throw new Error('maintenance-model-host-profile-changed');
+    }
+    const actualBudget = agentLoop ? assertAgentBudgetWithinHostCeiling(actualCeiling, binding.budgetProfile) : actualCeiling;
+    if (modelRuntimeProfileDigest(actualRuntime) !== fixed.runtimeProfileDigest
+      || agentBudgetProfileDigest(actualBudget) !== agentBudgetProfileDigest(binding.budgetProfile)) {
+      throw new Error('maintenance-model-host-profile-changed');
+    }
+    // P17-01.3：维护入口接全局仲裁（background 类）。provider 身份取自本次绑定，
+    // 不在 adapter 里猜；被前台抢占后迟到的结果会抛错而不是写入。
+    let physicalLease: AgentAdmissionLease | undefined;
+    const observed = arbitratedAgentClient(rawObserved, cfg, 'maintenance', undefined, () => {
+      // Arbitration may have waited after the Gateway guard. There is no await
+      // between this final check and the existing Observed/Registry handoff.
+      const lease = physicalLease;
+      if (!lease || !AGENT_ADMISSION_BROKER.mayDispatchLease(lease) || !authorizeHostDispatch(lease)) {
+        throw new AdmittedModelGatewayError('gateway-dispatch-authority-denied');
+      }
+    });
+    let skillHost: ReturnType<typeof createMaintenanceMemorySkillHostAuthority>
+      | ReturnType<typeof createMaintenanceSummarySkillHostAuthority>
+      | ReturnType<typeof createMaintenanceArcSkillHostAuthority>
+      | ReturnType<typeof createMaintenanceNpcSkillHostAuthority>
+      | ReturnType<typeof createMaintenanceWorldbookSkillHostAuthority> | null = null;
+    let memoryCall: ReturnType<typeof createMaintenanceMemorySkillLiveCall> | null = null;
+    let summaryCall: ReturnType<typeof createMaintenanceSummarySkillLiveCall> | null = null;
+    let arcCall: ReturnType<typeof createMaintenanceArcSkillLiveCall> | null = null;
+    let npcCall: ReturnType<typeof createMaintenanceNpcSkillLiveCall> | null = null;
+    let worldbookCall: ReturnType<typeof createMaintenanceWorldbookSkillLiveCall> | null = null;
+    if (arcSkillEligible && !binding.proposalContext) throw new Error('maintenance-arc-skill-context-required');
+    if (npcSkillEligible && !binding.proposalContext) throw new Error('maintenance-npc-skill-context-required');
+    if (worldbookSkillEligible && !binding.proposalContext) throw new Error('maintenance-worldbook-skill-context-required');
+    if ((memorySkillEligible || summarySkillEligible || requiredSkillEligible) && binding.proposalContext) {
+      try {
+        const ports: Omit<Parameters<typeof createMaintenanceMemorySkillHostAuthority>[0],
+          'source' | 'sourceAuthority' | 'liveEnabled'> = { execution: binding.execution,
+          jobAuthority: maintenanceJobs, controlStore: AGENT_CONTROL_STORE,
+          isSessionOpen: () => sessionDeletionAdmissionOpen(job.sessionId) && sessions.get(job.sessionId) === session,
+          readLaneRuntime: () => parseAgentLaneRuntimeConfig(process.env),
+          readEligibility: (lease) => {
+            const budget = maintenanceBudgetProfileForAutonomy('quality-beta', job.taskKind, process.env,
+              modelRuntimeProfileFor(cfg, observed));
+            const revision = agentBudgetProfileDigest(budget);
+            return { revision, allowed: maintenanceAdmissionAllowsSession(MAINTENANCE_ADMISSION_RUNTIME, job.sessionId)
+              && maintenanceJobs.settings(job.sessionId).effectiveEnabled
+              && maintenanceModelModeAllowed(MAINTENANCE_RUNTIME.enabled, MAINTENANCE_APPLY_RUNTIME, job)
+              && (!worldbookSkillEligible || !!(WORLDBOOK_REPAIR_CONTROL_PLANE && WORLDBOOK_REPAIR_CONTROL
+                && worldbookRepairForwardAllowsSession(WORLDBOOK_REPAIR_RUNTIME, job.sessionId)))
+              && turnJobs.getActiveForSession(job.sessionId) === null && revision === lease.budgetProfileDigest };
+          },
+          safetyAuthority: { readForLease: (lease, current) => {
+            const dbPath = resolveSessionDatabase(DATA_DIR, `${job.sessionId}.db`);
+            return dbPath ? { sessionId: lease.sessionId, sourceRevision: current.sourceRevision,
+              state: NSFW_SCENE_SAFETY_CONTROL.read({ dbPath, sessionId: job.sessionId,
+                manifest: session.getWorldbookSourceManifest() }) } : null;
+          } },
+        };
+        const fixedSource = { sessionId: job.sessionId, contentMode: session.getContentMode(),
+          assets: session.readAgentSkillAssetContext(), snapshot: binding.snapshot };
+        const readCurrentSource = () => {
+            const revision = snapshotForSession(session).snapshotToken;
+            if (revision !== job.sourceRevision) return null;
+            const summaryState = job.taskKind === 'rolling_summary' ? session.getMemory().mem.db.prepare(
+              `SELECT COALESCE(longterm,'') longterm,COALESCE(summary_round,0) summaryRound
+               FROM memory_meta WHERE id=1`,
+            ).get() as { longterm: string; summaryRound: number } | undefined : undefined;
+            const providerInput = { maxTokens: binding.budgetProfile.agentInputBudgetTokens,
+              system: maintenanceSystemPrompt(job.taskKind) };
+            const snapshot = job.taskKind === 'branch_index'
+              ? buildBranchIndexSnapshotForSession(session, job.sessionId, revision, providerInput)
+              : buildMaintenanceSessionSnapshot({ session, sessionId: job.sessionId, revision,
+              taskKind: job.taskKind, worldbookEntries: maintenanceWorldbookEntries(session),
+              ...(summaryState ? { summaryState } : {}),
+              ...(job.taskKind === 'worldbook_repair' ? {
+                worldbookRepairContext: maintenanceWorldbookRepairContext(session, job.sessionId, worldbookSkillEligible),
+              } : {}),
+              providerInputBudget: providerInput });
+            const current = { sessionId: job.sessionId, contentMode: session.getContentMode(),
+              assets: session.readAgentSkillAssetContext(), snapshot };
+            return snapshotForSession(session).snapshotToken === revision ? current : null;
+        };
+        if (memorySkillEligible) {
+          skillHost = createMaintenanceMemorySkillHostAuthority({ ...ports,
+            source: captureMaintenanceMemorySkillSource(fixedSource),
+            liveEnabled: () => maintenanceMemorySkillLiveEnabled(process.env),
+            sourceAuthority: { readCurrent: () => {
+              const current = readCurrentSource();
+              return current ? captureMaintenanceMemorySkillSource(current) : null;
+            } },
+          });
+          memoryCall = createMaintenanceMemorySkillLiveCall({ broker: AGENT_ADMISSION_BROKER,
+            authority: skillHost.authority, proposalContext: binding.proposalContext });
+        } else if (summarySkillEligible) {
+          skillHost = createMaintenanceSummarySkillHostAuthority({ ...ports,
+            source: captureMaintenanceSummarySkillSource(fixedSource),
+            liveEnabled: () => maintenanceSummarySkillLiveEnabled(process.env),
+            sourceAuthority: { readCurrent: () => {
+              const current = readCurrentSource();
+              return current ? captureMaintenanceSummarySkillSource(current) : null;
+            } },
+          });
+          summaryCall = createMaintenanceSummarySkillLiveCall({ broker: AGENT_ADMISSION_BROKER,
+            authority: skillHost.authority, proposalContext: binding.proposalContext });
+        } else if (arcSkillEligible) {
+          skillHost = createMaintenanceArcSkillHostAuthority({ ...ports,
+            source: captureMaintenanceArcSkillSource(fixedSource),
+            liveEnabled: () => maintenanceArcSkillLiveEnabled(process.env),
+            sourceAuthority: { readCurrent: () => {
+              const current = readCurrentSource();
+              return current ? captureMaintenanceArcSkillSource(current) : null;
+            } },
+          });
+          arcCall = createMaintenanceArcSkillLiveCall({ broker: AGENT_ADMISSION_BROKER,
+            authority: skillHost.authority, proposalContext: binding.proposalContext });
+        } else if (npcSkillEligible) {
+          skillHost = createMaintenanceNpcSkillHostAuthority({ ...ports,
+            source: captureMaintenanceNpcSkillSource(fixedSource),
+            liveEnabled: () => maintenanceNpcSkillLiveEnabled(process.env),
+            sourceAuthority: { readCurrent: () => {
+              const current = readCurrentSource();
+              return current ? captureMaintenanceNpcSkillSource(current) : null;
+            } },
+          });
+          npcCall = createMaintenanceNpcSkillLiveCall({ broker: AGENT_ADMISSION_BROKER,
+            authority: skillHost.authority, proposalContext: binding.proposalContext });
+        } else {
+          skillHost = createMaintenanceWorldbookSkillHostAuthority({ ...ports,
+            source: captureMaintenanceWorldbookSkillSource(fixedSource),
+            liveEnabled: () => maintenanceWorldbookSkillLiveEnabled(process.env),
+            sourceAuthority: { readCurrent: () => {
+              const current = readCurrentSource();
+              return current ? captureMaintenanceWorldbookSkillSource(current) : null;
+            } },
+          });
+          worldbookCall = createMaintenanceWorldbookSkillLiveCall({ broker: AGENT_ADMISSION_BROKER,
+            authority: skillHost.authority, proposalContext: binding.proposalContext });
+        }
+      } catch (error) {
+        if (requiredSkillEligible) throw error;
+        // Memory/Summary retain their existing optional provenance contract.
+      }
+    }
+    if (arcSkillEligible && !arcCall) throw new Error('maintenance-arc-skill-call-required');
+    if (npcSkillEligible && !npcCall) throw new Error('maintenance-npc-skill-call-required');
+    if (worldbookSkillEligible && !worldbookCall) throw new Error('maintenance-worldbook-skill-call-required');
+    const skillCall = worldbookCall ?? npcCall ?? arcCall ?? memoryCall ?? summaryCall;
+    let pendingSkillAudit: AdmittedModelLeaseAudit | undefined;
+    let skillAuditSettled = false;
+    const authorizeHostDispatch = (lease: AgentAdmissionLease): boolean => {
+      if (!sourceGuard.authorizeDispatch(lease)) return false;
+      try { agentLoop?.assertDispatch(); } catch { return false; }
+      return !skillHost || skillHost.authorizeDispatch(lease);
+    };
+    const gateway = new AdmittedModelGateway(AGENT_ADMISSION_BROKER, observed, {
+      estimateCostMicrousd: (usage) => estimateMaintenanceCost({
+        model: cfg.model,
+        inputTokens: usage.prompt_tokens,
+        outputTokens: usage.completion_tokens,
+      }),
+      onLeaseClosed: (entry) => {
+        if (!requiredSkillEligible) { recordAgentRuntimeLease(entry); return; }
+        // Gateway closes immediately on the final allowed call. Preserve its audit until
+        // the live request and proposal have been sealed, before any durable success.
+        if (pendingSkillAudit || skillAuditSettled) throw new AdmittedModelGatewayError('gateway-lease-audit-failed');
+        pendingSkillAudit = entry;
+      },
+      auditRequired: true,
+      prepareRequest: skillCall?.prepareRequest ?? (async () => null),
+      ...(requiredSkillEligible ? { prepareRequestRequired: true } : {}),
+      authorizeDispatch: (lease) => {
+        if (!authorizeHostDispatch(lease)) return false;
+        physicalLease = lease;
+        return true;
+      },
+    });
+    const admitted = createAdmittedMaintenanceModel({
+      broker: AGENT_ADMISSION_BROKER,
+      gateway,
+      job,
+      verifiedSourceRevision: binding.verifiedSourceRevision,
+      proposalContext: binding.proposalContext,
+      budgetProfile: binding.budgetProfile,
+      modelId: cfg.model,
+      mode: session.getContentMode(),
+      reasonCodes: audit.decision.reasonCodes.length > 0
+        ? audit.decision.reasonCodes : ['maintenance-admitted'],
+      evidenceDigests: [...new Set([
+        audit.decision.factsDigest,
+        audit.facts.sourceDigest,
+        audit.facts.observationDigest,
+      ])],
+      noveltyDigest: audit.facts.sourceDigest,
+      nowMs: Date.now,
+      ...(agentLoop ? { agentLoopInvocation: agentLoop.admissionScope } : {}),
+    });
+    const requiredSkillAdmitted = requiredSkillEligible ? { ...admitted,
+      finish(outcome: Parameters<typeof admitted.finish>[0] = 'completed') {
+        try { admitted.finish(outcome); }
+        finally {
+          if (pendingSkillAudit) {
+            const entry = pendingSkillAudit;
+            pendingSkillAudit = undefined;
+            skillAuditSettled = true;
+            try { recordAgentRuntimeLease(entry); }
+            catch { throw new AdmittedModelGatewayError('gateway-lease-audit-failed'); }
+          }
+        }
+      },
+    } : admitted;
+    const handle = worldbookCall ? bindMaintenanceWorldbookSkillLifecycle(requiredSkillAdmitted, worldbookCall)
+      : npcCall ? bindMaintenanceNpcSkillLifecycle(requiredSkillAdmitted, npcCall)
+      : arcCall ? bindMaintenanceArcSkillLifecycle(requiredSkillAdmitted, arcCall)
+      : summaryCall ? bindMaintenanceSummarySkillLifecycle(admitted, summaryCall)
+      : memoryCall ? bindMaintenanceMemorySkillLifecycle(admitted, memoryCall) : admitted;
+    return Object.freeze({ handle, sourceGuard });
+}
+
+/** Isolated correction MODEL host seam. Not installed in production composition.
+ * Only the original Runtime supplies the live lifetime and Service context. The
+ * initial grant/policy is committed before constructing the original MODEL port;
+ * no Action, completion, alternate Coordinator or Provider factory is introduced.
+ */
+async function createAgentLoopMaintenanceHostCorrection(context: MaintenanceAgentLoopExecutionContext,
+  step: Parameters<AgentLoopCoordinatorPorts['prepare']>[0], lifetime: Readonly<{
+    assertActive: () => void;
+    onPrepared: (result: Awaited<ReturnType<ReturnType<typeof createAgentLoopMaintenanceCorrectionPrepare>['prepare']>>) => void;
+  }>): Promise<ReturnType<typeof createAgentLoopMaintenanceCorrectionModel>> {
+  const { ownerId, signal, clock, readCurrent } = createAgentLoopMaintenanceCorrectionHostSource(context, step, lifetime);
+  const prepared = await createAgentLoopMaintenanceCorrectionPrepare({ store: AGENT_LOOP_PROJECTION_STORE,
+    ownerId, clock, signal, readCurrent, onPrepared: lifetime.onPrepared }).prepare({ taskId: context.taskId, revision: step.revision });
+  lifetime.assertActive();
+  return createAgentLoopMaintenanceCorrectionModel({ store: AGENT_LOOP_PROJECTION_STORE, ownerId, clock, signal,
+    policy: prepared.policy, readCurrent,
+    createHandle(input) {
+      lifetime.assertActive();
+      return createMaintenanceHostModel(input.execution.job, { execution: input.execution, snapshot: input.source.snapshot,
+        verifiedSourceRevision: input.source.snapshot.revision, budgetProfile: input.callBudgetProfile,
+        proposalContext: input.source.snapshot.providerProposalContext ?? input.source.snapshot.proposalContext }, {
+        ceilingBudgetProfile: normalizeAgentBudgetProfile(input.source.profile.budgetProfile), admissionScope: input.admissionScope,
+        assertCurrent: input.assertCurrent, assertDispatch: input.assertDispatch,
+      }).handle;
+    } });
+}
+
+/** Same original source/Session capture for the two closed correction hosts.
+ * It is AL-read-free: the callbacks also run inside Store writer transactions. */
+function createAgentLoopMaintenanceCorrectionHostSource(context: MaintenanceAgentLoopExecutionContext,
+  step: Parameters<AgentLoopCoordinatorPorts['prepare']>[0], lifetime: Readonly<{
+    assertActive: () => void;
+    onPrepared: (result: Awaited<ReturnType<ReturnType<typeof createAgentLoopMaintenanceCorrectionPrepare>['prepare']>>) => void;
+  }>) {
+  if (!agentLoopLegacySourceReady || !context || !context.signal || context.signal.aborted
+    || !lifetime || typeof lifetime.assertActive !== 'function' || typeof lifetime.onPrepared !== 'function'
+    || step.envelope.taskId !== context.taskId || step.revision !== 1) throw new Error('agent-loop-maintenance-host-unavailable');
+  lifetime.assertActive();
+  const { ownerId, signal } = context, execution = maintenanceJobs.readExecution(context.execution.job.runId);
+  if (!execution || execution.executorRoute !== 'agent-loop' || execution.leaseOwnerInstanceId !== ownerId
+    || execution.job.taskKind !== 'rolling_summary' || execution.job.mode !== 'shadow'
+    || !sameMaintenanceAgentLoopClaim(context.execution, execution)) throw new Error('agent-loop-maintenance-host-unavailable');
+  const job = execution.job, environment = readMaintenanceModelHostEnvironment(job, true), session = sessions.get(job.sessionId);
+  if (!environment || !session || environment.sessionIdentity !== session) throw new Error('agent-loop-maintenance-host-unavailable');
+  const clock = () => new Date().toISOString();
+  const guard = createMaintenanceModelHostGuard({ job, execution, verifiedSourceRevision: job.sourceRevision,
+    budgetProfile: environment.budgetProfile, expectedExecutorRoute: 'agent-loop',
+    readCurrent: () => readMaintenanceModelHostEnvironment(job, true), clock });
+  let expectedBinding: string | undefined;
+  // Source-only: lifetime.assertActive must not access AL storage because this
+  // read port also runs under the original Store's writer transaction.
+  const readCurrent = () => {
+    lifetime.assertActive();
+    if (signal.aborted || sessions.get(job.sessionId) !== session) throw new Error('agent-loop-maintenance-host-unavailable');
+    const current = guard.assertCurrent();
+    if (current.sessionIdentity !== session) throw new Error('agent-loop-maintenance-host-unavailable');
+    const snapshot = buildRollingSummarySnapshotForSession(session, job.sessionId, current.sourceRevision, {
+      maxTokens: guard.fixed.budgetProfile.agentInputBudgetTokens, system: maintenanceSystemPrompt('rolling_summary'),
+    });
+    const latest = guard.assertCurrent();
+    if (sessions.get(job.sessionId) !== session || latest.sessionIdentity !== session) throw new Error('agent-loop-maintenance-host-unavailable');
+    const result = { execution: latest.execution, source: { job: latest.execution.job, snapshot,
+      profile: { providerId: latest.providerId, modelId: latest.modelId, runtimeProfile: latest.runtimeProfile,
+        budgetProfile: latest.budgetProfile, policyVersion: job.policyVersion, contentMode: latest.contentMode },
+      sessionIdentity: session, hostDispatchGuarded: true as const } };
+    const binding = agentLoopMaintenanceBindingRef(result.execution, result.source);
+    if (expectedBinding !== undefined && binding !== expectedBinding) throw new Error('agent-loop-maintenance-host-unavailable');
+    lifetime.assertActive();
+    return result;
+  };
+  const first = readCurrent(); expectedBinding = agentLoopMaintenanceBindingRef(first.execution, first.source);
+  return { ownerId, signal, clock, readCurrent };
+}
+
+/** Installed only through the lazy versioned Runtime profile; there is still
+ * no production dispatcher/claim authority. Prepare owns the original source
+ * closure; Runtime consumes the live cap and calls createAction before Core
+ * writes its Action-started watermark. */
+async function createAgentLoopMaintenanceHostCorrectionProposal(context: MaintenanceAgentLoopExecutionContext,
+  step: Parameters<AgentLoopCoordinatorPorts['prepare']>[0], lifetime: Readonly<{
+    assertActive: () => void;
+    onPrepared: (result: Awaited<ReturnType<ReturnType<typeof createAgentLoopMaintenanceCorrectionPrepare>['prepare']>>) => void;
+  }>) {
+  const { ownerId, signal, clock, readCurrent } = createAgentLoopMaintenanceCorrectionHostSource(context, step, lifetime);
+  const prepared = await createAgentLoopMaintenanceCorrectionProposalPrepare({ store: AGENT_LOOP_PROJECTION_STORE,
+    ownerId, clock, signal, readCurrent, onPrepared: lifetime.onPrepared }).prepare({ taskId: context.taskId, revision: step.revision });
+  try {
+    lifetime.assertActive();
+    const model = createAgentLoopMaintenanceCorrectionProposalModel({ store: AGENT_LOOP_PROJECTION_STORE,
+      ownerId, clock, signal, policy: prepared.policy, proposalCapability: prepared.proposalCapability, readCurrent,
+      createHandle(input) {
+        lifetime.assertActive();
+        return createMaintenanceHostModel(input.execution.job, { execution: input.execution, snapshot: input.source.snapshot,
+          verifiedSourceRevision: input.source.snapshot.revision, budgetProfile: input.callBudgetProfile,
+          proposalContext: input.source.snapshot.providerProposalContext ?? input.source.snapshot.proposalContext }, {
+          ceilingBudgetProfile: normalizeAgentBudgetProfile(input.source.profile.budgetProfile), admissionScope: input.admissionScope,
+          assertCurrent: input.assertCurrent, assertDispatch: input.assertDispatch,
+        }).handle;
+      } });
+    const publication = (input: Pick<AgentLoopCorrectionRollingSummaryArtifactSourceOptions,
+        'observeRecord' | 'policy' | 'modelRecord' | 'modelOutcome' | 'actionRecord' | 'actionOutcome' | 'rejectedModelOutcome'>) => {
+        const fields = normalizeAgentLoopActionObject(input,
+          ['observeRecord','policy','modelRecord','modelOutcome','actionRecord','actionOutcome'],['rejectedModelOutcome']);
+        lifetime.assertActive();
+        const readSource = () => {
+          const current = readCurrent();
+          // hostDispatchGuarded belongs to the MODEL guard, not the original
+          // artifact source's exact four-field source representation.
+          return { execution: current.execution, source: { job: current.source.job, profile: current.source.profile,
+            snapshot: current.source.snapshot, sessionIdentity: current.source.sessionIdentity } };
+        };
+        const current = readSource();
+        return createAgentLoopCorrectionShadowPublication({ store: AGENT_LOOP_PROJECTION_STORE, manager: maintenanceJobs,
+          ownerId, clock, signal, execution: current.execution, fixedSource: current.source, readCurrent: readSource,
+          observeRecord: fields.observeRecord as typeof input.observeRecord, policy: fields.policy as typeof input.policy,
+          modelRecord: fields.modelRecord as typeof input.modelRecord, modelOutcome: fields.modelOutcome,
+          actionRecord: fields.actionRecord as typeof input.actionRecord, actionOutcome: fields.actionOutcome,
+          ...(Object.hasOwn(fields,'rejectedModelOutcome') ? { rejectedModelOutcome: fields.rejectedModelOutcome } : {}) });
+      };
+    return Object.freeze({ ...model, proposalCapability: prepared.proposalCapability, publication,
+      createAction(input: Pick<AgentLoopMaintenanceCorrectionProposalActionOptions,
+        'record' | 'policy' | 'modelRecord' | 'modelOutcome' | 'decision' | 'rejectedModelOutcome'>) {
+        const fields = normalizeAgentLoopActionObject(input, ['record','policy','modelRecord','modelOutcome','decision'], ['rejectedModelOutcome']);
+        lifetime.assertActive();
+        const current = readCurrent();
+        return createAgentLoopMaintenanceCorrectionProposalAction({ store: AGENT_LOOP_PROJECTION_STORE, manager: maintenanceJobs,
+          ownerId, clock, signal, execution: current.execution, fixedSource: current.source, readCurrent,
+          record: fields.record as typeof input.record, policy: fields.policy as typeof input.policy,
+          modelRecord: fields.modelRecord as typeof input.modelRecord, modelOutcome: fields.modelOutcome as typeof input.modelOutcome,
+          decision: fields.decision, ...(Object.hasOwn(fields,'rejectedModelOutcome')
+            ? { rejectedModelOutcome: fields.rejectedModelOutcome as typeof input.rejectedModelOutcome } : {}) });
+      } });
+  } catch (error) {
+    // COMMIT facts are durable. This is only the live cap's ownership cleanup
+    // when construction failed before Runtime could receive its revoke owner.
+    revokeAgentLoopCorrectionProposalCapability(prepared.proposalCapability);
+    throw error;
+  }
+}
+
+/** Initial trusted Prepare seam only; the production runtime remains fixed-deny.
+ * Caller must first obtain an explicit durable AL claim. No Client or Ticket is allocated here.
+ */
+function createAgentLoopMaintenanceHostPrepare(input: Readonly<{
+  runId: string; taskId: string; expectedRevision: number; ownerId: string; signal: AbortSignal;
+}>) {
+  if (!agentLoopLegacySourceReady || !input || !input.signal || input.signal.aborted) {
+    throw new Error('agent-loop-maintenance-host-unavailable');
+  }
+  const { runId, taskId, expectedRevision, ownerId, signal } = input;
+  const execution = maintenanceJobs.readExecution(runId);
+  if (!execution || execution.executorRoute !== 'agent-loop' || execution.leaseOwnerInstanceId !== ownerId
+    || execution.job.taskKind !== 'rolling_summary') {
+    throw new Error('agent-loop-maintenance-host-unavailable');
+  }
+  const job = execution.job, environment = readMaintenanceModelHostEnvironment(job, true);
+  if (!environment) throw new Error('agent-loop-maintenance-host-unavailable');
+  const guard = createMaintenanceModelHostGuard({ job, execution, verifiedSourceRevision: job.sourceRevision,
+    budgetProfile: environment.budgetProfile, expectedExecutorRoute: 'agent-loop',
+    readCurrent: () => readMaintenanceModelHostEnvironment(job, true), clock: () => new Date().toISOString() });
+  const clock = () => new Date().toISOString();
+  const readCurrent = () => {
+    if (signal.aborted) throw new Error('agent-loop-maintenance-host-unavailable');
+    const current = guard.assertCurrent(), session = sessions.get(job.sessionId);
+    if (!session || current.sessionIdentity !== session) throw new Error('agent-loop-maintenance-host-unavailable');
+    const snapshot = buildRollingSummarySnapshotForSession(session, job.sessionId, current.sourceRevision, {
+      maxTokens: guard.fixed.budgetProfile.agentInputBudgetTokens, system: maintenanceSystemPrompt('rolling_summary'),
+    });
+    const latest = guard.assertCurrent();
+    return { execution: latest.execution, source: { job: latest.execution.job, snapshot,
+      profile: { providerId: latest.providerId, modelId: latest.modelId, runtimeProfile: latest.runtimeProfile,
+        budgetProfile: latest.budgetProfile, policyVersion: job.policyVersion, contentMode: latest.contentMode },
+      sessionIdentity: session } };
+  };
+  const adapter = createAgentLoopMaintenanceExecutionPrepare({ store: AGENT_LOOP_PROJECTION_STORE, ownerId, clock, readCurrent });
+  const assertStep = (step: Parameters<typeof adapter.prepare>[0]) => {
+    if (step.envelope.taskId !== taskId || step.revision !== expectedRevision) throw new Error('agent-loop-maintenance-host-unavailable');
+  };
+  return Object.freeze({
+    prepare: async (step: Parameters<typeof adapter.prepare>[0]) => {
+      assertStep(step);
+      return adapter.prepare(step);
+    },
+    prepareGetVariables: async (step: Parameters<typeof adapter.prepare>[0]) => {
+      assertStep(step);
+      const getVariablesAuthorization = issueAgentLoopGetVariablesAuthorization({ store: AGENT_LOOP_PROJECTION_STORE,
+        ownerId, clock, signal, readCurrent });
+      return createAgentLoopMaintenanceExecutionPrepare({ store: AGENT_LOOP_PROJECTION_STORE,
+        ownerId, clock, readCurrent, getVariablesAuthorization }).prepare(step);
+    },
+    // A separate host seam only; the production composition does not select this route.
+    prepareRollingSummaryProposal: async (step: Parameters<typeof adapter.prepare>[0]) => {
+      assertStep(step);
+      const rollingSummaryProposalAuthorization = issueAgentLoopRollingSummaryProposalAuthorization({ store: AGENT_LOOP_PROJECTION_STORE,
+        ownerId, clock, signal, readCurrent });
+      return createAgentLoopMaintenanceExecutionPrepare({ store: AGENT_LOOP_PROJECTION_STORE,
+        ownerId, clock, readCurrent, rollingSummaryProposalAuthorization }).prepare(step);
+    },
+    // Separate host capability; only the trusted apply route selects it.
+    // The production Service pre-claim gate stays closed.
+    prepareRollingSummaryApply: async (step: Parameters<typeof adapter.prepare>[0], context?: MaintenanceAgentLoopExecutionContext) => {
+      assertStep(step);
+      assertMaintenanceMemorySummaryCommitAllowed(MAINTENANCE_APPLY_RUNTIME, job.sessionId, 'rolling_summary');
+      // Capture the original source BEFORE the source-changing native ACT.
+      // The old three-step host seam may omit context and gains no completion.
+      let completion: ReturnType<typeof createAgentLoopSummaryApplyCompletion> | undefined;
+      if (context !== undefined) {
+        AGENT_LOOP_APPLY_COMPLETION_HOSTS.delete(context);
+        if (context.taskId !== taskId || context.ownerId !== ownerId || context.signal !== signal
+          || !sameMaintenanceAgentLoopClaim(execution, context.execution)) throw new Error('agent-loop-maintenance-host-unavailable');
+        const initial = readCurrent(), session = sessions.get(job.sessionId);
+        if (!session || session !== initial.source.sessionIdentity) throw new Error('agent-loop-maintenance-host-unavailable');
+        const liveGuard = createMaintenanceModelHostGuard({ job, execution: initial.execution,
+          verifiedSourceRevision: job.sourceRevision, budgetProfile: guard.fixed.budgetProfile, expectedExecutorRoute: 'agent-loop',
+          readCurrent: () => readMaintenanceLiveModelHostEnvironment(job, true), clock });
+        const readLive = () => {
+          if (signal.aborted || sessions.get(job.sessionId) !== session) throw new Error('agent-loop-maintenance-host-unavailable');
+          assertMaintenanceMemorySummaryCommitAllowed(MAINTENANCE_APPLY_RUNTIME, job.sessionId, 'rolling_summary');
+          const current = liveGuard.assertLiveClaim();
+          if (current.sessionIdentity !== session) throw new Error('agent-loop-maintenance-host-unavailable');
+          assertMaintenanceMemorySummaryCommitAllowed(MAINTENANCE_APPLY_RUNTIME, job.sessionId, 'rolling_summary');
+          return current;
+        };
+        completion = createAgentLoopSummaryApplyCompletion({ store: AGENT_LOOP_PROJECTION_STORE, manager: maintenanceJobs,
+          ownerId, clock, signal, execution: initial.execution, fixedSource: initial.source, readLive,
+          committer: new MemorySummaryMaintenanceCommitter({ sessionId: job.sessionId, memory: session.getMemory().mem },
+            (sessionId) => {
+              if (sessionId !== job.sessionId || sessions.get(sessionId) !== session) throw new Error('agent-loop-maintenance-host-unavailable');
+              return snapshotForSession(session).snapshotToken;
+            }, clock) });
+      }
+      const rollingSummaryApplyAuthorization = issueAgentLoopRollingSummaryApplyAuthorization({ store: AGENT_LOOP_PROJECTION_STORE,
+        ownerId, clock, signal, readCurrent });
+      const prepared = await createAgentLoopMaintenanceExecutionPrepare({ store: AGENT_LOOP_PROJECTION_STORE,
+        ownerId, clock, readCurrent, rollingSummaryApplyAuthorization }).prepare(step);
+      if (context && completion && !signal.aborted) AGENT_LOOP_APPLY_COMPLETION_HOSTS.set(context, completion);
+      return prepared;
+    },
+    // Read-only provenance/verifier adapter; does not itself request or complete a task.
+    verification: () => {
+      const initial = readCurrent();
+      return createAgentLoopRollingSummaryProposalVerification({ store: AGENT_LOOP_PROJECTION_STORE,
+        manager: maintenanceJobs, ownerId, clock, signal, execution: initial.execution,
+        fixedSource: initial.source, readCurrent });
+    },
+    // Business-first completion seam. Only the original Service's trusted scope
+    // can select it; production canClaim remains literally false.
+    publication: () => {
+      const initial = readCurrent();
+      return createAgentLoopShadowPublication({ store: AGENT_LOOP_PROJECTION_STORE,
+        manager: maintenanceJobs, ownerId, clock, signal, execution: initial.execution,
+        fixedSource: initial.source, readCurrent });
+    },
+  });
+}
+
+/** One-use retrieval only. Original Prepare already captured the fixed source
+ * and same loaded Session; the current post-write state cannot recreate it. */
+function createAgentLoopMaintenanceHostApplyCompletion(context: MaintenanceAgentLoopExecutionContext,
+  step: Readonly<{ envelope: import('@jiuguan/agent-loop-contract').AgentLoopTaskEnvelopeV1; revision: number }>) {
+  const completion = AGENT_LOOP_APPLY_COMPLETION_HOSTS.get(context);
+  AGENT_LOOP_APPLY_COMPLETION_HOSTS.delete(context);
+  if (!completion || context.signal.aborted || !agentLoopLegacySourceReady) throw new Error('agent-loop-maintenance-host-unavailable');
+  const record = AGENT_LOOP_PROJECTION_STORE.read(context.taskId);
+  if (!record || record.ownerId !== context.ownerId || record.fenced || record.envelope.phase !== 'OBSERVE'
+    || record.envelope.state !== 'RUNNING' || record.revision !== step.revision
+    || JSON.stringify(record.envelope) !== JSON.stringify(step.envelope)) throw new Error('agent-loop-maintenance-host-unavailable');
+  return completion;
+}
+
+/** One lazy fixed-snapshot read route, not a model Client or a second execution driver.
+ * The runtime must supply its one-use trusted Action capability before entering this port.
+ */
+function createAgentLoopMaintenanceHostAction(input: Readonly<{
+  runId: string; taskId: string; expectedRevision: number; ownerId: string; signal: AbortSignal;
+}>) {
+  if (!agentLoopLegacySourceReady || !input || !input.signal || input.signal.aborted) {
+    throw new Error('agent-loop-maintenance-host-unavailable');
+  }
+  const { runId, taskId, expectedRevision, ownerId, signal } = input;
+  const execution = maintenanceJobs.readExecution(runId);
+  if (!execution || execution.executorRoute !== 'agent-loop' || execution.leaseOwnerInstanceId !== ownerId
+    || execution.job.taskKind !== 'rolling_summary') throw new Error('agent-loop-maintenance-host-unavailable');
+  const job = execution.job, environment = readMaintenanceModelHostEnvironment(job, true);
+  const record = AGENT_LOOP_PROJECTION_STORE.read(taskId);
+  if (!environment || !record || record.revision !== expectedRevision || taskId !== `agentloop.maintenance.${runId}`) {
+    throw new Error('agent-loop-maintenance-host-unavailable');
+  }
+  const clock = () => new Date().toISOString();
+  const guard = createMaintenanceModelHostGuard({ job, execution, verifiedSourceRevision: job.sourceRevision,
+    budgetProfile: environment.budgetProfile, expectedExecutorRoute: 'agent-loop',
+    readCurrent: () => readMaintenanceLiveModelHostEnvironment(job, true), clock });
+  const readCurrent = () => {
+    if (signal.aborted) throw new Error('agent-loop-maintenance-host-unavailable');
+    const current = guard.assertCurrent(), session = sessions.get(job.sessionId);
+    if (!session || current.sessionIdentity !== session) throw new Error('agent-loop-maintenance-host-unavailable');
+    const snapshot = buildRollingSummarySnapshotForSession(session, job.sessionId, current.sourceRevision, {
+      maxTokens: guard.fixed.budgetProfile.agentInputBudgetTokens, system: maintenanceSystemPrompt('rolling_summary'),
+    });
+    const latest = guard.assertCurrent();
+    return { execution: latest.execution, source: { job: latest.execution.job, snapshot,
+      profile: { providerId: latest.providerId, modelId: latest.modelId, runtimeProfile: latest.runtimeProfile,
+        budgetProfile: latest.budgetProfile, policyVersion: job.policyVersion, contentMode: latest.contentMode },
+      sessionIdentity: session } };
+  };
+  const initial = readCurrent();
+  let readAdapter: ReturnType<typeof createAgentLoopMaintenanceGetVariablesAction> | undefined;
+  let proposalAdapter: ReturnType<typeof createAgentLoopMaintenanceRollingSummaryProposalAction> | undefined;
+  let applyAdapter: ReturnType<typeof createAgentLoopMaintenanceRollingSummaryApplyAction> | undefined;
+  const assertStep = (step: Parameters<AgentLoopCoordinatorPorts['act']>[0]) => {
+    if (step.actionRequest.taskId !== taskId || step.actionRequest.expectedTaskRevision !== expectedRevision) {
+      throw new Error('agent-loop-maintenance-host-unavailable');
+    }
+  };
+  return Object.freeze({
+    act: async (step: Parameters<AgentLoopCoordinatorPorts['act']>[0]) => {
+      assertStep(step);
+      readAdapter ??= createAgentLoopMaintenanceGetVariablesAction({ store: AGENT_LOOP_PROJECTION_STORE,
+        ownerId, clock, signal, execution: initial.execution, fixedSource: initial.source, readCurrent });
+      return readAdapter.act(step);
+    },
+    actRollingSummaryProposal: async (step: Parameters<AgentLoopCoordinatorPorts['act']>[0]) => {
+      assertStep(step);
+      proposalAdapter ??= createAgentLoopMaintenanceRollingSummaryProposalAction({ store: AGENT_LOOP_PROJECTION_STORE,
+        manager: maintenanceJobs, ownerId, clock, signal, execution: initial.execution,
+        fixedSource: initial.source, readCurrent });
+      return proposalAdapter.act(step);
+    },
+    // Trusted original-capability handoff only. Service.canClaim remains false;
+    // no HTTP/ENV/DTO activation or Runtime pre-consumption of this cap.
+    actRollingSummaryApply: async (step: Parameters<AgentLoopCoordinatorPorts['act']>[0], capability: AgentLoopRollingSummaryApplyCapability) => {
+      let entered = false;
+      try {
+        assertStep(step);
+        const readLive = () => {
+          assertMaintenanceMemorySummaryCommitAllowed(MAINTENANCE_APPLY_RUNTIME, job.sessionId, 'rolling_summary');
+          const current = guard.assertLiveClaim();
+          if (sessions.get(job.sessionId) !== initial.source.sessionIdentity || current.sessionIdentity !== initial.source.sessionIdentity) {
+            throw new Error('agent-loop-maintenance-host-unavailable');
+          }
+          assertMaintenanceMemorySummaryCommitAllowed(MAINTENANCE_APPLY_RUNTIME, job.sessionId, 'rolling_summary');
+          return current;
+        };
+        readLive();
+        const session = sessions.get(job.sessionId);
+        if (!session || session !== initial.source.sessionIdentity) throw new Error('agent-loop-maintenance-host-unavailable');
+        applyAdapter ??= createAgentLoopMaintenanceRollingSummaryApplyAction({ store: AGENT_LOOP_PROJECTION_STORE,
+          manager: maintenanceJobs, ownerId, clock, signal, execution: initial.execution, fixedSource: initial.source,
+          readCurrent, readLive, capability,
+          committer: new MemorySummaryMaintenanceCommitter({ sessionId: job.sessionId, memory: session.getMemory().mem },
+            (sessionId) => {
+              if (sessionId !== job.sessionId || sessions.get(sessionId) !== session) throw new Error('agent-loop-maintenance-host-unavailable');
+              return snapshotForSession(session).snapshotToken;
+            }, clock) });
+        entered = true;
+        return await applyAdapter.act(step);
+      } finally {
+        revokeAgentLoopRollingSummaryApplyCapability(capability);
+        if (entered) MAINTENANCE_SUMMARY_WRITE_SCHEDULER?.schedule();
+      }
+    },
+  });
+}
+
+/** Lazy host MODEL port. Only the durable reservation winner can open one per-invocation handle.
+ * Construction is read-only; the production Service claim fence remains fixed closed.
+ */
+function createAgentLoopMaintenanceHostModel(input: Readonly<{
+  runId: string; taskId: string; expectedRevision: number; ownerId: string; signal: AbortSignal;
+}>, rollingSummaryApplyCapability?: AgentLoopRollingSummaryApplyCapability) {
+  const applySelected = arguments.length > 1;
+  try {
+  if (!agentLoopLegacySourceReady || !input || !input.signal || input.signal.aborted) {
+    throw new Error('agent-loop-maintenance-host-unavailable');
+  }
+  const { runId, taskId, expectedRevision, ownerId, signal } = input;
+  const execution = maintenanceJobs.readExecution(runId);
+  if (!execution || execution.executorRoute !== 'agent-loop' || execution.leaseOwnerInstanceId !== ownerId
+    || execution.job.taskKind !== 'rolling_summary') throw new Error('agent-loop-maintenance-host-unavailable');
+  const job = execution.job, environment = readMaintenanceModelHostEnvironment(job, true);
+  const session = sessions.get(job.sessionId), record = AGENT_LOOP_PROJECTION_STORE.read(taskId);
+  if (!environment || !session || environment.sessionIdentity !== session || !record || record.revision !== expectedRevision) {
+    throw new Error('agent-loop-maintenance-host-unavailable');
+  }
+  const ceilingBudgetProfile = normalizeAgentBudgetProfile(environment.budgetProfile);
+  // The claim start and prepared ceiling are durable/stable. Creating a new wrapper never restarts this clock.
+  const deadlineAtMs = Date.parse(job.startedAt ?? '') + ceilingBudgetProfile.maxWallMs;
+  if (!Number.isSafeInteger(deadlineAtMs) || !Number.isFinite(new Date(deadlineAtMs).getTime())) {
+    throw new Error('agent-loop-maintenance-host-unavailable');
+  }
+  const budgetAt = (current: typeof record) => deriveAgentLoopModelCallBudget({ budget: current.envelope.budget,
+    hostProfile: ceilingBudgetProfile, deadlineAtMs, nowMs: Date.now() });
+  const checkRecord = (requireReservation: boolean, budgetProfile = budgetAt(record)) => {
+    if (signal.aborted) throw new Error('agent-loop-maintenance-host-unavailable');
+    return assertAgentLoopMaintenanceModelRecord({ store: AGENT_LOOP_PROJECTION_STORE,
+      ownerId, clock: () => new Date().toISOString(), job, budgetProfile,
+      envelope: record.envelope, revision: expectedRevision, requireReservation });
+  };
+  checkRecord(false);
+  const assertApplyModel = (current = record) => {
+    if (!applySelected) return;
+    assertMaintenanceMemorySummaryCommitAllowed(MAINTENANCE_APPLY_RUNTIME, job.sessionId, 'rolling_summary');
+    assertAgentLoopRollingSummaryApplyModelCapability(rollingSummaryApplyCapability, {
+      store: AGENT_LOOP_PROJECTION_STORE, ownerId, record: current,
+    });
+  };
+  // Before any Client, Broker ticket or per-invocation handle is constructed.
+  assertApplyModel();
+  const snapshot = buildRollingSummarySnapshotForSession(session, job.sessionId, job.sourceRevision, {
+    maxTokens: ceilingBudgetProfile.agentInputBudgetTokens, system: maintenanceSystemPrompt('rolling_summary'),
+  });
+  assertAgentLoopMaintenancePreparedBinding({ record, execution, source: { job, snapshot,
+    profile: { providerId: environment.providerId, modelId: environment.modelId,
+      runtimeProfile: environment.runtimeProfile, budgetProfile: ceilingBudgetProfile, policyVersion: job.policyVersion,
+      contentMode: environment.contentMode } } });
+  const constructionGuard = createMaintenanceModelHostGuard({ job, execution, verifiedSourceRevision: job.sourceRevision,
+    budgetProfile: ceilingBudgetProfile, expectedExecutorRoute: 'agent-loop',
+    readCurrent: () => readMaintenanceModelHostEnvironment(job, true), clock: () => new Date().toISOString() });
+  let used = false;
+  return Object.freeze({ async decide(step: Parameters<AgentLoopCoordinatorPorts['decide']>[0]) {
+    let bundle: ReturnType<typeof createMaintenanceHostModel> | undefined;
+    try {
+    if (used) throw new Error('agent-loop-maintenance-host-unavailable');
+    used = true;
+    if (step.revision !== expectedRevision || JSON.stringify(step.envelope) !== JSON.stringify(record.envelope)) {
+      throw new Error('agent-loop-maintenance-host-unavailable');
+    }
+    constructionGuard.assertCurrent();
+    const budgetProfile = budgetAt(record), currentRecord = checkRecord(true, budgetProfile);
+    assertApplyModel(currentRecord);
+    const admissionScope = consumeAgentLoopModelInvocationPermit(step.invocationPermit, { record: currentRecord, ownerId,
+      deadlineMs: Math.min(deadlineAtMs, Date.now() + budgetProfile.maxWallMs) });
+    bundle = createMaintenanceHostModel(job, { execution, snapshot, verifiedSourceRevision: snapshot.revision,
+      proposalContext: snapshot.providerProposalContext ?? snapshot.proposalContext, budgetProfile }, {
+      ceilingBudgetProfile, admissionScope,
+      assertCurrent: () => { constructionGuard.assertCurrent(); assertApplyModel(checkRecord(true, budgetProfile)); },
+      assertDispatch: () => { constructionGuard.assertCurrent(); assertApplyModel(checkRecord(true, budgetProfile)); },
+    });
+    const currentBundle = bundle;
+      const readCurrent = () => {
+        const current = currentBundle.sourceGuard.assertCurrent(), fixed = currentBundle.sourceGuard.fixed;
+        if (sessions.get(job.sessionId) !== session || current.sessionIdentity !== session) throw new Error('agent-loop-maintenance-host-unavailable');
+        const currentSnapshot = buildRollingSummarySnapshotForSession(session, job.sessionId, current.sourceRevision, {
+          maxTokens: ceilingBudgetProfile.agentInputBudgetTokens, system: maintenanceSystemPrompt('rolling_summary'),
+        });
+        const latest = currentBundle.sourceGuard.assertCurrent();
+        return { execution: latest.execution, source: { job: latest.execution.job, snapshot: currentSnapshot,
+          profile: { providerId: fixed.providerId, modelId: fixed.modelId, runtimeProfile: fixed.runtimeProfile,
+            budgetProfile: ceilingBudgetProfile, policyVersion: fixed.job.policyVersion, contentMode: fixed.contentMode },
+          sessionIdentity: session, hostDispatchGuarded: true as const } };
+      };
+      const fixedSource = readCurrent().source;
+      const bridge = createAgentLoopMaintenanceModel({ store: AGENT_LOOP_PROJECTION_STORE, ownerId,
+        clock: () => new Date().toISOString(), execution, fixedSource, handle: currentBundle.handle, callBudgetProfile: budgetProfile,
+        readCurrent, signal, harnessRunId: job.runId,
+        ...(applySelected ? { rollingSummaryApplyCapability } : {}) });
+      return await bridge.decide(step);
+    } catch (error) {
+      try { bundle?.handle.finish('cancelled'); } catch { /* Do not expose a private source/sink failure. */ }
+      if (applySelected) revokeAgentLoopRollingSummaryApplyCapability(rollingSummaryApplyCapability);
+      // Before a handle exists, the original default path must retain its
+      // precise permit error. Rejecting a forgery must not interrupt the genuine
+      // pending winner or pretend that this wrapper owned a lease to finish.
+      if (!applySelected && !bundle) throw error;
+      throw new Error('agent-loop-maintenance-host-unavailable');
+    }
+  } });
+  } catch (error) {
+    if (applySelected) revokeAgentLoopRollingSummaryApplyCapability(rollingSummaryApplyCapability);
+    if (!applySelected) throw error;
+    throw new Error('agent-loop-maintenance-host-unavailable');
+  }
+}
+
+// Default-off production composition for the first and only enabled cohort.
+// The durable ControlStore remains the switch; merely constructing this exact
+// port does not change its `off` migration default or claim an AL job.
+const AGENT_LOOP_MAINTENANCE_PRODUCTION_CANARY_PORT = AGENT_ADMISSION_LEDGER
+  ? bindAgentLoopMaintenanceProductionCanaryExecutionPort(
+      AGENT_LOOP_RUNTIME,
+      maintenanceJobs,
+      () => {
+        // Reuse the one existing bounded pump after startup reconciliation.
+        // This is only a wake; the exact port remains the claim authority.
+        if (agentLoopLegacySourceReady) maintenanceDrainPump?.request();
+      },
+    )
+  : null;
+const AGENT_LOOP_MAINTENANCE_PRODUCTION_DISPATCHER = (() => {
+  const admissionLedger = AGENT_ADMISSION_LEDGER;
+  const agentLoop = AGENT_LOOP_MAINTENANCE_PRODUCTION_CANARY_PORT;
+  if (admissionLedger && agentLoop) {
+    return createAgentLoopMaintenanceProductionDispatcher({
+      manager: maintenanceJobs,
+      mode: 'production-canary-5',
+      admissionLedger,
+      controlStore: AGENT_CONTROL_STORE,
+      resolveSessionMemory: (sessionId) => sessions.get(sessionId)?.getMemory().mem ?? null,
+      sourcePolicyReader: AGENT_LOOP_MAINTENANCE_CANARY_SOURCE_POLICY_READER,
+      readRouteSnapshot:
+        createAgentLoopMaintenanceProductionRouteSnapshotReaderInternal(AGENT_CONTROL_STORE),
+      agentLoop,
+    });
+  }
+  return createAgentLoopMaintenanceProductionDispatcher({
+    manager: maintenanceJobs,
+    mode: 'closed-legacy',
+    // Without the Admission authority the production namespace stays on the
+    // code-owned Legacy route and cannot obtain an AgentLoop claim.
+    routeControl: Object.freeze({
+      generation: AGENT_LOOP_MAINTENANCE_CANARY_COHORT_EPOCH_V2,
+      state: 'off' as const,
+      revision: 0,
+    }),
+  });
+})();
+
 maintenanceHarness = new MaintenanceHarnessService({
   manager: maintenanceJobs,
-  budgetFor: (job) => {
-    const provider = loadProviderConfig();
-    return maintenanceBudgetProfileForAutonomy(
-      'quality-beta',
-      job.taskKind,
-      process.env,
-      modelRuntimeProfileFor(provider),
-    );
+  productionDispatcher: AGENT_LOOP_MAINTENANCE_PRODUCTION_DISPATCHER,
+  ownerInstanceId: `server.${SERVER_INSTANCE_ID}`,
+  agentLoop: AGENT_LOOP_MAINTENANCE_PRODUCTION_CANARY_PORT ?? {
+    store: AGENT_LOOP_PROJECTION_STORE,
+    // No Admission ledger means there is no exact production port. Keep the
+    // historical hard fence so the fallback dispatcher remains Legacy-only.
+    canClaim: () => false,
+    execute: (context) => AGENT_LOOP_RUNTIME.executeMaintenance(context),
   },
+  budgetFor: (job) => readMaintenanceModelProfile(job).budgetProfile,
   admissionOpen: releaseAdmissionOpen,
   foregroundActive: (sessionId) => turnJobs.getActiveForSession(sessionId) !== null,
-  // Rechecked by the service both before enqueue and immediately before claim.
-  executionAllowed: maintenanceLaneExecutionAllowed,
-  observeRuntime: (input) => {
-    recordAgentControlObservation({
-      lane: 'maintenance',
-      sessionId: input.sessionId,
-      parentRunId: input.parentRunId,
-      invalidCalls: input.invalidCalls,
-    });
+  onPostTurnGraceElapsed: (sessionId) => {
+    // A newer foreground turn may have consumed the wake. Its own settled event
+    // resets the full grace window and schedules the next bounded drain.
+    if (turnJobs.getActiveForSession(sessionId) !== null) return;
+    maintenanceDrainPump?.request();
+    STYLE_COMPILE_RUNTIME?.wakeSession(sessionId);
   },
-  loadSnapshot: async (sessionId, taskKind) => {
+  // Rechecked by the service both before enqueue and immediately before claim.
+  executionAllowed: maintenanceTaskExecutionAllowed,
+  observeRuntime: (input) => {
+    recordMaintenanceProtocolObservation(input);
+  },
+  observeLifecycle: (input) => {
+    // Header-only projection/fence; the existing Maintenance Manager still owns
+    // every Provider call and business write, including retries and recovery.
+    AGENT_LOOP_RUNTIME.observeMaintenanceJobPhase({ runId: input.job.runId, phase: input.phase });
+    publishMaintenanceLifecycleInvalidation(eventHub, input);
+    let directOwnsEvidence = false;
+    if (input.phase === 'settled' && input.job.taskKind === 'memory_consolidation') {
+      try { directOwnsEvidence = maintenanceJobs.getMemoryDirectProposal(input.job.runId) !== null; }
+      catch { directOwnsEvidence = true; AGENT_CLOSURE_DEGRADED = true; }
+    }
+    if (input.phase === 'settled' && input.job.taskKind === 'rolling_summary') {
+      try { directOwnsEvidence = maintenanceJobs.readSummarySkillProvenance(input.job.runId) !== null; }
+      catch { directOwnsEvidence = true; AGENT_CLOSURE_DEGRADED = true; }
+    }
+    // Prepared direct writes own their original pre-COMMIT milestones, even if task settlement later fails.
+    if (!directOwnsEvidence) AGENT_CLOSURE_RECORDER?.observeMaintenanceLifecycle(input);
+    if (input.phase === 'settled') {
+      MAINTENANCE_MEMORY_SKILL_SCHEDULER?.schedule();
+      MAINTENANCE_MEMORY_WRITE_SCHEDULER?.schedule();
+      MAINTENANCE_SUMMARY_WRITE_SCHEDULER?.schedule();
+    }
+  },
+  beforeManagerClose: () => settleAgentLoopManagerReadersBeforeClose(),
+  observeCommitted: ({ job }) => {
+    // Receipt stays internal. Only a real pre-COMMIT preparation can join this write to its source.
+    if (job.taskKind === 'memory_consolidation') MAINTENANCE_MEMORY_WRITE_SCHEDULER?.schedule();
+    if (job.taskKind === 'rolling_summary') MAINTENANCE_SUMMARY_WRITE_SCHEDULER?.schedule();
+  },
+  onShadowProposal: applyGuardedNpcProposal,
+  onWorldbookRepairProposal: registerWorldbookRepairProposal,
+  loadSnapshot: async (sessionId, taskKind, _expectedRevision, providerInput) => {
     const session = await loadSessionById(sessionId);
     if (!session) throw new Error('maintenance-session-not-found');
     const revision = snapshotForSession(session).snapshotToken;
-    const identity = session.learningProfileIdentity();
-    const allowedArcIds = taskKind === 'branch_index' && AGENT_LEARNING_LEDGER
-      ? selectArcSessionProjection(
-        AGENT_LEARNING_LEDGER.arcSessionProjections(),
-        identity,
-      )?.arcs.map((arc) => arc.arcId)
+    const worldbookRepairContext = taskKind === 'worldbook_repair'
+      ? maintenanceWorldbookRepairContext(session, sessionId, maintenanceWorldbookSkillLiveEnabled(process.env))
       : undefined;
-    const maintenanceSnapshot = buildMaintenanceSessionSnapshot({
+    const maintenanceSnapshot = taskKind === 'rolling_summary'
+      ? buildRollingSummarySnapshotForSession(session, sessionId, revision, providerInput)
+      : taskKind === 'branch_index'
+      ? buildBranchIndexSnapshotForSession(session, sessionId, revision, providerInput)
+      : buildMaintenanceSessionSnapshot({
       session,
       sessionId,
       revision,
       taskKind,
-      allowedArcIds,
       worldbookEntries: maintenanceWorldbookEntries(session),
+      providerInputBudget: providerInput,
+      ...(worldbookRepairContext ? { worldbookRepairContext } : {}),
     });
     // 读取世界书/会话行后再次取聚合 revision；中途变化会让 service 在 Provider 前标 stale。
     const verifiedRevision = snapshotForSession(session).snapshotToken;
@@ -1922,57 +6269,358 @@ maintenanceHarness = new MaintenanceHarnessService({
       },
     };
   },
-  modelFor: (job, binding) => {
-    if (!MAINTENANCE_RUNTIME.enabled || job.mode !== 'shadow') {
-      throw new Error('maintenance-production-lane-disabled');
-    }
-    if (!AGENT_ADMISSION_LEDGER) throw new Error('maintenance-admission-ledger-unavailable');
-    const audit = AGENT_ADMISSION_LEDGER.listMaintenance({
-      parentRunId: job.parentRunId,
-      sessionId: job.sessionId,
-      limit: 32,
-    }).find((entry) => entry.sourceRevision === job.sourceRevision
-      && entry.facts.taskKind === job.taskKind
-      && entry.decision.policyVersion === job.policyVersion
-      && entry.decision.verdict === 'would-admit');
-    if (!audit) throw new Error('maintenance-admission-audit-missing');
-    const cfg = loadProviderConfig();
-    const registryClient = providerClientForServer();
-    if (!registryClient) assertProviderReady(cfg);
-    const observed = observeServerModelClient(registryClient ?? new OpenAICompatibleClient(cfg));
-    const gateway = new AdmittedModelGateway(AGENT_ADMISSION_BROKER, observed, {
-      estimateCostMicrousd: (usage) => estimateMaintenanceCost({
-        model: cfg.model,
-        inputTokens: usage.prompt_tokens,
-        outputTokens: usage.completion_tokens,
-      }),
-      onLeaseClosed: recordAgentRuntimeLease,
-      auditRequired: true,
-    });
-    const session = sessions.get(job.sessionId);
-    if (!session) throw new Error('maintenance-session-not-loaded');
-    return createAdmittedMaintenanceModel({
-      broker: AGENT_ADMISSION_BROKER,
-      gateway,
-      job,
-      verifiedSourceRevision: binding.verifiedSourceRevision,
-      budgetProfile: binding.budgetProfile,
-      modelId: cfg.model,
-      mode: session.getContentMode(),
-      reasonCodes: audit.decision.reasonCodes.length > 0
-        ? audit.decision.reasonCodes : ['maintenance-admitted'],
-      evidenceDigests: [...new Set([
-        audit.decision.factsDigest,
-        audit.facts.sourceDigest,
-        audit.facts.observationDigest,
-      ])],
-      noveltyDigest: audit.facts.sourceDigest,
-    });
+  modelFor: (job, binding) => createMaintenanceHostModel(job, binding).handle,
+  // P16 E2（用户裁定：所有 agent 推入正式写入）：
+  // - memory_consolidation / rolling_summary → 走 MemorySummaryMaintenanceCommitter
+  //   （现成 typed 提交器：操作账本 + CAS + 回执 + 回滚锚，操作者路径已在用）；
+  // - npc_state 保持 shadow（走 onShadowProposal 的**审计式** guarded-auto：
+  //   apply-policy 限额 + occupied-targets 审计 + 备份，不能被直接提交绕过）；
+  // - branch_index / worldbook_repair 保持 shadow（各自的操作者/控制面路径）。
+  resolveMode: (sessionId, taskKind) => {
+    if (taskKind !== 'memory_consolidation' && taskKind !== 'rolling_summary') return 'shadow';
+    return maintenanceMemorySummaryApplyMode(
+      MAINTENANCE_APPLY_RUNTIME,
+      sessionId,
+      taskKind,
+    );
   },
-  // P13-B 首发仅 shadow；apply 接口存在于核心层供 CAS 测试，生产接线 fail closed。
   committer: {
-    commit: async () => { throw new Error('maintenance-apply-disabled'); },
+    commit: async (request) => {
+      if (request.taskKind !== 'memory_consolidation' && request.taskKind !== 'rolling_summary') {
+        throw new Error('maintenance-apply-task-kind-unsupported');
+      }
+      // Defense in depth: do not trust the mode persisted on a queued job. The
+      // acknowledged exact/managed-local business-write grant is rechecked at the final boundary.
+      assertMaintenanceMemorySummaryCommitAllowed(
+        MAINTENANCE_APPLY_RUNTIME,
+        request.sessionId,
+        request.taskKind,
+      );
+      if (!request.context) throw new Error('maintenance-apply-context-missing');
+      const session = await loadSessionById(request.sessionId);
+      if (!session) throw new Error('maintenance-session-not-found');
+      if (request.taskKind === 'memory_consolidation') {
+        assertMaintenanceMemorySummaryCommitAllowed(MAINTENANCE_APPLY_RUNTIME, request.sessionId, request.taskKind);
+        assertMaintenanceMemoryDirectWriteAllowed(request, {
+          manager: maintenanceJobs,
+          allowed: (id) => sessionDeletionAdmissionOpen(id) && maintenanceTaskExecutionAllowed(id, request.taskKind),
+        });
+      } else {
+        assertMaintenanceMemorySummaryCommitAllowed(MAINTENANCE_APPLY_RUNTIME, request.sessionId, request.taskKind);
+        assertMaintenanceSummaryDirectWriteAllowed(request, {
+          manager: maintenanceJobs,
+          allowed: (id) => sessionDeletionAdmissionOpen(id) && maintenanceTaskExecutionAllowed(id, request.taskKind),
+        });
+      }
+      const memorySummary = new MemorySummaryMaintenanceCommitter({
+        sessionId: request.sessionId,
+        memory: session.getMemory().mem,
+      }, () => snapshotForSession(session).snapshotToken);
+      const commitInput = {
+        jobRunId: request.runId,
+        sessionId: request.sessionId,
+        taskKind: request.taskKind,
+        sourceRevision: request.expectedRevision,
+        proposal: request.proposal,
+        context: request.context,
+      };
+      const write = () => memorySummary.commit(commitInput);
+      const committed = request.taskKind === 'rolling_summary'
+        ? withMaintenanceSummaryWriteWake(write, () => MAINTENANCE_SUMMARY_WRITE_SCHEDULER?.schedule())
+        : withMaintenanceMemoryWriteWake(write, () => {
+          MAINTENANCE_MEMORY_SKILL_SCHEDULER?.schedule();
+          MAINTENANCE_MEMORY_WRITE_SCHEDULER?.schedule();
+        });
+      if (committed.status === 'stale') {
+        return { status: 'stale' as const, actualRevision: committed.actualRevision, diff: shadowDiff(request.proposal) };
+      }
+      return {
+        status: 'committed' as const,
+        revision: String((committed.receipt as { revision?: unknown }).revision ?? request.expectedRevision),
+        diff: shadowDiff(request.proposal),
+        receipt: committed.receipt,
+      };
+    },
   },
+});
+/**
+ * Session deletion has two fences: a process-local reservation closes the
+ * pre-CAS race, then the privacy journal becomes the permanent tombstone.
+ * Cleanup is replayable and starts only after both foreground and background
+ * executors (including their observer callbacks) have settled.
+ */
+const SESSION_DELETION_COORDINATOR = new SessionDeletionCoordinator({
+  journal: SESSION_DELETION_JOURNAL,
+  reserve(identity) {
+    if (SESSION_DELETION_RESERVATIONS.has(identity.sessionId)) {
+      throw new Error('session-deletion-reservation-conflict');
+    }
+    const reservation: SessionDeletionReservation = Object.freeze({
+      sessionId: identity.sessionId,
+      operationId: identity.operationId,
+      reservationId: `sdelete-reservation:${randomUUID()}`,
+    });
+    SESSION_DELETION_RESERVATIONS.set(identity.sessionId, reservation);
+    return reservation;
+  },
+  release(reservation) {
+    if (SESSION_DELETION_RESERVATIONS.get(reservation.sessionId)?.reservationId
+      === reservation.reservationId) {
+      SESSION_DELETION_RESERVATIONS.delete(reservation.sessionId);
+      DIRECTOR_CREATIVE_SERVICE?.releaseQuiescence(reservation.sessionId);
+    }
+  },
+  async quiesce({ identity }) {
+    await Promise.all([
+      turnJobs.quiesceSession(identity.sessionId),
+      maintenanceHarness!.quiesceSession(identity.sessionId),
+      SKILL_COMPILE_RUNTIME?.quiesceSession(identity.sessionId),
+      SKILL_EVALUATE_RUNTIME?.quiesceSession(identity.sessionId),
+      SKILL_SAMPLE_RUNTIME?.quiesceSession(identity.sessionId),
+      SKILL_QUALITY_RUNTIME?.quiesceSession(identity.sessionId),
+      STYLE_COMPILE_RUNTIME?.quiesceSession(identity.sessionId),
+      DIRECTOR_CREATIVE_SERVICE?.quiesceSession(identity.sessionId),
+      CONTEXT_COMPILER_SHADOW_RUNNER.cancelSession(identity.sessionId),
+    ]);
+  },
+  readRevision(sessionId) {
+    const session = sessions.get(sessionId);
+    if (session) return snapshotForSession(session).snapshotToken;
+    const dbPath = resolveSessionDatabase(DATA_DIR, `${sessionId}.db`);
+    if (!dbPath || !existsSync(dbPath)) return ABSENT_REVISION;
+    const revision = readSessionMeta(dbPath).snapshotToken;
+    if (!revision) throw new Error('session-deletion-snapshot-unavailable');
+    return revision;
+  },
+  cleanupSteps: [
+    {
+      id: 'style-compile-jobs', failureCode: 'style-compile-delete-failed',
+      async run(identity) {
+        if (STYLE_COMPILE_RUNTIME) await STYLE_COMPILE_RUNTIME.redactSession(identity.sessionId);
+        else if (existsSync(resolve(DATA_DIR, STYLE_COMPILE_JOB_DATA_DIRECTORY, STYLE_COMPILE_JOB_DB_FILE))) {
+          throw new Error('style-compile-store-unavailable');
+        }
+      },
+    },
+    {
+        id: 'skill-quality-source',
+        failureCode: 'skill-quality-delete-failed',
+        run(identity) {
+            if (SKILL_QUALITY_RUNTIME) SKILL_QUALITY_RUNTIME.redactSession(identity.sessionId);
+            else if (existsSync(resolve(DATA_DIR, SKILL_QUALITY_DB_FILE))) {
+                throw new Error('skill-quality-store-unavailable');
+            }
+        },
+    },
+    {
+        id: 'skill-sample-source',
+        failureCode: 'skill-sample-delete-failed',
+        run(identity) {
+            if (SKILL_SAMPLE_RUNTIME) SKILL_SAMPLE_RUNTIME.redactSession(identity.sessionId);
+            else if (existsSync(resolve(DATA_DIR, SKILL_SAMPLE_DB_FILE))) {
+                throw new Error('skill-sample-store-unavailable');
+            }
+        },
+    },
+    {
+        id: 'skill-evaluate-source',
+        failureCode: 'skill-evaluate-delete-failed',
+        run(identity) {
+            if (SKILL_EVALUATE_RUNTIME) SKILL_EVALUATE_RUNTIME.redactSession(identity.sessionId);
+            else if (existsSync(resolve(DATA_DIR, SKILL_EVALUATE_DB_FILE))) {
+                throw new Error('skill-evaluate-store-unavailable');
+            }
+        },
+    },
+    {
+        id: 'skill-compile-source',
+        failureCode: 'skill-compile-delete-failed',
+        run(identity) {
+            if (SKILL_COMPILE_RUNTIME) SKILL_COMPILE_RUNTIME.redactSession(identity.sessionId);
+            else if (existsSync(resolve(DATA_DIR, SKILL_COMPILE_DB_FILE))) {
+                throw new Error('skill-compile-store-unavailable');
+            }
+        },
+    },
+    {
+        id: 'agent-evidence',
+        failureCode: 'agent-evidence-delete-failed',
+        run(identity) {
+            EXPLICIT_PREFERENCE_EVIDENCE_SCHEDULER?.cancel(identity.sessionId);
+            CLOSURE_SKILL_EVIDENCE_SCHEDULER?.cancel(identity.sessionId);
+            MAINTENANCE_MEMORY_EVIDENCE_SCHEDULER?.cancel(identity.sessionId);
+            MAINTENANCE_SUMMARY_EVIDENCE_SCHEDULER?.cancel(identity.sessionId);
+            MAINTENANCE_PROPOSAL_REJECTION_EVIDENCE_SCHEDULER?.cancel(identity.sessionId);
+            MAINTENANCE_PROPOSAL_APPROVAL_EVIDENCE_SCHEDULER?.cancel(identity.sessionId);
+            ARC_COMMIT_EVIDENCE_SCHEDULER?.cancel(identity.sessionId);
+            WORLDBOOK_APPLY_EVIDENCE_SCHEDULER?.cancel(identity.sessionId);
+            NPC_OPERATION_EVIDENCE_SCHEDULER?.cancel(identity.sessionId);
+            REGENERATION_EVIDENCE_SCHEDULER?.cancel(identity.sessionId);
+            STYLE_COMPILE_ADOPTION_EVIDENCE_SCHEDULER?.cancel(identity.sessionId);
+            VARIABLE_APPLY_EVIDENCE_SCHEDULER?.cancel(identity.sessionId);
+            VARIABLE_INVALIDATION_EVIDENCE_SCHEDULER?.cancel(identity.sessionId);
+            REPORTED_EFFECT_EVIDENCE_SCHEDULER?.cancel(identity.sessionId);
+            BRANCH_MODIFIED_EVIDENCE_SCHEDULER?.cancel(identity.sessionId);
+            BRANCH_ATTRIBUTION_EVIDENCE_SCHEDULER?.cancel(identity.sessionId);
+            PREFERENCE_INFERENCE_EVIDENCE_SCHEDULER?.cancel(identity.sessionId);
+            AQL_ADVISORY_EVIDENCE_SCHEDULER?.cancel(identity.sessionId);
+            NSFW_SCENE_EVIDENCE_SCHEDULER?.cancel(identity.sessionId);
+            if (AGENT_EVIDENCE_LEDGER) AGENT_EVIDENCE_LEDGER.redactSession(identity.sessionId);
+            else if (existsSync(resolve(DATA_DIR, AGENT_EVIDENCE_DB_FILE))) {
+                throw new Error('agent-evidence-ledger-unavailable');
+            }
+        },
+    },
+    {
+      id: 'learning-evidence',
+      failureCode: 'learning-delete-failed',
+      run(identity) {
+        LEARNING_PREFERENCE_SOURCE_SCHEDULER?.cancel(identity.sessionId);
+        if (!AGENT_LEARNING_LEDGER) throw new Error('agent-learning-ledger-unavailable');
+        AGENT_LEARNING_LEDGER.deleteScope({
+          sessionId: opaqueLearningToken('session', identity.sessionId),
+        });
+      },
+    },
+    {
+      id: 'worldbook-repair-control',
+      failureCode: 'worldbook-repair-delete-failed',
+      run(identity) {
+        // The control is constructed whenever its sidecar exists. A null value
+        // therefore means there is no worldbook-repair database to redact.
+        WORLDBOOK_REPAIR_CONTROL?.deleteSession(identity.sessionId);
+      },
+    },
+    {
+      id: 'npc-maintenance-activation',
+      failureCode: 'npc-maintenance-activation-delete-failed',
+      run(identity) {
+        deleteNpcMaintenanceActivationSession(DATA_DIR, identity.sessionId);
+      },
+    },
+    {
+      id: 'learned-style-proposals',
+      failureCode: 'learned-style-delete-failed',
+      run(identity) {
+        LEARNED_STYLE_PROPOSALS.deleteSessionScope(
+          opaqueLearningToken('session', identity.sessionId),
+        );
+      },
+    },
+    {
+      id: 'model-usage',
+      failureCode: 'model-usage-delete-failed',
+      run(identity) {
+        MODEL_USAGE_LEDGER.redactSession(identity.sessionId);
+      },
+    },
+    {
+      id: 'director-creative',
+      failureCode: 'director-creative-delete-failed',
+      async run(identity) { await DIRECTOR_CREATIVE_SERVICE?.deleteSource(identity.sessionId); },
+    },
+    {
+      id: 'agent-admission',
+      failureCode: 'agent-admission-delete-failed',
+      run(identity) {
+        // Null means the runtime was disabled and no historical DB existed at
+        // startup. Existing databases are always reopened above.
+        AGENT_ADMISSION_LEDGER?.deleteSession(identity.sessionId);
+      },
+    },
+    {
+      id: 'interactive-calls',
+      failureCode: 'interactive-calls-delete-failed',
+      run(identity) {
+        // Runtime-off does not skip an existing database: it is reopened above.
+        INTERACTIVE_CALL_LEDGER?.deleteSession(identity.sessionId);
+      },
+    },
+    {
+      id: 'agent-control-references',
+      failureCode: 'agent-control-references-delete-failed',
+      run(identity) {
+        AGENT_CONTROL_STORE.deleteSessionReferences(identity.sessionId);
+      },
+    },
+    {
+      id: 'arc-projection',
+      failureCode: 'arc-projection-delete-failed',
+      run(identity) {
+        ARC_PROJECTIONS?.deleteSession(identity.sessionId);
+      },
+    },
+    {
+      id: 'maintenance-jobs',
+      failureCode: 'maintenance-jobs-delete-failed',
+      run(identity) {
+        maintenanceJobs.deleteSession(identity.sessionId);
+      },
+    },
+    {
+      id: 'turn-jobs',
+      failureCode: 'turn-jobs-delete-failed',
+      run(identity) {
+        turnJobs.deleteSessionAfterPrivacyFence(identity.sessionId);
+      },
+    },
+    {
+      id: 'agent-closure',
+      failureCode: 'agent-closure-delete-failed',
+      run(identity) {
+        // The closure ledger is privacy evidence, not a disposable cache.
+        // If it could not be opened, preserve the durable deletion fence and
+        // leave this step pending instead of reporting a false cleanup success.
+        SKILL_CONSUMPTION_SCHEDULER?.cancel(identity.sessionId);
+        MAINTENANCE_MEMORY_CONSUMPTION_SCHEDULER?.cancel(identity.sessionId);
+        MAINTENANCE_SUMMARY_CONSUMPTION_SCHEDULER?.cancel(identity.sessionId);
+        if (!AGENT_CLOSURE_STORE) throw new Error('agent-closure-store-unavailable');
+        AGENT_CLOSURE_STORE.redactSession(identity.sessionId);
+      },
+    },
+    createP14EvidenceSessionDeletionStep(DATA_DIR),
+    {
+      id: 'snapshot-artifacts',
+      failureCode: 'snapshot-artifacts-delete-failed',
+      run(identity) {
+        cleanupDeletedSessionSnapshotArtifacts({
+          dataDir: DATA_DIR,
+          sessionId: identity.sessionId,
+        });
+      },
+    },
+    createDshSessionDeletionStep(dshHost),
+    {
+      id: 'session-files',
+      failureCode: 'session-files-delete-failed',
+      async run(identity) {
+        const pendingLoad = sessionLoadPromises.get(identity.sessionId);
+        if (pendingLoad) await Promise.allSettled([pendingLoad]);
+        await CONTEXT_COMPILER_SHADOW_RUNNER.cancelSession(identity.sessionId);
+        const session = sessions.get(identity.sessionId);
+        if (session) {
+          // A failed close may retain a Windows file handle. Keep the instance
+          // in the map and leave this journal step pending so retry can close it.
+          session.close();
+        }
+        sessions.delete(identity.sessionId);
+        const dbPath = resolveSessionDatabase(DATA_DIR, `${identity.sessionId}.db`);
+        if (!dbPath) throw new Error('session-deletion-path-invalid');
+        for (const suffix of ['', '-wal', '-shm']) {
+          const path = suffix ? `${dbPath}${suffix}` : dbPath;
+          if (existsSync(path)) rmSync(path, { force: true });
+        }
+      },
+    },
+    {
+      id: 'pgvector-namespace',
+      failureCode: 'pgvector-namespace-delete-failed',
+      async run(identity) {
+        const result = await (await getPgVectorStore()).purgeNamespace(identity.sessionId);
+        if (result.status !== 'purged') throw new Error('pgvector-namespace-not-purged');
+      },
+    },
+  ],
 });
 const dshRuntimeErrors = new Map<string, string>();
 /** 正则库（前端屏蔽隐藏 + 用户维护，数据在 data/regex-rules.json） */
@@ -2070,6 +6718,64 @@ function maintenanceWorldbookEntries(session: ChatSession): unknown[] {
     } catch { /* 损坏/竞态资产按空命中处理，不暴露路径或原始错误。 */ }
   }
   return output;
+}
+
+/**
+ * 世界书修正的可改证据（严格只读）。
+ *
+ * 只列**本会话实际绑定**的世界书；每本给出当前 revision 与逐条 (稳定 uid, digest)。
+ * 这些值同时构成提案的唯一合法取值域：`normalizeWorldbookRepairProposalWithContext`
+ * 会逐条比对 sessionId / file / expectedRevision / evidenceSetDigest / 条目 digest，
+ * 模型无法自造条目或版本。
+ *
+ * ⚠️ digest 必须与 `buildAfterImage` **同源** —— 两者都对 `rawEntriesOf` 取出的
+ * **磁盘原始条目**计算，而不是 `parseWorldBook` 规范化后的形状；否则 apply 阶段会以
+ * `worldbook-repair-entry-revision-conflict` 全量拒绝提案。
+ */
+function maintenanceWorldbookRepairContext(
+  session: ChatSession,
+  sessionId: string,
+  required = false,
+): WorldbookRepairProposalContext | undefined {
+  const files: WorldbookRepairFileEvidence[] = [];
+  for (const file of session.getSessionConfig().worldbooks.slice(0, 8)) {
+    if (!isSafeAssetFileName(file)) {
+      if (required) throw new Error('maintenance-worldbook-skill-source-invalid');
+      continue;
+    }
+    let asset: { raw: string; revision: string } | null = null;
+    try { asset = readRevisionedAsset('worldbook', file); } catch { asset = null; }
+    if (!asset) {
+      if (required) throw new Error('maintenance-worldbook-skill-source-invalid');
+      continue;
+    }
+    const entries: Array<{ entryUid: string; digest: string }> = [];
+    try {
+      const parsed: unknown = JSON.parse(asset.raw);
+      const seen = new Set<string>();
+      for (const raw of rawEntriesOf(parsed).entries.slice(0, 64)) {
+        const uid = stableEntryUid(raw);
+        if (uid === null || seen.has(uid)) {
+          if (required) throw new Error('maintenance-worldbook-skill-source-invalid');
+          continue;
+        }
+        seen.add(uid);
+        entries.push({ entryUid: uid, digest: worldbookEntryDigest(raw) });
+      }
+    } catch {
+      if (required) throw new Error('maintenance-worldbook-skill-source-invalid');
+      continue;
+    }
+    if (entries.length === 0) {
+      if (required) throw new Error('maintenance-worldbook-skill-source-invalid');
+      continue;
+    }
+    const evidenceSetDigest = `sha256:${createHash('sha256')
+      .update(JSON.stringify({ file, revision: asset.revision, entries }), 'utf8').digest('hex')}`;
+    files.push({ file, expectedRevision: asset.revision, evidenceSetDigest, entries });
+  }
+  if (required && files.length === 0) throw new Error('maintenance-worldbook-skill-context-required');
+  return files.length > 0 ? { sessionId, files } : undefined;
 }
 
 function json(res: ServerResponse, obj: unknown, status = 200): void {
@@ -2218,10 +6924,38 @@ function assetDisplayName(file: string): string {
   return file.replace(/\.(json|png)$/i, '');
 }
 
-function ensureAssetIdentity(kind: 'card' | 'preset' | 'worldbook', file: string, displayName?: string): LocalAssetIdentity {
+function ensureAssetIdentityInMutation(
+  kind: 'card' | 'preset' | 'worldbook',
+  file: string,
+  displayName?: string,
+): LocalAssetIdentity {
   const current = ASSET_IDENTITIES.findByStorageKey(kind, file);
   if (current && displayName === undefined) return current;
   return ASSET_IDENTITIES.ensure(kind, file, displayName?.trim() || assetDisplayName(file));
+}
+
+function ensureAssetIdentity(
+  kind: 'card' | 'preset' | 'worldbook',
+  file: string,
+  displayName?: string,
+): LocalAssetIdentity {
+  const current = ASSET_IDENTITIES.findByStorageKey(kind, file);
+  const nextDisplayName = displayName?.trim() || assetDisplayName(file);
+  if (current && (displayName === undefined || current.displayName === nextDisplayName)) return current;
+  return AGENT_CONTROL_STORE.withAssetMutation(
+    () => ensureAssetIdentityInMutation(kind, file, displayName),
+  );
+}
+
+function ensureDiscoveredAssetIdentities(
+  entries: readonly {
+    kind: 'card' | 'preset' | 'worldbook';
+    storageKey: string;
+    displayName: string;
+  }[],
+): void {
+  if (entries.every((entry) => ASSET_IDENTITIES.findByStorageKey(entry.kind, entry.storageKey))) return;
+  AGENT_CONTROL_STORE.withAssetMutation(() => ASSET_IDENTITIES.ensureDiscovered(entries));
 }
 
 /**
@@ -2345,6 +7079,10 @@ function turnJobFailureMessage(action: 'turn' | 'regenerate', code: string | und
     case 'provider_interrupted': return '模型服务调用被中断，请重试';
     case 'execution_lease_lost': return '生成任务执行权已失效，请重试';
     case 'skill_context_conflict': return '完整 Skill 与必需上下文超出模型容量，请调整上下文配置';
+    case 'skill_package_output_invalid': return 'Skill Canary 回合输出未通过校验，本次已停止';
+    case 'skill_package_budget_exhausted': return 'Skill Canary 回合预算已耗尽，本次已停止';
+    case 'skill_package_shadow_output_invalid': return 'Skill Shadow 回合输出未通过校验，本次已停止';
+    case 'skill_package_shadow_budget_exhausted': return 'Skill Shadow 回合预算已耗尽，本次已停止';
     default: return action === 'regenerate' ? '重新生成失败，请重试' : '回合生成失败，请重试';
   }
 }
@@ -2449,6 +7187,58 @@ function parseBranchSelection(raw: unknown): BranchSelectionReference | undefine
   return { round: Number(row.round), branchId: row.branchId };
 }
 
+const MAX_NSFW_AGENT_STATE_BYTES = 32 * 1024;
+
+/**
+ * Bind an external NSFW state envelope to exactly one durable turn job. The
+ * agent-policy layer performs field allow-listing; this HTTP boundary rejects
+ * oversized/non-JSON shapes and unsafe XML declarations before persistence.
+ */
+function parseNsfwAgentStatePayload(raw: unknown): unknown | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  let payload: unknown = raw;
+  if (typeof raw === 'string') {
+    const text = raw.trim();
+    if (!text || Buffer.byteLength(text, 'utf8') > MAX_NSFW_AGENT_STATE_BYTES
+      || /<!DOCTYPE|<!ENTITY/iu.test(text)) {
+      throw new Error('nsfw_state 必须是有界 JSON 或 <nsfw_state> XML');
+    }
+    if (/^[\[{]/u.test(text)) {
+      try {
+        payload = JSON.parse(text) as unknown;
+        if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('shape');
+      } catch {
+        throw new Error('nsfw_state 必须是合法的 JSON 对象');
+      }
+    } else if (!/^<nsfw(?:[-_:]?state)?(?:\s|>)/iu.test(text)) {
+      throw new Error('nsfw_state 必须是有界 JSON 或 <nsfw_state> XML');
+    } else {
+      payload = text;
+    }
+  } else {
+    if (typeof raw !== 'object' || Array.isArray(raw)) throw new Error('nsfw_state 必须是对象、JSON 或 XML');
+    const serialized = JSON.stringify(raw);
+    if (Buffer.byteLength(serialized, 'utf8') > MAX_NSFW_AGENT_STATE_BYTES) {
+      throw new Error('nsfw_state 过大');
+    }
+  }
+  const parsed = parseNsfwAgentState(payload, typeof payload === 'object');
+  if (typeof payload === 'string' && parsed.source !== 'xml') {
+    throw new Error('nsfw_state 必须是完整的 <nsfw_state> XML');
+  }
+  // Persist only the allow-listed canonical projection. Raw XML and unrelated
+  // JSON fields never reach a durable turn job or the main model query.
+  return {
+    version: 'nsfw-agent-state-v1',
+    ...(parsed.active === null ? {} : { active: parsed.active }),
+    retrieval: parsed.retrieval,
+    ...(parsed.confidence === null ? {} : { confidence: parsed.confidence }),
+    ...(parsed.scene ? { scene: parsed.scene } : {}),
+    ...(parsed.phase ? { phase: parsed.phase } : {}),
+    participants: [...parsed.participants],
+  };
+}
+
 /** 模拟流式分块（按标点/换行/60 字切） */
 function chunkText(text: string, size = 60): string[] {
   const out: string[] = [];
@@ -2476,7 +7266,7 @@ function readSessionMeta(dbPath: string): {
   snapshotToken: string | null;
 } {
   try {
-    const mem = new MemoryDb({ path: dbPath });
+    const mem = new MemoryDb({ path: dbPath, readOnly: true });
     try {
       const meta = mem.db.prepare('SELECT config FROM memory_meta WHERE id = 1').get() as { config: string } | undefined;
       const cfg = meta ? (JSON.parse(meta.config ?? '{}') as SessionSnapshotConfig) : {};
@@ -2767,7 +7557,12 @@ const server = createServer(async (req, res) => {
 
     if (method === 'GET' && p === '/health') {
       securityAuditSpan?.annotate({ reasonCode: 'health' });
-      return json(res, { ok: true, app: 'jiuguan', version: APP_VERSION });
+      return json(res, {
+        ok: true,
+        app: 'jiuguan',
+        version: APP_VERSION,
+        agentClosure: AGENT_CLOSURE_DEGRADED ? 'degraded' : 'ok',
+      });
     }
 
     if (method === 'GET' && p === '/api/capabilities') {
@@ -3013,6 +7808,21 @@ const server = createServer(async (req, res) => {
           controller: requestAbortController,
         });
       }
+    }
+
+    // One deletion fence protects every path-addressed session read/write. This
+    // check runs after auth/CSRF/rate admission (no tombstone oracle) and before
+    // any handler reads a body or touches ChatSession/Agent sidecars.
+    const routedSessionId = sessionScopedRouteTarget(routeAccess, p);
+    if (routedSessionId && isSafeOpaqueId(routedSessionId, 160)
+      && !sessionDeletionAdmissionOpen(routedSessionId)) {
+      req.resume();
+      securityAuditSpan?.annotate({ reasonCode: 'session-deleting' });
+      return dshJson(res, {
+        error: '会话正在删除，暂时拒绝访问',
+        code: 'session-deleting',
+        requestId,
+      }, 409);
     }
 
     // A7：capability 自身是短期 bearer，因此读取路由在长期设备认证之前处理。
@@ -3299,7 +8109,7 @@ const server = createServer(async (req, res) => {
     // DSH 公开面只能位于 /ext/<pluginId>/...，无法遮蔽 /api。
     if (p.startsWith('/ext/')) {
       if (!admitDshBody(req, res)) return;
-      if (dshHost.count() > 0 && await dshHost.dispatch(req, res, p)) return;
+          if (dshHost.count() > 0 && (await dshHost.dispatch(req, res, p))) return;
     }
 
     // 角色卡列表
@@ -3307,7 +8117,7 @@ const server = createServer(async (req, res) => {
       const cards = listCards();
       const presets = listAssets('preset');
       const worldbooks = listAssets('worldbook');
-      ASSET_IDENTITIES.ensureDiscovered([
+      ensureDiscoveredAssetIdentities([
         ...cards.map((asset) => ({ kind: 'card' as const, storageKey: asset.file, displayName: asset.name })),
         ...presets.map((asset) => ({ kind: 'preset' as const, storageKey: asset.file, displayName: asset.name })),
         ...worldbooks.map((asset) => ({ kind: 'worldbook' as const, storageKey: asset.file, displayName: asset.name })),
@@ -3351,7 +8161,7 @@ const server = createServer(async (req, res) => {
     // 角色卡兼容列表：id/name 为旧客户端字段；assetId 是所有新写入的权威引用。
     if (method === 'GET' && p === '/api/cards') {
       const listedCards = listCards();
-      ASSET_IDENTITIES.ensureDiscovered(listedCards.map((card) => ({
+      ensureDiscoveredAssetIdentities(listedCards.map((card) => ({
         kind: 'card',
         storageKey: card.file,
         displayName: card.name,
@@ -3378,11 +8188,12 @@ const server = createServer(async (req, res) => {
     if (method === 'GET' && p === '/api/sessions') {
       if (!existsSync(DATA_DIR)) return json(res, { sessions: [] });
       const dbs = readdirSync(DATA_DIR).filter((f) => f.endsWith('.db'));
-      const list = dbs.map((f) => {
+      const list = dbs.flatMap((f) => {
         const dbPath = resolve(DATA_DIR, f);
-        const meta = readSessionMeta(dbPath);
         const id = f.replace(/\.db$/, '');
-        return {
+        if (isSafeOpaqueId(id, 160) && SESSION_DELETION_JOURNAL.isBlocked(id)) return [];
+        const meta = readSessionMeta(dbPath);
+        return [{
           id,
           file: f,
           name: meta.card || id,
@@ -3392,7 +8203,7 @@ const server = createServer(async (req, res) => {
           createdAt: meta.createdAt,
           revision: meta.revision,
           snapshotToken: meta.snapshotToken,
-        };
+        }];
       });
       return json(res, { sessions: list });
     }
@@ -3641,33 +8452,92 @@ const server = createServer(async (req, res) => {
         return json(res, { error: '预设不存在或 assetId 非法' }, 404);
       }
       if (preset) ensureAssetIdentity('preset', preset);
-      // 卡片导入会话（PNG 卡由 ChatSession 内部解包，见 tools/cli/session.ts init）
+      // 卡片导入会话（PNG 卡由 ChatSession 内部解包，见 packages/session/src/session.ts init）
       sse(res);
       try {
         const dbName = `session-${Date.now()}.db`;
         const dbPath = resolve(DATA_DIR, dbName);
+        const id = dbName.replace(/\.db$/, '');
         const mode = body.content_mode === 'nsf' ? 'nsf' : 'nsfw';
         let presetOverrides: Record<string, boolean> | undefined;
         if (body.preset_overrides && typeof body.preset_overrides === 'object') {
           presetOverrides = body.preset_overrides as Record<string, boolean>;
         }
-        const session = new ChatSession({
+        let session: ChatSession;
+        session = new ChatSession({
           card: cardRes.path, db: dbPath, resume: false, useBge: false, contentMode: mode,
           worldbooks: worldbooks.length > 0 ? worldbooks : undefined,
           preset: preset ?? undefined,
           presetOverrides,
           style: typeof body.style === 'string' && body.style ? body.style : undefined,
-          providerClient: providerClientForServer(),
-          observeProviderClient: observeServerModelClient,
-          learnedStyleResolver: learnedStyleResolverForSession(dbName.replace(/\.db$/, '')),
-          interactiveHarness: interactiveHarnessForSession(dbName.replace(/\.db$/, '')),
-          agentAdmission: agentAdmissionForSession(dbName.replace(/\.db$/, '')),
+          ...sessionProviderArgsForServer(id),
+          toolResultBodyAccess: toolResultBodyAccessForSession(id, () => session),
+          skillSelectionObserver: skillSelectionObserverForSession(id),
+          stylePackageShadowRequired: () => STYLE_PACKAGE_SHADOW_ENABLED && SESSION_AGENT_SKILL_SHADOW_RUNTIME_CONFIG.allowsSession(id),
+          stylePackageShadowRejected: input => STYLE_PACKAGE_SHADOW.rejectTurn(input),
+          stylePackageCanary: STYLE_PACKAGE_CANARY,
+          learnedStyleResolver: learnedStyleResolverForSession(id),
+          commitLearnedStyleAdoption: learnedStyleAdoptionForSession(id),
+          aqlReplanSkillRequired: () => aqlReplanSkillLiveEnabled(process.env),
+          interactiveHarness: interactiveHarnessForSession(id),
+          agentAdmission: agentAdmissionForSession(id),
+          variableProposalSkill: variableProposalSkillForSession(id),
+          nsfwSceneSkill: nsfwSceneSkillForSession(id),
+          nsfwSceneSafetyResolver: () => NSFW_SCENE_SAFETY_CONTROL.resolveSnapshot({
+            dbPath,
+            sessionId: id,
+            manifest: session.getWorldbookSourceManifest(),
+          }),
+          maintenanceHistoryReconcile: ({ sessionId: callbackSessionId, rollbackRound, historyEpoch }) => {
+            if (callbackSessionId !== id || session.getHistoryEpoch() !== historyEpoch) {
+              throw new Error('maintenance-history-reconcile-fence-mismatch');
+            }
+            const committer = new MemorySummaryMaintenanceCommitter({
+              sessionId: id,
+              memory: session.getMemory().mem,
+            }, () => snapshotForSession(session).snapshotToken);
+            const reconciled = committer.reconcileHistoryRollback(rollbackRound);
+            queueMicrotask(() => STYLE_COMPILE_RUNTIME?.wakeSession(id));
+            if (reconciled.rolledBackRunIds.length > 0) {
+              MAINTENANCE_MEMORY_WRITE_SCHEDULER?.schedule();
+              MAINTENANCE_SUMMARY_WRITE_SCHEDULER?.schedule();
+              queueMicrotask(() => {
+                MAINTENANCE_MEMORY_EVIDENCE_SCHEDULER?.schedule(id);
+                MAINTENANCE_SUMMARY_EVIDENCE_SCHEDULER?.schedule(id);
+              });
+            }
+          },
           quietLogs: ACCESS_MODE === 'secured',
         });
         await session.init((stage) => sseSend(res, { type: 'stage', stage }), requestAbortController?.signal);
+        if (shuttingDown) { session.close(); throw new Error('server-shutting-down'); }
         try { hydrateLearningFromLedger(session); } catch { /* 本地空/可重建投影继续，不阻断建档 */ }
-        const id = dbName.replace(/\.db$/, '');
         sessions.set(id, session);
+        STYLE_COMPILE_RUNTIME?.wakeSession(id);
+        SKILL_CONSUMPTION_SCHEDULER?.schedule(id);
+        LEARNING_PREFERENCE_SOURCE_SCHEDULER?.schedule(id);
+        EXPLICIT_PREFERENCE_EVIDENCE_SCHEDULER?.schedule(id);
+        CLOSURE_SKILL_EVIDENCE_SCHEDULER?.schedule(id);
+        MAINTENANCE_MEMORY_EVIDENCE_SCHEDULER?.schedule(id);
+        MAINTENANCE_SUMMARY_EVIDENCE_SCHEDULER?.schedule(id);
+        MAINTENANCE_PROPOSAL_REJECTION_EVIDENCE_SCHEDULER?.schedule(id);
+        MAINTENANCE_PROPOSAL_APPROVAL_EVIDENCE_SCHEDULER?.schedule(id);
+        ARC_COMMIT_EVIDENCE_SCHEDULER?.schedule(id);
+        WORLDBOOK_APPLY_EVIDENCE_SCHEDULER?.schedule(id);
+        NPC_OPERATION_EVIDENCE_SCHEDULER?.schedule(id);
+        REGENERATION_EVIDENCE_SCHEDULER?.schedule(id);
+        STYLE_COMPILE_ADOPTION_EVIDENCE_SCHEDULER?.schedule(id);
+        VARIABLE_APPLY_EVIDENCE_SCHEDULER?.schedule(id);
+        VARIABLE_INVALIDATION_EVIDENCE_SCHEDULER?.schedule(id);
+        REPORTED_EFFECT_EVIDENCE_SCHEDULER?.schedule(id);
+        BRANCH_MODIFIED_EVIDENCE_SCHEDULER?.schedule(id);
+        BRANCH_ATTRIBUTION_EVIDENCE_SCHEDULER?.schedule(id);
+        PREFERENCE_INFERENCE_EVIDENCE_SCHEDULER?.schedule(id);
+        AQL_ADVISORY_EVIDENCE_SCHEDULER?.schedule(id);
+        NSFW_SCENE_EVIDENCE_SCHEDULER?.schedule(id);
+        MAINTENANCE_MEMORY_CONSUMPTION_SCHEDULER?.schedule(id);
+        MAINTENANCE_SUMMARY_CONSUMPTION_SCHEDULER?.schedule(id);
+        MAINTENANCE_SUMMARY_WRITE_SCHEDULER?.schedule();
         scheduleLearningDrain(session);
         const snapshot = snapshotForSession(session);
         // DSH 插件会话事件：session/created（对齐官方 core/session Events）
@@ -3742,20 +8612,29 @@ const server = createServer(async (req, res) => {
       if (!isSafeOpaqueId(sessionId) || (action !== 'turn' && action !== 'regenerate')) {
         return json(res, { error: 'turn job 请求形状非法', code: 'turn-job-request-invalid' }, 400);
       }
+      if (!sessionDeletionAdmissionOpen(sessionId)) {
+        return json(res, { error: '会话正在删除', code: 'session-deleting' }, 409);
+      }
       const session = sessions.get(sessionId);
       if (!session) return json(res, { error: '会话不存在，请先创建或恢复', code: 'session-not-found' }, 404);
       let round: number;
       let input: string | undefined;
       let attachments: ImageAttachment[] | undefined;
       let branchSelection: BranchSelectionReference | undefined;
+      let nsfwState: unknown;
       const contentMode = body.content_mode === 'nsf' ? 'nsf' : 'nsfw';
       if (action === 'turn') {
         input = String(body.input ?? '').trim();
         try {
           attachments = parseImageAttachments(body.attachments);
           branchSelection = parseBranchSelection(body.branchSelection);
+          nsfwState = parseNsfwAgentStatePayload(body.nsfw_state);
         } catch (error) {
-          return json(res, { error: (error as Error).message.slice(0, 200), code: 'attachments-invalid' }, 400);
+          const message = (error as Error).message.slice(0, 200);
+          return json(res, {
+            error: message,
+            code: message.startsWith('nsfw_state') ? 'nsfw-state-invalid' : 'attachments-invalid',
+          }, 400);
         }
         if (!input && attachments.length === 0) {
           return json(res, { error: '输入为空', code: 'turn-input-empty' }, 400);
@@ -3778,6 +8657,7 @@ const server = createServer(async (req, res) => {
           ...(input === undefined ? {} : { input }),
           ...(attachments === undefined ? {} : { attachments }),
           ...(branchSelection === undefined ? {} : { branchSelection }),
+          ...(nsfwState === undefined ? {} : { nsfwState }),
           ...(action === 'turn' ? { contentMode } : {}),
         });
         return json(res, created, created.job.status === 'queued' || created.job.status === 'running' ? 202 : 200);
@@ -3810,6 +8690,9 @@ const server = createServer(async (req, res) => {
       try {
         const existing = turnJobs.get(runId);
         if (!existing) return json(res, { error: 'turn job 不存在', code: 'turn-job-not-found' }, 404);
+        if (!sessionDeletionAdmissionOpen(existing.sessionId)) {
+          return json(res, { error: '会话正在删除', code: 'session-deleting' }, 409);
+        }
         return json(res, { job: turnJobs.cancel(runId) });
       } catch (error) {
         if (error instanceof TurnJobConflictError) {
@@ -3819,13 +8702,28 @@ const server = createServer(async (req, res) => {
       }
     }
 
+    const turnJobCandidateRoute = matchRouteTemplate('/api/turn-jobs/:runId/candidate', p);
+    if (method === 'GET' && turnJobCandidateRoute) {
+      const runId = turnJobCandidateRoute.runId;
+      if (!isSafeOpaqueId(runId)) return json(res, { error: 'runId 非法', code: 'run-id-invalid' }, 400);
+      const job = turnJobs.get(runId);
+      if (!job || !sessionDeletionAdmissionOpen(job.sessionId))
+        return json(res, { error: '候选不可用', code: 'turn-candidate-not-found' }, 404);
+      const candidate = turnJobs.manager.failedCandidate(runId);
+      return candidate ? json(res, { sessionId: job.sessionId, runId, ...candidate })
+        : json(res, { error: '候选不可用', code: 'turn-candidate-not-found' }, 404);
+    }
     const turnJobGetRoute = matchRouteTemplate('/api/turn-jobs/:runId', p);
     if (method === 'GET' && turnJobGetRoute) {
       const runId = turnJobGetRoute.runId;
       if (!isSafeOpaqueId(runId)) return json(res, { error: 'runId 非法', code: 'run-id-invalid' }, 400);
       const job = turnJobs.get(runId);
+      if (job && !sessionDeletionAdmissionOpen(job.sessionId)) {
+        return json(res, { error: '会话正在删除', code: 'session-deleting' }, 409);
+      }
+      const progress = job ? turnJobs.getProgress(runId) : null;
       return job
-        ? json(res, { job })
+        ? json(res, { job, ...(progress ? { progress } : {}) })
         : json(res, { error: 'turn job 不存在', code: 'turn-job-not-found' }, 404);
     }
 
@@ -3840,7 +8738,31 @@ const server = createServer(async (req, res) => {
       });
     }
 
+    // Maintenance 的读取面可以通过已配对的私有远程入口观察，但开关、取消与任务写入
+    // 会立即影响 Provider 调用和费用，因此必须再经过一道“电脑本机 authority”门禁。
+    // 这道门禁故意与 JG_AGENT_CONTROL_MUTATION 无关：Maintenance API 本身已是显式控制面，
+    // 但远程配对 admin 仍只能读取，不能利用 admin scope 越过本机操作边界。
+    const requireLocalMaintenanceMutation = (): boolean => {
+      const access = authorizeAgentControlMutation({
+        runtime: { enabled: true },
+        authority: authority.authority,
+        localAuthorities: LOCAL_AUTHORITIES,
+        accessMode: ACCESS_MODE,
+        authenticatedAdmin: authenticatedContext?.isAdmin === true,
+      });
+      if (access.allowed) return true;
+      req.resume();
+      securityAuditSpan?.annotate({ reasonCode: access.reasonCode });
+      dshJson(res, {
+        error: 'Maintenance 写入仅允许电脑本机管理员入口',
+        code: access.reasonCode,
+        requestId,
+      }, 403);
+      return false;
+    };
+
     if (method === 'POST' && p === '/api/maintenance/control') {
+      if (!requireLocalMaintenanceMutation()) return;
       const body = await readBody(req);
       if (Object.keys(body).some((key) => key !== 'globalEnabled')
         || typeof body.globalEnabled !== 'boolean') {
@@ -3850,17 +8772,21 @@ const server = createServer(async (req, res) => {
         return json(res, { error: '后台 Harness 未由宿主显式启用', code: 'maintenance-runtime-disabled' }, 409);
       }
       maintenanceHarness!.setGlobalEnabled(body.globalEnabled);
-      if (body.globalEnabled) queueMicrotask(() => { void maintenanceHarness?.drainAvailable(4); });
+      if (body.globalEnabled) maintenanceDrainPump?.request();
       return json(res, { ok: true, globalEnabled: maintenanceJobs.globalEnabled() });
     }
 
     const maintenanceJobCancelRoute = matchRouteTemplate('/api/maintenance-jobs/:runId/cancel', p);
     if (method === 'POST' && maintenanceJobCancelRoute) {
+      if (!requireLocalMaintenanceMutation()) return;
       const runId = maintenanceJobCancelRoute.runId;
       if (!isSafeOpaqueId(runId)) return json(res, { error: 'runId 非法', code: 'run-id-invalid' }, 400);
       await readBody(req);
       const existing = maintenanceHarness!.get(runId);
       if (!existing) return json(res, { error: 'maintenance job 不存在', code: 'maintenance-job-not-found' }, 404);
+      if (!sessionDeletionAdmissionOpen(existing.sessionId)) {
+        return json(res, { error: '会话正在删除', code: 'session-deleting' }, 409);
+      }
       return json(res, { job: maintenanceHarness!.cancel(runId) });
     }
 
@@ -3869,6 +8795,9 @@ const server = createServer(async (req, res) => {
       const runId = maintenanceJobGetRoute.runId;
       if (!isSafeOpaqueId(runId)) return json(res, { error: 'runId 非法', code: 'run-id-invalid' }, 400);
       const job = maintenanceHarness!.get(runId);
+      if (job && !sessionDeletionAdmissionOpen(job.sessionId)) {
+        return json(res, { error: '会话正在删除', code: 'session-deleting' }, 409);
+      }
       return job
         ? json(res, { job })
         : json(res, { error: 'maintenance job 不存在', code: 'maintenance-job-not-found' }, 404);
@@ -3886,13 +8815,14 @@ const server = createServer(async (req, res) => {
 
     const maintenanceSettingsRoute = matchRouteTemplate('/api/session/:sessionId/maintenance/settings', p);
     if (method === 'POST' && maintenanceSettingsRoute) {
+      if (!requireLocalMaintenanceMutation()) return;
       const sessionId = maintenanceSettingsRoute.sessionId;
       if (!isSafeOpaqueId(sessionId)) return json(res, { error: 'sessionId 非法', code: 'session-id-invalid' }, 400);
       const body = await readBody(req);
       if (Object.keys(body).some((key) => key !== 'enabled') || typeof body.enabled !== 'boolean') {
         return json(res, { error: 'maintenance settings 请求非法', code: 'maintenance-settings-invalid' }, 400);
       }
-      if (!await loadSessionById(sessionId)) {
+          if (!(await loadSessionById(sessionId))) {
         return json(res, { error: '会话不存在', code: 'session-not-found' }, 404);
       }
       maintenanceHarness!.setSessionEnabled(sessionId, body.enabled);
@@ -3901,6 +8831,7 @@ const server = createServer(async (req, res) => {
 
     const maintenanceCreateRoute = matchRouteTemplate('/api/session/:sessionId/maintenance-jobs', p);
     if (method === 'POST' && maintenanceCreateRoute) {
+      if (!requireLocalMaintenanceMutation()) return;
       const sessionId = maintenanceCreateRoute.sessionId;
       if (!isSafeOpaqueId(sessionId)) return json(res, { error: 'sessionId 非法', code: 'session-id-invalid' }, 400);
       const body = await readBody(req);
@@ -3917,7 +8848,39 @@ const server = createServer(async (req, res) => {
       return json(res, {
         error: '手动后台任务需要由已提交回合的准入决策触发',
         code: 'maintenance-admission-required',
-      }, 409);
+              },
+              409,
+          );
+      }
+
+      // Same account-wide read scope as /api/events, but only validated task metadata.
+      // A caller cannot use this endpoint to resolve refs, goals or domain bodies.
+      if (method === 'GET' && p === '/api/agent-loop/task-status') {
+          res.setHeader('Cache-Control', 'no-store');
+          if (
+              url.searchParams.getAll('taskId').length !== 1 ||
+              url.searchParams.getAll('outcomes').length > 1 ||
+              url.searchParams.getAll('explain').length > 1 ||
+              (url.searchParams.has('explain') && (url.searchParams.get('explain') !== '1' || url.searchParams.has('outcomes'))) ||
+              (url.searchParams.has('outcomes') && url.searchParams.get('outcomes') !== '1') ||
+              [...url.searchParams.keys()].some((key) => key !== 'taskId' && key !== 'outcomes' && key !== 'explain')
+          ) {
+              return json(res, { code: 'agent-loop-task-id-invalid' }, 400);
+          }
+          try {
+              const taskId = url.searchParams.get('taskId');
+              const status = url.searchParams.has('outcomes')
+                  ? readAgentLoopTaskOutcomeStatus(AGENT_LOOP_PROJECTION_STORE, taskId, AGENT_LOOP_SUMMARY_APPLY_OUTCOME_READER)
+                  : url.searchParams.has('explain') ? readAgentLoopTaskExplanation(AGENT_LOOP_PROJECTION_STORE, taskId)
+                  : readAgentLoopTaskStatus(AGENT_LOOP_PROJECTION_STORE, taskId);
+              if (!status) return json(res, { code: 'agent-loop-task-not-found' }, 404);
+              return json(res, status);
+          } catch (error) {
+              if (error instanceof Error && error.message === 'agent-loop-task-id-invalid') {
+                  return json(res, { code: 'agent-loop-task-id-invalid' }, 400);
+              }
+              return json(res, { code: 'agent-loop-task-status-unavailable' }, 503);
+          }
     }
 
     // -----------------------------------------------------------------
@@ -3927,6 +8890,17 @@ const server = createServer(async (req, res) => {
     // 任何缺口/跨实例/超前游标都回 sync.required；REST/SQLite 仍是唯一真值。
     // -----------------------------------------------------------------
     if (method === 'GET' && p === '/api/events') {
+      const taskEventVersion = req.headers['x-jg-task-event-version'];
+      if (taskEventVersion !== undefined && taskEventVersion !== '2') {
+        return json(res, { code: 'task-event-version-invalid' }, 400);
+      }
+      const taskEventsV2 = taskEventVersion === '2';
+      const endTaskEventError = () => {
+        try {
+          res.write('event: task-event.error\ndata: {"code":"task-event-evidence-unavailable"}\n\n');
+          res.end();
+        } catch { res.destroy(); }
+      };
       const rawCursor = req.headers['last-event-id'];
       const cursor = Array.isArray(rawCursor) ? rawCursor[0] : rawCursor;
       const cursorInstanceHeader = req.headers['x-jg-last-server-instance'];
@@ -3940,8 +8914,11 @@ const server = createServer(async (req, res) => {
         if (replay.kind === 'replay') {
           securityAuditSpan?.annotate({ reasonCode: 'events-replay' });
           for (const envelope of replay.envelopes) {
+            let projected: EventEnvelope;
+            try { projected = eventHub.taskEventForClient(envelope, taskEventsV2); }
+            catch { endTaskEventError(); return; }
             res.write(
-              `id: ${envelope.eventId}\nevent: ${envelope.type}\ndata: ${JSON.stringify(envelope)}\n\n`,
+              `id: ${projected.eventId}\nevent: ${projected.type}\ndata: ${JSON.stringify(projected)}\n\n`,
             );
           }
         } else {
@@ -3958,11 +8935,14 @@ const server = createServer(async (req, res) => {
       let closed = false;
       const unsubscribe = eventHub.subscribe((envelope: EventEnvelope) => {
         if (closed || res.writableEnded || res.destroyed) return;
+        let projected: EventEnvelope;
+        try { projected = eventHub.taskEventForClient(envelope, taskEventsV2); }
+        catch { endTaskEventError(); return; }
         try {
           res.write(
-            `id: ${envelope.eventId}\nevent: ${envelope.type}\ndata: ${JSON.stringify(envelope)}\n\n`,
+            `id: ${projected.eventId}\nevent: ${projected.type}\ndata: ${JSON.stringify(projected)}\n\n`,
           );
-        } catch { /* 客户端已断开；close 回调负责清理。 */ }
+        } catch { res.destroy(); }
       });
       const heartbeat = setInterval(() => {
         if (closed || res.writableEnded || res.destroyed) return;
@@ -4002,21 +8982,25 @@ const server = createServer(async (req, res) => {
       const body = await readBody(req);
       if (ac.signal.aborted || req.aborted || res.destroyed) return;
       const sessionId = String(body.session ?? '');
+      if (isSafeOpaqueId(sessionId, 160) && !sessionDeletionAdmissionOpen(sessionId)) {
+        return json(res, { error: '会话正在删除', code: 'session-deleting' }, 409);
+      }
       const session = sessions.get(sessionId);
       if (!session) return json(res, { error: '会话不存在，请先创建或恢复' }, 404);
       const input = String(body.input ?? '').trim();
       let attachments: ImageAttachment[];
       let branchSelection: BranchSelectionReference | undefined;
+      let nsfwState: unknown;
       try {
         attachments = parseImageAttachments(body.attachments);
         branchSelection = parseBranchSelection(body.branchSelection);
+        nsfwState = parseNsfwAgentStatePayload(body.nsfw_state);
       } catch (e) {
         return json(res, { error: (e as Error).message.slice(0, 200) }, 400);
       }
       if (!input && attachments.length === 0) return json(res, { error: '输入为空' }, 400);
-      const compatibilityRunId = body.runId === undefined
-        ? `legacy-${requestId}`
-        : (isSafeOpaqueId(body.runId) ? body.runId : undefined);
+          const compatibilityRunId =
+              body.runId === undefined ? `legacy-${requestId}` : isSafeOpaqueId(body.runId) ? body.runId : undefined;
       if (!compatibilityRunId) return json(res, { error: 'runId 非法' }, 400);
       const mode = body.content_mode === 'nsf' ? 'nsf' : 'nsfw';
       let created: ReturnType<TurnJobService['create']>;
@@ -4033,6 +9017,7 @@ const server = createServer(async (req, res) => {
           contentMode: mode,
           attachments,
           ...(branchSelection ? { branchSelection } : {}),
+          ...(nsfwState === undefined ? {} : { nsfwState }),
         });
       } catch (error) {
         sse(res);
@@ -4061,6 +9046,9 @@ const server = createServer(async (req, res) => {
         round: created.job.round,
         startedAt: Date.parse(created.job.startedAt ?? created.job.createdAt),
       });
+      const unsubscribeProgress = turnJobs.subscribeProgress(created.job.runId, progress => {
+        sseSend(res, { type: 'progress', ...progress });
+      });
       try {
         const settled = await turnJobs.wait(created.job.runId, ac.signal);
         const value = settled.value ?? turnJobs.valueFromCommittedJob(settled.job);
@@ -4076,9 +9064,12 @@ const server = createServer(async (req, res) => {
           }
           const charNotices = session.drainCharacterNotices();
           sseSend(res, {
-            type: 'memory', committed: charNotices.length > 0,
+            // succeeded turn 已原子提交 memory/meta/state；人物通知为空不等于“没有提交”。
+            type: 'memory', committed: true,
             characters: charNotices, headVersion: session.memoryHeadVersion(),
             pending: session.getCharacterPending(), pool: session.getCharacterPool(),
+            changedDomains: ['memory', 'turn-state', ...(charNotices.length > 0 ? ['characters'] : [])],
+            turnState: session.getTurnState(),
           });
         } else if (settled.job.status === 'cancelled') {
           sseSend(res, { type: 'done', prose: '', aborted: true, runId: settled.job.runId });
@@ -4096,6 +9087,7 @@ const server = createServer(async (req, res) => {
         }
       } finally {
         unsubscribe();
+        unsubscribeProgress();
         stopHeartbeat();
       }
       cleanupConnection();
@@ -4153,9 +9145,8 @@ const server = createServer(async (req, res) => {
       if (ac.signal.aborted || req.aborted || res.destroyed) return;
       const round = Number(body.round ?? 0);
       if (!Number.isInteger(round) || round < 1) return json(res, { error: 'round 非法' }, 400);
-      const compatibilityRunId = body.runId === undefined
-        ? `legacy-${requestId}`
-        : (isSafeOpaqueId(body.runId) ? body.runId : undefined);
+          const compatibilityRunId =
+              body.runId === undefined ? `legacy-${requestId}` : isSafeOpaqueId(body.runId) ? body.runId : undefined;
       if (!compatibilityRunId) return json(res, { error: 'runId 非法' }, 400);
       let created: ReturnType<TurnJobService['create']>;
       try {
@@ -4192,6 +9183,9 @@ const server = createServer(async (req, res) => {
         runId: created.job.runId, round,
         startedAt: Date.parse(created.job.startedAt ?? created.job.createdAt),
       });
+      const unsubscribeProgress = turnJobs.subscribeProgress(created.job.runId, progress => {
+        sseSend(res, { type: 'progress', ...progress });
+      });
       try {
         const settled = await turnJobs.wait(created.job.runId, ac.signal);
         const value = settled.value ?? turnJobs.valueFromCommittedJob(settled.job);
@@ -4217,6 +9211,7 @@ const server = createServer(async (req, res) => {
         }
       } finally {
         unsubscribe();
+        unsubscribeProgress();
         stopHeartbeat();
       }
       cleanupConnection();
@@ -4320,10 +9315,15 @@ const server = createServer(async (req, res) => {
       if (!Number.isInteger(round) || round < 1) return json(res, { error: 'round 非法' }, 400);
       try {
         const r = session.deleteMessages(round, mode);
+        STYLE_COMPILE_RUNTIME?.wakeSession(id);
         scheduleLearningDrain(session);
         return json(res, { ok: true, round: r.round, mode });
       } catch (e) {
         return json(res, { error: (e as Error).message.slice(0, 200) }, 400);
+      } finally {
+        // Only existing original markers are read; optional post-commit failures cannot hide a completed rollback.
+        try { scheduleVariableInvalidationEvidence(id); }
+        catch { console.warn('[AgentEvidence] VARIABLE_INVALIDATION_DELIVERY_PENDING'); }
       }
     }
 
@@ -4337,7 +9337,7 @@ const server = createServer(async (req, res) => {
       let round = 0;
       let force = false;
       if (method === 'POST') {
-        const parsed = parseStoryIndexPostBody(await readBody(req) as unknown);
+              const parsed = parseStoryIndexPostBody((await readBody(req)) as unknown);
         if (!parsed.ok) return json(res, { error: parsed.error }, 400);
         round = parsed.round;
         force = parsed.force;
@@ -4389,8 +9389,9 @@ const server = createServer(async (req, res) => {
       }
       const dbPath = resolveSessionDatabase(DATA_DIR, `${id}.db`);
       if (!dbPath) return json(res, { error: '会话标识无效' }, 400);
-      const session = sessions.get(id);
-      if (!existsSync(dbPath)) {
+      const durableDeletion = SESSION_DELETION_JOURNAL.get(id);
+      const existedBefore = existsSync(dbPath);
+      if (!existedBefore && !durableDeletion) {
         // CAS 删除的竞争失败必须暴露当前真值 absent；否则第二个客户端只看到普通 404，
         // 无法区分“从未存在”与“基于旧 revision 的并发删除”。
         if (expected !== ABSENT_REVISION) {
@@ -4398,69 +9399,83 @@ const server = createServer(async (req, res) => {
         }
         return json(res, { error: '会话不存在' }, 404);
       }
-      const actual = session
-        ? snapshotForSession(session).snapshotToken
-        : readSessionMeta(dbPath).snapshotToken;
-      if (actual === null) {
+      if (!durableDeletion) {
+        const session = sessions.get(id);
+        const actual = session
+          ? snapshotForSession(session).snapshotToken
+          : readSessionMeta(dbPath).snapshotToken;
+        if (actual === null) {
+          return json(res, {
+            error: {
+              code: 'snapshot_unavailable',
+              message: '会话快照暂时不可用，已拒绝删除以保护本地数据',
+            },
+          }, 503);
+        }
+        if (actual !== expected) return revisionConflict(res, expected, actual, `session:${id}`);
+      }
+      if (expected === ABSENT_REVISION) {
+        return revisionConflict(
+          res,
+          expected,
+          durableDeletion?.sourceRevision ?? ABSENT_REVISION,
+          `session:${id}`,
+        );
+      }
+      const operationId = `sdelete:${createHash('sha256')
+        .update(`${id.length}:${id}:${expected}`)
+        .digest('hex')}`;
+      try {
+        const result = await SESSION_DELETION_COORDINATOR.deleteSession({
+          sessionId: id,
+          operationId,
+          sourceRevision: expected,
+        });
+        if (result.status === 'conflict') {
+          return revisionConflict(res, expected, result.actualRevision, `session:${id}`);
+        }
+        if (result.status === 'accepted') {
+          return revisionJson(res, {
+            ok: false,
+            pending: true,
+            id,
+            code: result.errorCode,
+            snapshotToken: ABSENT_REVISION,
+          }, ABSENT_REVISION, 202);
+        }
+      } catch (error) {
+        const code = (error as Error).message === 'session-deletion-reservation-conflict'
+          ? 'session-delete-in-progress' : 'session-delete-failed';
         return json(res, {
           error: {
-            code: 'snapshot_unavailable',
-            message: '会话快照暂时不可用，已拒绝删除以保护本地数据',
+            code,
+            message: code === 'session-delete-in-progress'
+              ? '会话删除正在收口，请稍后重试'
+              : '会话删除未能安全进入清理流程，请稍后重试',
           },
-        }, 503);
-      }
-      if (actual !== expected) return revisionConflict(res, expected, actual, `session:${id}`);
-      // 学习账本是可重建副本，但主动删除必须同时清除它；若账本不可用则隐私优先、拒绝假成功。
-      if (!AGENT_LEARNING_LEDGER) {
-        return json(res, {
-          error: { code: 'learning_delete_unavailable', message: '学习证据暂时无法安全清理，已拒绝删除会话' },
-        }, 503);
-      }
-      try {
-        AGENT_LEARNING_LEDGER.deleteScope({ sessionId: opaqueLearningToken('session', id) });
-      } catch {
-        return json(res, {
-          error: { code: 'learning_delete_failed', message: '学习证据清理失败，已拒绝删除会话' },
-        }, 503);
-      }
-      try {
-        ARC_PROJECTIONS?.deleteSession(id);
-        maintenanceJobs.deleteSession(id);
-      } catch {
-        return json(res, {
-          error: { code: 'arc_projection_delete_failed', message: '剧情弧投影清理失败，已拒绝删除会话' },
-        }, 503);
-      }
-      if (session) { try { session.close(); } catch { /* 忽略 */ } }
-      sessions.delete(id);
-      // DSH 插件会话销毁事件（whale-widget 清理每轮消耗聚合桶）
-      dshHost.emitSessionDisposed({ id, card: session?.getCardName() });
-      let removed = false;
-      try {
-        for (const suffix of ['', '-wal', '-shm']) {
-          const f = suffix ? `${dbPath}${suffix}` : dbPath;
-          if (existsSync(f)) { rmSync(f, { force: true }); removed = true; }
-        }
-      } catch (e) {
-        return json(res, { error: (e as Error).message.slice(0, 200) }, 400);
+        }, code === 'session-delete-in-progress' ? 409 : 503);
       }
       eventHub.publish({
         type: 'session.deleted',
         resource: { kind: 'session', id, revision: ABSENT_REVISION },
         requestId,
       });
-      return revisionJson(res, { ok: true, removed, id, snapshotToken: ABSENT_REVISION }, ABSENT_REVISION);
+      return revisionJson(res, {
+        ok: true,
+        removed: existedBefore,
+        id,
+        snapshotToken: ABSENT_REVISION,
+      }, ABSENT_REVISION);
     }
 
-    const agentControlMutationAccess = (): ReturnType<typeof authorizeAgentControlMutation> => (
+      const agentControlMutationAccess = (): ReturnType<typeof authorizeAgentControlMutation> =>
       authorizeAgentControlMutation({
         runtime: AGENT_CONTROL_MUTATION_RUNTIME,
         authority: authority.authority,
         localAuthorities: LOCAL_AUTHORITIES,
         accessMode: ACCESS_MODE,
         authenticatedAdmin: authenticatedContext?.isAdmin === true,
-      })
-    );
+          });
 
     if (method === 'POST' && p === '/api/agent-control') {
       const access = agentControlMutationAccess();
@@ -4520,53 +9535,96 @@ const server = createServer(async (req, res) => {
             }, 404);
           }
           if (mutation.operation === 'reject-maintenance-proposal') {
-            const control = maintenanceJobs.rejectPendingProposal({
-              proposalId: mutation.proposalId,
-              expectedRevision: mutation.expectedRevision,
-              reason: mutation.reasonCode,
-            });
-            securityAuditSpan?.annotate({ reasonCode: 'maintenance-proposal-rejected' });
+            if (!sessionDeletionAdmissionOpen(proposal.sessionId)) {
+              throw new Error('maintenance-proposal-session-deleting');
+            }
+            const proposalSession = await loadSessionById(proposal.sessionId);
+            if (!proposalSession) throw new Error('maintenance-proposal-session-not-found');
+            if (!sessionDeletionAdmissionOpen(proposal.sessionId)) {
+              throw new Error('maintenance-proposal-session-deleting');
+            }
+            // Always pass through the typed control so a session-DB write that committed
+            // just before a control-DB crash is recovered as applied, never hidden as rejected.
+            const control = maintenanceProposalControlFor(proposal.sessionId, proposalSession).reject(
+              mutation.proposalId,
+              mutation.expectedRevision,
+              mutation.reasonCode,
+            );
+            if ((proposal.taskKind === 'memory_consolidation' || proposal.taskKind === 'rolling_summary')
+              && control.status === 'applied') {
+              eventHub.publish({
+                type: 'session.updated',
+                resource: {
+                  kind: 'session', id: proposal.sessionId,
+                  revision: snapshotForSession(proposalSession).snapshotToken,
+                },
+                requestId,
+                runId: proposal.jobRunId,
+                data: { status: `maintenance-${proposal.taskKind}-applied` },
+              });
+            }
+            securityAuditSpan?.annotate({ reasonCode: `maintenance-proposal-${control.status}` });
             return json(res, { ok: true, control });
           }
           if (mutation.operation === 'approve-maintenance-proposal'
-            && !maintenanceApplyAllowsSession(MAINTENANCE_APPLY_RUNTIME, proposal.sessionId)) {
+            && !maintenanceProposalApplySupported(
+              MAINTENANCE_APPLY_RUNTIME,
+              proposal.sessionId,
+              proposal.taskKind,
+            )) {
             throw new Error('maintenance-proposal-apply-disabled');
           }
-          if (!ARC_PROJECTIONS) throw new Error('maintenance-proposal-control-unavailable');
           const proposalSession = await loadSessionById(proposal.sessionId);
           if (!proposalSession) throw new Error('maintenance-proposal-session-not-found');
-          const control = new MaintenanceProposalControl({
-            manager: maintenanceJobs,
-            arcStore: ARC_PROJECTIONS,
-            currentRevision: (sessionId) => {
-              if (sessionId !== proposal.sessionId) throw new Error('maintenance-proposal-session-conflict');
-              return snapshotForSession(proposalSession).snapshotToken;
-            },
-            ...createNpcMaintenanceProposalAdapters({
-              dataDir: DATA_DIR,
-              currentRevision: (sessionId) => {
-                if (sessionId !== proposal.sessionId) throw new Error('maintenance-proposal-session-conflict');
-                return snapshotForSession(proposalSession).snapshotToken;
-              },
-            }),
-          });
+          if (!sessionDeletionAdmissionOpen(proposal.sessionId)) {
+            throw new Error('maintenance-proposal-session-deleting');
+          }
+          const control = maintenanceProposalControlFor(proposal.sessionId, proposalSession);
+          if (mutation.operation === 'approve-maintenance-proposal') {
+            const reviewItems = maintenanceProposalReviewItems(proposal, proposalSession);
+            if (!reviewItems?.length) throw new Error('maintenance-proposal-review-required');
+            if (!maintenanceReviewHasApplicableWrite(reviewItems)) {
+              throw new Error('maintenance-proposal-no-applicable-write');
+            }
+          }
           const updated = mutation.operation === 'approve-maintenance-proposal'
             ? control.approve(mutation.proposalId, mutation.expectedRevision)
             : control.rollback(mutation.proposalId, mutation.expectedRevision);
+          if ((proposal.taskKind === 'memory_consolidation' || proposal.taskKind === 'rolling_summary')
+            && (updated.status === 'applied' || updated.status === 'rolled_back')) {
+            eventHub.publish({
+              type: 'session.updated',
+              resource: {
+                kind: 'session', id: proposal.sessionId,
+                revision: snapshotForSession(proposalSession).snapshotToken,
+              },
+              requestId,
+              runId: proposal.jobRunId,
+              data: { status: `maintenance-${proposal.taskKind}-${updated.status}` },
+            });
+          }
           securityAuditSpan?.annotate({ reasonCode: `maintenance-proposal-${updated.status}` });
           return json(res, { ok: true, control: updated });
         }
         if (mutation.operation === 'clear-preference-profile') {
+          if (!sessionDeletionAdmissionOpen(mutation.sessionId)) {
+            throw new Error('preference-profile-session-deleting');
+          }
           const session = await loadSessionById(mutation.sessionId);
           if (!session) {
             return dshJson(res, {
               error: '会话不存在', code: 'preference-profile-session-not-found', requestId,
             }, 404);
           }
+          if (!sessionDeletionAdmissionOpen(mutation.sessionId)) {
+            throw new Error('preference-profile-session-deleting');
+          }
           const control = session.clearPreferenceProfiles({
             expectedRevision: mutation.expectedRevision,
             operationId: mutation.operationId,
           });
+          LEARNING_PREFERENCE_SOURCE_SCHEDULER?.schedule(mutation.sessionId);
+          EXPLICIT_PREFERENCE_EVIDENCE_SCHEDULER?.schedule(mutation.sessionId);
           try {
             if (!LEARNING_OUTBOX_DRAINER) throw new Error('agent-learning-ledger-unavailable');
             LEARNING_OUTBOX_DRAINER.syncPreferenceFences(session);
@@ -4591,6 +9649,15 @@ const server = createServer(async (req, res) => {
           mutation,
           { styleProposals: LEARNED_STYLE_PROPOSALS },
         );
+        // P16 C2.3：Style 提案的转换证据（写后回读在 observeStyleCompileControl 内部）。
+        // 业务转换已提交，观测失败不得影响响应。
+        if (mutation.operation === 'approve-style-proposal') {
+          observeStyleCompileControl(control as StyleProposal, 'applied');
+        } else if (mutation.operation === 'rollback-style-proposal') {
+          observeStyleCompileControl(control as StyleProposal, 'reverted');
+        } else if (mutation.operation === 'disable-style-proposal') {
+          observeStyleCompileControl(control as StyleProposal, 'disabled');
+        }
         securityAuditSpan?.annotate({ reasonCode: `agent-control-${body.operation}-ok` });
         const publicControl = mutation.operation === 'disable-style-proposal'
           || mutation.operation === 'approve-style-proposal'
@@ -4613,6 +9680,11 @@ const server = createServer(async (req, res) => {
           || code === 'learning-preference-clear-operation-intent-conflict'
           || code === 'style-proposal-revision-conflict'
           || code === 'maintenance-proposal-revision-conflict'
+          || code === 'maintenance-proposal-review-required'
+          || code === 'maintenance-proposal-no-applicable-write'
+          || code === 'maintenance-proposal-source-revision-stale'
+          || code === 'maintenance-proposal-session-deleting'
+          || code === 'preference-profile-session-deleting'
           || code === 'npc-maintenance-rollback-revision-conflict'
           || code === 'worldbook-repair-proposal-revision-conflict'
           || code === 'worldbook-repair-source-revision-conflict'
@@ -4636,16 +9708,118 @@ const server = createServer(async (req, res) => {
                 || code === 'lane-recovery-evidence-not-operational'
                 || code === 'lane-recovery-evidence-stale-recorded-at'
                 || code === 'lane-recovery-evidence-stale-captured-at'
+                || code === 'known-defect-correction-already-applied'
+                || code === 'known-defect-kill-signature-mismatch'
+                || code === 'known-defect-observation-signature-mismatch'
+                || code === 'known-defect-other-permanent-evidence-present'
+                || code === 'known-defect-window-not-quiescent'
+                || code === 'known-defect-evidence-missing'
+                || code === 'known-defect-evidence-not-operational'
+                || code === 'known-defect-evidence-stale-recorded-at'
+                || code === 'known-defect-evidence-stale-captured-at'
+                || code === 'capability-quality-recovery-required'
+                || code === 'capability-kill-reason-conflict'
                 || code === 'capability-not-killed'
                 || code === 'style-proposal-already-disabled'
                 || code === 'style-proposal-already-enabled'
                 || code === 'style-proposal-not-enabled'
                 || code === 'style-proposal-rollback-version-invalid'
                 || code === 'agent-control-noop' ? 409 : 400;
-        const publicCode = /^agent-control-[a-z-]+$|^lane-[a-z-]+$|^capability-[a-z-]+$|^style-proposal-[a-z-]+$|^learning-preference-[a-z-]+$|^preference-profile-[a-z-]+$|^maintenance-proposal-[a-z-]+$|^npc-maintenance-[a-z-]+$|^worldbook-repair-[a-z-]+$/u.test(code)
+        const publicCode = /^agent-control-[a-z-]+$|^lane-[a-z-]+$|^known-defect-[a-z-]+$|^capability-[a-z-]+$|^style-proposal-[a-z-]+$|^learning-preference-[a-z-]+$|^preference-profile-[a-z-]+$|^maintenance-proposal-[a-z-]+$|^npc-maintenance-[a-z-]+$|^worldbook-repair-[a-z-]+$/u.test(code)
           ? code : 'agent-control-mutation-failed';
         securityAuditSpan?.annotate({ reasonCode: publicCode });
         return dshJson(res, { error: 'Agent 控制操作未应用', code: publicCode, requestId }, status);
+      }
+    }
+
+    // P15-C：NSFW 场景策展的可信安全控制面。secured 模式由 route manifest
+    // 强制 admin + CSRF；local-only 模式仍受 loopback authority 约束。服务端只接受
+    // 当前会话实际加载的世界书，并把声明绑定到其 sourceRevision。浏览器 localStorage
+    // 和模型生成内容都不参与授权。
+    const nsfwSceneSafetyRoute = matchRouteTemplate('/api/session/:sessionId/nsfw-scene-safety', p);
+    if ((method === 'GET' || method === 'POST') && nsfwSceneSafetyRoute) {
+      const id = nsfwSceneSafetyRoute.sessionId;
+      if (!isSafeOpaqueId(id)) {
+        return json(res, { error: 'sessionId 非法', code: 'session-id-invalid' }, 400);
+      }
+      const dbPath = resolveSessionDatabase(DATA_DIR, `${id}.db`);
+      if (!dbPath || !existsSync(dbPath)) {
+        return json(res, { error: '会话不存在', code: 'session-not-found' }, 404);
+      }
+          const session = sessions.get(id) ?? (await loadSessionById(id));
+      if (!session) return json(res, { error: '会话不存在', code: 'session-not-found' }, 404);
+      const manifest = session.getWorldbookSourceManifest();
+      try {
+        let turnAbort: ReturnType<ChatSession['abortActiveTurn']> | null = null;
+        let safety;
+        if (method === 'GET') {
+          safety = NSFW_SCENE_SAFETY_CONTROL.read({ dbPath, sessionId: id, manifest });
+        } else {
+          const update = parseNsfwSceneSafetyUpdate(await readBody(req));
+          safety = NSFW_SCENE_SAFETY_CONTROL.update({
+            dbPath,
+            sessionId: id,
+            manifest,
+            request: update,
+          });
+          // Withdrawal is safety-dominant: stop an already assembled/in-flight
+          // turn as well as closing the gate for every subsequent turn.
+          if (!safety.enabled) {
+            const activeJob = turnJobs.getActiveForSession(id);
+            if (activeJob) {
+              try { turnJobs.cancel(activeJob.runId); } catch { /* resolver is already revoked */ }
+            }
+            const activeTurn = session.getActiveTurnState();
+            if (activeTurn.active) turnAbort = session.abortActiveTurn(activeTurn.runId, activeTurn.round);
+          }
+          await CONTEXT_COMPILER_SHADOW_RUNNER.cancelSession(id);
+          if (DIRECTOR_CREATIVE_SERVICE) {
+            try { await DIRECTOR_CREATIVE_SERVICE.quiesceSession(id); }
+            finally { DIRECTOR_CREATIVE_SERVICE.releaseQuiescence(id); }
+          }
+          // Remember the attestation device-wide, including revocations: a withdrawn consent
+          // must not be inherited by the next new session.
+          try {
+            NSFW_SCENE_ATTESTATION_MEMORY.record({
+              adultAttestation: update.adultAttestation,
+              participantsAdult: update.participantsAdult,
+              consent: update.consent,
+              allowedWorldbooks: safety.allowedWorldbooks,
+            });
+          } catch (memoryError) {
+            console.warn('[NsfwSafety] 电脑级授权记忆写入失败（仅影响新会话预填）:',
+              memoryError instanceof Error ? memoryError.message : memoryError);
+          }
+        }
+        securityAuditSpan?.annotate({ reasonCode: method === 'GET'
+          ? 'nsfw-safety-read-ok'
+          : safety.enabled ? 'nsfw-safety-enabled' : 'nsfw-safety-revoked' });
+        return json(res, {
+          safety,
+          manifest: { books: [...manifest.books], sourceRevision: manifest.sourceRevision },
+          // A brand-new session pre-fills its grant form from the device-level attestation; this
+          // is a pre-fill only — enabling still requires the explicit POST below.
+          ...(method === 'GET' && safety.reasonCode === 'not-configured'
+            ? { inheritedAttestation: NSFW_SCENE_ATTESTATION_MEMORY.readLatest() }
+            : {}),
+          ...(turnAbort ? { turnAbort } : {}),
+        });
+      } catch (error) {
+        if (error instanceof PayloadTooLargeError || error instanceof BodyDeadlineError) throw error;
+        const code = error instanceof NsfwSceneSafetyControlError
+          ? error.code
+          : error instanceof SyntaxError ? 'nsfw-safety-request-invalid'
+            : 'nsfw-safety-storage-failed';
+        const status = code === 'nsfw-safety-revision-conflict' ? 409
+          : code === 'nsfw-safety-storage-invalid' || code === 'nsfw-safety-storage-failed' ? 503
+            : 400;
+        securityAuditSpan?.annotate({ reasonCode: code });
+        return json(res, {
+          error: status === 409 ? '安全声明已被其他操作更新，请刷新后重试'
+            : status === 503 ? '安全声明暂时不可用，场景策展保持关闭'
+              : 'NSFW 场景安全设置无效',
+          code,
+        }, status);
       }
     }
 
@@ -4656,6 +9830,55 @@ const server = createServer(async (req, res) => {
       const dbPath = resolveSessionDatabase(DATA_DIR, `${id}.db`);
       if (!dbPath || !existsSync(dbPath)) return json(res, { error: '会话不存在' }, 404);
       const mutationAccess = agentControlMutationAccess();
+      let styleAdoptionEvidence: ReturnType<typeof readStyleCompileAdoptionEvidencePage> = null;
+      let styleEvidenceCursor = 0, styleEvidenceLimit = 10;
+      let variableApplyEvidence: ReturnType<typeof readVariableApplyEvidencePage> | ReturnType<typeof readVariableApplyEvidencePageV2> = null;
+      let variableEvidenceVersion = 1;
+      let variableEvidenceCursor = 0, variableEvidenceLimit = 10;
+      if (url.searchParams.has('styleEvidence') || url.searchParams.has('styleEvidenceCursor')
+          || url.searchParams.has('styleEvidenceLimit')) {
+        res.setHeader('Cache-Control', 'no-store');
+        const cursorText = url.searchParams.get('styleEvidenceCursor') ?? '0';
+        const limitText = url.searchParams.get('styleEvidenceLimit') ?? '10';
+        if (url.searchParams.getAll('styleEvidence').length !== 1 || url.searchParams.get('styleEvidence') !== '1'
+            || url.searchParams.getAll('styleEvidenceCursor').length > 1 || url.searchParams.getAll('styleEvidenceLimit').length > 1
+            || !/^(0|[1-9][0-9]{0,15})$/u.test(cursorText) || !/^[1-9][0-9]?$/u.test(limitText)
+            || !Number.isSafeInteger(Number(cursorText)) || Number(limitText) > 10) {
+          return json(res, { code: 'style-evidence-page-invalid' }, 400);
+        }
+        if (!mutationAccess.allowed) return json(res, { code: 'style-evidence-forbidden' }, 403);
+        if (!sessionDeletionAdmissionOpen(id)) return json(res, { code: 'session-not-found' }, 404);
+        if (!AGENT_EVIDENCE_LEDGER) return json(res, { code: 'style-evidence-unavailable' }, 503);
+        try {
+          styleEvidenceCursor = Number(cursorText); styleEvidenceLimit = Number(limitText);
+          styleAdoptionEvidence = readStyleCompileAdoptionEvidencePage({ path: dbPath, rawSessionId: id,
+            ledger: AGENT_EVIDENCE_LEDGER, allowed: sessionDeletionAdmissionOpen,
+            cursor: styleEvidenceCursor, limit: styleEvidenceLimit });
+          if (!styleAdoptionEvidence) return json(res, { code: 'style-evidence-unavailable' }, 503);
+        } catch { return json(res, { code: 'style-evidence-unavailable' }, 503); }
+      }
+      if (url.searchParams.has('variableEvidence') || url.searchParams.has('variableEvidenceCursor')
+          || url.searchParams.has('variableEvidenceLimit')) {
+        res.setHeader('Cache-Control', 'no-store');
+        const cursorText = url.searchParams.get('variableEvidenceCursor') ?? '0';
+        const limitText = url.searchParams.get('variableEvidenceLimit') ?? '10';
+        if (url.searchParams.getAll('variableEvidence').length !== 1 || !['1', '2'].includes(url.searchParams.get('variableEvidence') ?? '')
+            || url.searchParams.getAll('variableEvidenceCursor').length > 1 || url.searchParams.getAll('variableEvidenceLimit').length > 1
+            || !/^(0|[1-9][0-9]{0,15})$/u.test(cursorText) || !/^[1-9][0-9]?$/u.test(limitText)
+            || !Number.isSafeInteger(Number(cursorText)) || Number(limitText) > 10)
+          return json(res, { code: 'variable-evidence-page-invalid' }, 400);
+        if (!mutationAccess.allowed) return json(res, { code: 'variable-evidence-forbidden' }, 403);
+        if (!sessionDeletionAdmissionOpen(id)) return json(res, { code: 'session-not-found' }, 404);
+        if (!AGENT_EVIDENCE_LEDGER) return json(res, { code: 'variable-evidence-unavailable' }, 503);
+        try {
+          variableEvidenceCursor = Number(cursorText); variableEvidenceLimit = Number(limitText);
+          variableEvidenceVersion = Number(url.searchParams.get('variableEvidence'));
+          variableApplyEvidence = (variableEvidenceVersion === 2 ? readVariableApplyEvidencePageV2 : readVariableApplyEvidencePage)({ path: dbPath, rawSessionId: id,
+            ledger: AGENT_EVIDENCE_LEDGER, allowed: sessionDeletionAdmissionOpen,
+            cursor: variableEvidenceCursor, limit: variableEvidenceLimit });
+          if (!variableApplyEvidence) return json(res, { code: 'variable-evidence-unavailable' }, 503);
+        } catch { return json(res, { code: 'variable-evidence-unavailable' }, 503); }
+      }
       const loadedSession = sessions.get(id);
       const opaqueSessionId = opaqueLearningToken('session', id);
       const learningIdentity = loadedSession?.learningProfileIdentity()
@@ -4679,11 +9902,16 @@ const server = createServer(async (req, res) => {
         ? (loadedSession?.preferenceControlState()
           ?? (learningIdentity ? readSessionPreferenceEvidenceState(dbPath, learningIdentity) : null))
         : null;
-      return json(res, readSessionAgentControl({
+      const agentControlNow = new Date();
+      let contextCompilerCanaryAllowed = false;
+      try { contextCompilerCanaryAllowed = CONTEXT_COMPILER_RUNTIME.mode === 'canary'
+        && contextCompilerRuntimeAllows(parseContextCompilerRuntimeConfig(process.env), id); } catch { /* report disabled */ }
+      const agentControl = readSessionAgentControl({
         rawSessionId: id,
         opaqueSessionId,
         controlStore: AGENT_CONTROL_STORE,
         admissionLedger: AGENT_ADMISSION_LEDGER,
+        contextCompilerCanaryAllowed,
         allowedActions: {
           canChangeLane: mutationAccess.allowed,
           canKill: mutationAccess.allowed,
@@ -4696,23 +9924,67 @@ const server = createServer(async (req, res) => {
         ...(preferenceProfile ? { preferenceProfile } : {}),
         ...(effectiveLearning ? { effectiveLearning } : {}),
         ...(preferenceSyncState ? { preferenceSyncState } : {}),
-        maintenanceProposals: maintenanceJobs.listPendingProposals(id).map((proposal) => ({
+        now: agentControlNow,
+        maintenanceSettings: maintenanceJobs.settings(id),
+        // Exact-session, content-free scheduler diagnostics. The read composer
+        // applies the same rolling-budget helper used by admission so the UI
+        // cannot drift from the actual gate.
+        maintenanceJobs: maintenanceJobs.listAdmissionBudgetWindow(id, agentControlNow.getTime()),
+        // Shadow proposal execution is intentionally independent from any
+        // pre-existing apply backup marker. The read model derives NPC proposal
+        // availability from the Maintenance lane/capability gates only.
+        maintenanceApplyActivationSessions: NPC_MAINTENANCE_ACTIVATION_SESSIONS,
+        maintenanceProposals: maintenanceJobs.listPendingProposals(id).map((proposal) => {
+          const pending = mutationAccess.allowed
+            ? maintenanceJobs.getPendingProposal(proposal.proposalId)
+            : undefined;
+          const reviewItems = pending
+            ? maintenanceProposalReviewItems(pending, loadedSession)
+            : undefined;
+          return {
             id: proposal.proposalId,
             taskKind: proposal.taskKind,
             status: proposal.status,
             proposalDigest: proposal.proposalDigest,
-            itemCount: Number(proposal.diff.itemCount ?? 0),
+            itemCount: proposal.taskKind === 'rolling_summary'
+              ? 1 : Number(proposal.diff.itemCount ?? 0),
             revision: proposal.revision,
             applySupported: maintenanceProposalApplySupported(
               MAINTENANCE_APPLY_RUNTIME,
               id,
               proposal.taskKind,
             ),
+            ...(reviewItems ? { reviewItems } : {}),
             createdAt: proposal.createdAt,
             updatedAt: proposal.updatedAt,
-          })),
-        worldbookRepairProposals: WORLDBOOK_REPAIR_CONTROL_PLANE?.list(id, 50) ?? Object.freeze([]),
-      }));
+          };
+        }),
+        // 变更审阅视图只给本机可操作者（与 canApprove 同一权限源）；
+        // 远端只读客户端拿到的是不含内容的摘要。
+        worldbookRepairProposals: WORLDBOOK_REPAIR_CONTROL_PLANE?.list(id, 50, mutationAccess.allowed)
+          ?? Object.freeze([]),
+      });
+      if (styleAdoptionEvidence || variableApplyEvidence) {
+        if (!sessionDeletionAdmissionOpen(id) || !agentControlMutationAccess().allowed)
+          return json(res, { code: styleAdoptionEvidence ? 'style-evidence-forbidden' : 'variable-evidence-forbidden' }, 403);
+        try {
+          if (styleAdoptionEvidence && (!AGENT_EVIDENCE_LEDGER || JSON.stringify(readStyleCompileAdoptionEvidencePage({ path: dbPath,
+            rawSessionId: id, ledger: AGENT_EVIDENCE_LEDGER, allowed: sessionDeletionAdmissionOpen,
+            cursor: styleEvidenceCursor, limit: styleEvidenceLimit })) !== JSON.stringify(styleAdoptionEvidence)))
+            return json(res, { code: 'style-evidence-unavailable' }, 503);
+        } catch { return json(res, { code: 'style-evidence-unavailable' }, 503); }
+        try {
+          if (variableApplyEvidence && (!AGENT_EVIDENCE_LEDGER || JSON.stringify((variableEvidenceVersion === 2 ? readVariableApplyEvidencePageV2 : readVariableApplyEvidencePage)({ path: dbPath,
+            rawSessionId: id, ledger: AGENT_EVIDENCE_LEDGER, allowed: sessionDeletionAdmissionOpen,
+            cursor: variableEvidenceCursor, limit: variableEvidenceLimit })) !== JSON.stringify(variableApplyEvidence)))
+            return json(res, { code: 'variable-evidence-unavailable' }, 503);
+        } catch { return json(res, { code: 'variable-evidence-unavailable' }, 503); }
+        if (!sessionDeletionAdmissionOpen(id) || !agentControlMutationAccess().allowed)
+          return json(res, { code: styleAdoptionEvidence ? 'style-evidence-forbidden' : 'variable-evidence-forbidden' }, 403);
+        return json(res, { ...agentControl, ...(styleAdoptionEvidence ? { styleAdoptionEvidence } : {}),
+          ...(variableApplyEvidence ? { variableApplyEvidence } : {}) });
+      }
+      return json(res, agentControl);
     }
 
     // 会话历史
@@ -4745,7 +10017,7 @@ const server = createServer(async (req, res) => {
     const snapshotGetRoute = matchRouteTemplate('/api/session/:sessionId/snapshot', p);
     if (method === 'GET' && snapshotGetRoute) {
       const id = snapshotGetRoute.sessionId;
-      const session = sessions.get(id) ?? await loadSessionById(id);
+          const session = sessions.get(id) ?? (await loadSessionById(id));
       if (!session) return json(res, { error: '会话不存在' }, 404);
       const snapshot = snapshotForSession(session);
       return revisionJson(res, {
@@ -4754,6 +10026,30 @@ const server = createServer(async (req, res) => {
         rowCounts: snapshot.rowCounts,
         assets: snapshot.assets,
       }, snapshot.snapshotToken);
+    }
+
+    // Content-addressed tool bodies remain bound to the current Session's own mode and epoch.
+    const toolResultBodyPostRoute = matchRouteTemplate('/api/session/:sessionId/tool-result-body', p);
+    if (method === 'POST' && toolResultBodyPostRoute) {
+      const id = toolResultBodyPostRoute.sessionId;
+      const session = sessions.get(id);
+      if (!session) return json(res, { error: '会话不存在' }, 404);
+      if (shuttingDown || !sessionDeletionAdmissionOpen(id)) {
+        return json(res, { error: '会话不可访问', code: 'session-unavailable' }, 409);
+      }
+      const request = parseToolResultBodyRead(await readBody(req));
+      if (!request) return json(res, { error: '工具正文读取参数非法', code: 'invalid-tool-result-body-read' }, 400);
+      if (shuttingDown || sessions.get(id) !== session || !sessionDeletionAdmissionOpen(id)) {
+        return json(res, { error: '会话不可访问', code: 'session-unavailable' }, 409);
+      }
+      try {
+        return json(res, session.readToolResultBody(request));
+      } catch (error) {
+        if (error instanceof Error && error.message === 'tool-result-body-unavailable') {
+          return json(res, { error: '工具正文不可读取', code: 'tool-result-body-unavailable' }, 404);
+        }
+        throw error;
+      }
     }
 
     // 记忆控制台：双通道检索调试
@@ -4837,13 +10133,33 @@ const server = createServer(async (req, res) => {
       });
     }
 
+    const turnAgentEvidenceRoute = matchRouteTemplate('/api/session/:sessionId/turn-agent-evidence', p);
+    if (method === 'GET' && turnAgentEvidenceRoute) {
+      res.setHeader('Cache-Control', 'no-store');
+      const id = turnAgentEvidenceRoute.sessionId;
+      const session = sessions.get(id);
+      if (!session || !sessionDeletionAdmissionOpen(id)) return json(res, { code: 'session-not-found' }, 404);
+      if (!AGENT_CLOSURE_STORE) return json(res, { code: 'turn-agent-evidence-unavailable' }, 503);
+      try {
+        const evidence = readCurrentTurnAgentEvidence({ sessionId: id, session, closure: AGENT_CLOSURE_STORE,
+          styleJobs: STYLE_COMPILE_RUNTIME,
+          allowed: () => sessions.get(id) === session && sessionDeletionAdmissionOpen(id) });
+        return json(res, { evidence });
+      } catch (error) {
+        const stale = error instanceof Error && error.message === 'turn-agent-evidence-stale';
+        return json(res, { code: stale ? 'turn-agent-evidence-stale' : 'turn-agent-evidence-unavailable' }, stale ? 409 : 503);
+      }
+    }
+
     // 推进槽 / 事件类型 / NSFW 锁定（P2）
     const turnStateGetRoute = matchRouteTemplate('/api/session/:sessionId/turn-state', p);
     if (method === 'GET' && turnStateGetRoute) {
       const id = turnStateGetRoute.sessionId;
       const session = sessions.get(id);
       if (!session) return json(res, { error: '会话不存在' }, 404);
-      return json(res, { state: session.getTurnState(), generation: session.getActiveTurnState(), headVersion: session.memoryHeadVersion() });
+      const progress = turnJobs.progressForSession(id);
+      return json(res, { state: session.getTurnState(), generation: session.getActiveTurnState(),
+        headVersion: session.memoryHeadVersion(), ...(progress ? { progress } : {}) });
     }
 
     // FE-B2：会话级共享脚本运行包（按清单依赖顺序下发真实脚本文本，前端注入到卡脚本之前）
@@ -4976,12 +10292,16 @@ const server = createServer(async (req, res) => {
         if (!state || typeof state !== 'object' || Array.isArray(state)) {
           return json(res, { error: 'state 必须为对象' }, 400);
         }
-        const replaced = session.replaceMvuState(
-          state as Record<string, unknown>,
-          ref,
-          { ...opts, expectedVersion: typeof body.expectedVersion === 'number' ? body.expectedVersion : undefined },
+              const replaced = session.replaceMvuState(state as Record<string, unknown>, ref, {
+                  ...opts,
+                  expectedVersion: typeof body.expectedVersion === 'number' ? body.expectedVersion : undefined,
+              });
+              if (!replaced.ok)
+                  return json(
+                      res,
+                      { error: replaced.error, code: replaced.code },
+                      replaced.code === 'unresolved' ? 404 : 409,
         );
-        if (!replaced.ok) return json(res, { error: replaced.error, code: replaced.code }, replaced.code === 'unresolved' ? 404 : 409);
         return json(res, replaced);
       }
 
@@ -5033,7 +10353,7 @@ const server = createServer(async (req, res) => {
       if (expected === null) return;
       const body = await readBody(req);
       const requestedName = String(body.name ?? session.getPrimaryWorldbook() ?? '').trim();
-      const changed = Array.isArray(body.changed) ? body.changed as TavernHelperEntry[] : [];
+          const changed = Array.isArray(body.changed) ? (body.changed as TavernHelperEntry[]) : [];
       if (!requestedName) return json(res, { error: '缺少世界书文件名' }, 400);
       const file = readAssetReference('worldbook', requestedName);
       if (!file) return json(res, { error: '世界书引用非法' }, 400);
@@ -5048,9 +10368,12 @@ const server = createServer(async (req, res) => {
         return json(res, { error: `变更条目未能匹配任何现有条目（uid 不匹配）`, missed }, 409);
       }
       try {
-        const mutation = saveUserAssetCas('worldbook', file, JSON.stringify(parsed, null, 2), expected);
+        const { mutation, identity } = AGENT_CONTROL_STORE.withAssetMutation(() => {
+          const mutation = saveUserAssetCas('worldbook', file, JSON.stringify(parsed, null, 2), expected);
+          const identity = ensureAssetIdentityInMutation('worldbook', file);
+          return { mutation, identity };
+        });
         const { entries } = rawEntriesOf(parsed);
-        const identity = ensureAssetIdentity('worldbook', file);
         eventHub.publish({
           type: 'asset.changed',
           resource: { kind: 'asset', id: `worldbook:${identity.assetId}`, revision: mutation.revision },
@@ -5082,6 +10405,90 @@ const server = createServer(async (req, res) => {
       }
       const merged = session.setGlobalVars(values as Record<string, unknown>);
       return json(res, { ok: true, values: merged });
+    }
+
+    // ── Agent Provider 独立路由（只保存 mode/providerId/model；继承模式实时跟随主选择）──
+    if (method === 'GET' && p === '/api/agent-provider') {
+      try {
+        // P16 T-1：凭据封锁（测试安全门）下不得读取 agent-provider.json。
+        const config = loadAgentProviderConfig({ ignoreFile: credentialLockdownActive() });
+        const main = loadProviderConfig();
+        const effective = config.mode === 'inherit-main'
+          ? { providerId: main.providerId, model: main.model }
+          : { providerId: config.providerId, model: config.model };
+        const descriptor = providerRegistry.describe(effective.providerId);
+        return json(res, {
+          ok: true,
+          mode: config.mode,
+          ...(config.mode === 'override'
+            ? { providerId: config.providerId, model: config.model }
+            : {}),
+          effectiveProviderId: effective.providerId,
+          effectiveModel: effective.model,
+          available: descriptor?.configured === true,
+          ...(descriptor ? { provider: descriptor } : {}),
+        });
+      } catch (error) {
+        if (error instanceof AgentProviderConfigFileError) {
+          return json(res, { ok: false, code: 'agent-provider-config-invalid', error: error.message }, 409);
+        }
+        throw error;
+      }
+    }
+
+    if (method === 'POST' && p === '/api/agent-provider') {
+      if (!PROVIDER_SPI_ENABLED) {
+        return json(res, {
+          ok: false,
+          code: 'provider-spi-disabled',
+          error: 'Provider SPI 已由 JG_PROVIDER_SPI=0 关闭',
+        }, 409);
+      }
+      const body = await readBody(req);
+      const allowedKeys = new Set(['mode', 'providerId', 'model']);
+      if (Object.keys(body).some((key) => !allowedKeys.has(key))) {
+        return json(res, { ok: false, code: 'invalid-agent-provider', error: 'Agent Provider 配置包含未知字段' }, 400);
+      }
+      let config: AgentProviderConfig;
+      try {
+        config = normalizeAgentProviderConfig(body);
+      } catch {
+        return json(res, { ok: false, code: 'invalid-agent-provider', error: 'Agent Provider 配置非法' }, 400);
+      }
+      if (config.mode === 'override') {
+        const descriptor = providerRegistry.describe(config.providerId);
+        if (!descriptor) {
+          return json(res, {
+            ok: false,
+            code: 'not-found',
+            error: `Provider 不可用: ${config.providerId}`,
+          }, 404);
+        }
+        if (!descriptor.configured) {
+          return json(res, {
+            ok: false,
+            code: 'not-configured',
+            error: `Provider 未配置: ${config.providerId}`,
+          }, 409);
+        }
+      }
+      writeAgentProviderConfig(config);
+      const main = loadProviderConfig();
+      const effective = config.mode === 'inherit-main'
+        ? { providerId: main.providerId, model: main.model }
+        : { providerId: config.providerId, model: config.model };
+      const descriptor = providerRegistry.describe(effective.providerId);
+      return json(res, {
+        ok: true,
+        mode: config.mode,
+        ...(config.mode === 'override'
+          ? { providerId: config.providerId, model: config.model }
+          : {}),
+        effectiveProviderId: effective.providerId,
+        effectiveModel: effective.model,
+        available: descriptor?.configured === true,
+        ...(descriptor ? { provider: descriptor } : {}),
+      });
     }
 
     // ── P4 ProviderRegistry 管理面（公开 descriptor 白名单；不含 key/baseUrl/cookie）──
@@ -5517,7 +10924,7 @@ const server = createServer(async (req, res) => {
       return json(res, { ok: true, removed });
     }
 
-    // 服务端代理抓取外部前端页文本（如卡自带 external-page/index.html；浏览器 fetch 跨域受限，由服务器侧解决 CORS）
+    // 服务端代理抓取外部前端页文本（如卡自带 sample-phone-host/index.html；浏览器 fetch 跨域受限，由服务器侧解决 CORS）
     if (method === 'POST' && p === '/api/assets/page') {
       if (AUTH_RUNTIME) {
         req.resume();
@@ -5585,6 +10992,9 @@ const server = createServer(async (req, res) => {
     if (method === 'GET' && p === '/api/regex-rules') {
       const urlQ = new URL(req.url ?? '/', `http://${req.headers.host}`);
       const sid = urlQ.searchParams.get('session') ?? '';
+      if (isSafeOpaqueId(sid, 160) && !sessionDeletionAdmissionOpen(sid)) {
+        return json(res, { error: '会话正在删除，暂时拒绝访问', code: 'session-deleting' }, 409);
+      }
       const session = sid ? sessions.get(sid) : null;
       if (!session) return json(res, { rules: regexLibrary.list() });
       const cardName = session.getCardName();
@@ -5605,7 +11015,7 @@ const server = createServer(async (req, res) => {
     // 保存/更新规则（builtin 可覆盖启用状态）
     if (method === 'POST' && p === '/api/regex-rules/save') {
       const body = await readBody(req);
-      const rule = body.rule && typeof body.rule === 'object' ? body.rule as Record<string, unknown> : null;
+          const rule = body.rule && typeof body.rule === 'object' ? (body.rule as Record<string, unknown>) : null;
       if (!rule || typeof rule.id !== 'string' || typeof rule.findRegex !== 'string') {
         return json(res, { error: '规则缺少 id/findRegex' }, 400);
       }
@@ -5712,7 +11122,9 @@ const server = createServer(async (req, res) => {
           raw,
           pngBuffer: pngBuf,
         });
-        const mutation = ASSET_IMPORT_TRANSACTIONS.commit(prepared);
+        const mutation = AGENT_CONTROL_STORE.withAssetMutation(
+          () => ASSET_IMPORT_TRANSACTIONS.commit(prepared),
+        );
         const identity = mutation.identity;
         if (upload.kind === 'card') sessionCardFileCache.clear();
         eventHub.publish({
@@ -5746,13 +11158,20 @@ const server = createServer(async (req, res) => {
       const expected = expectedRevision(req, res);
       if (expected === null) return;
       const body = await readBody(req);
-      const filename = (body.filename ?? '').toString().trim();
+      const filename = (body.filename ?? '').toString();
       const format = body.format === 'png' ? 'png' : 'json';
       const data = (body.data ?? '').toString();
-      if (!filename) return json(res, { error: '缺少文件名' }, 400);
+      if (!filename.trim()) return json(res, { error: '缺少文件名' }, 400);
+      if (!isSafeAssetFileName(filename)) return json(res, { error: '文件名非法' }, 400);
       if (!data || data.length > MAX_IMPORT) return json(res, { error: '文件过大或为空' }, 400);
       const name = filename.replace(/\.(json|png)$/i, '');
       if (!name) return json(res, { error: '文件名非法' }, 400);
+      const jsonFile = `${name}.json`;
+      const pngFile = `${name}.png`;
+      if (!isSafeAssetFileName(jsonFile)
+        || (format === 'png' && !isSafeAssetFileName(pngFile))) {
+        return json(res, { error: '文件名非法' }, 400);
+      }
       let cardJson: string;
       let pngBuf: Buffer | null = null;
       if (format === 'png') {
@@ -5769,23 +11188,32 @@ const server = createServer(async (req, res) => {
       } catch (e) {
         return json(res, { error: `角色卡校验失败: ${(e as Error).message.slice(0, 120)}` }, 400);
       }
-      const jsonFile = `${name}.json`;
-      let mutation: ReturnType<typeof saveUserAssetCas>;
+      let committed: {
+        mutation: ReturnType<typeof saveUserAssetCas>;
+        identity: LocalAssetIdentity;
+        pngSaved: boolean;
+      };
       try {
-        mutation = saveUserAssetCas('card', jsonFile, cardJson, expected);
+        committed = AGENT_CONTROL_STORE.withAssetMutation(() => {
+          const mutation = saveUserAssetCas('card', jsonFile, cardJson, expected);
+          let pngSaved = false;
+          if (pngBuf) {
+            try {
+              saveAssetBuffer('card', pngFile, pngBuf);
+              pngSaved = true;
+                      } catch {
+                          /* 规范 JSON 已是完整业务真值；PNG 原件失败不回滚卡片 */
+          }
+                  }
+                  const identity = ensureAssetIdentityInMutation('card', jsonFile, parsedCard.card.name || name);
+          return { mutation, identity, pngSaved };
+        });
       } catch (error) {
         if (assetConflict(res, error)) return;
         throw error;
       }
-      let pngSaved = false;
-      if (pngBuf) {
-        try {
-          saveAssetBuffer('card', `${name}.png`, pngBuf);
-          pngSaved = true;
-        } catch { /* 规范 JSON 已是完整业务真值；PNG 原件失败不回滚卡片 */ }
-      }
+      const { mutation, identity, pngSaved } = committed;
       sessionCardFileCache.clear();
-      const identity = ensureAssetIdentity('card', jsonFile, parsedCard.card.name || name);
       eventHub.publish({
         type: 'asset.changed',
         resource: { kind: 'asset', id: `card:${identity.assetId}`, revision: mutation.revision },
@@ -5829,20 +11257,23 @@ const server = createServer(async (req, res) => {
       const base = file.replace(/\.json$/i, '');
       const wbName = parsed.card.data.character_book?.name || `${base}-世界书`;
       const wbFile = `${base.replace(/[\\/:*?"<>|]/g, '_')}-世界书.json`;
-      let mutation: ReturnType<typeof saveUserAssetCas>;
+      let committed: {
+        mutation: ReturnType<typeof saveUserAssetCas>;
+        identity: LocalAssetIdentity;
+      };
       try {
-        parseWorldBook(JSON.stringify({ name: wbName, entries: wbEntries }, null, 2)); // 强校验后再落盘
-        mutation = saveUserAssetCas(
-          'worldbook',
-          wbFile,
-          JSON.stringify({ name: wbName, entries: wbEntries }, null, 2),
-          expected,
-        );
+        const worldbookRaw = JSON.stringify({ name: wbName, entries: wbEntries }, null, 2);
+        parseWorldBook(worldbookRaw); // 强校验后再落盘
+        committed = AGENT_CONTROL_STORE.withAssetMutation(() => {
+          const mutation = saveUserAssetCas('worldbook', wbFile, worldbookRaw, expected);
+          const identity = ensureAssetIdentityInMutation('worldbook', wbFile, wbName);
+          return { mutation, identity };
+        });
       } catch (e) {
         if (assetConflict(res, e)) return;
         return json(res, { error: `世界书生成失败: ${(e as Error).message.slice(0, 120)}` }, 400);
       }
-      const identity = ensureAssetIdentity('worldbook', wbFile, wbName);
+      const { mutation, identity } = committed;
       eventHub.publish({
         type: 'asset.changed',
         resource: { kind: 'asset', id: `worldbook:${identity.assetId}`, revision: mutation.revision },
@@ -5865,8 +11296,11 @@ const server = createServer(async (req, res) => {
       const file = readAssetReference('card', body.assetId ?? body.file);
       if (!file) return json(res, { error: '角色卡引用非法' }, 400);
       try {
-        const mutation = deleteUserCardCas(file, expected);
-        const identity = ensureAssetIdentity('card', file);
+        const { mutation, identity } = AGENT_CONTROL_STORE.withAssetMutation(() => {
+          const mutation = deleteUserCardCas(file, expected);
+          const identity = ensureAssetIdentityInMutation('card', file);
+          return { mutation, identity };
+        });
         sessionCardFileCache.clear();
         eventHub.publish({
           type: 'asset.changed',
@@ -5944,8 +11378,11 @@ const server = createServer(async (req, res) => {
         return json(res, { error: `预设校验失败: ${(e as Error).message.slice(0, 120)}` }, 400);
       }
       try {
-        const mutation = saveUserAssetCas('preset', filename, raw, expected);
-        const identity = ensureAssetIdentity('preset', filename);
+        const { mutation, identity } = AGENT_CONTROL_STORE.withAssetMutation(() => {
+          const mutation = saveUserAssetCas('preset', filename, raw, expected);
+          const identity = ensureAssetIdentityInMutation('preset', filename);
+          return { mutation, identity };
+        });
         eventHub.publish({ type: 'asset.changed', resource: { kind: 'asset', id: `preset:${identity.assetId}`, revision: mutation.revision }, requestId });
         return revisionJson(res, { ok: true, assetId: identity.assetId, file: filename }, mutation.revision);
       } catch (error) {
@@ -5984,8 +11421,11 @@ const server = createServer(async (req, res) => {
         return json(res, { error: `世界书校验失败: ${(e as Error).message.slice(0, 120)}` }, 400);
       }
       try {
-        const mutation = saveUserAssetCas('worldbook', filename, raw, expected);
-        const identity = ensureAssetIdentity('worldbook', filename);
+        const { mutation, identity } = AGENT_CONTROL_STORE.withAssetMutation(() => {
+          const mutation = saveUserAssetCas('worldbook', filename, raw, expected);
+          const identity = ensureAssetIdentityInMutation('worldbook', filename);
+          return { mutation, identity };
+        });
         eventHub.publish({ type: 'asset.changed', resource: { kind: 'asset', id: `worldbook:${identity.assetId}`, revision: mutation.revision }, requestId });
         return revisionJson(res, { ok: true, assetId: identity.assetId, file: filename }, mutation.revision);
       } catch (error) {
@@ -6013,7 +11453,7 @@ const server = createServer(async (req, res) => {
     // 预设列表（用户层 + 源，source 标记）
     if (method === 'GET' && p === '/api/presets') {
       const listedPresets = listAssets('preset');
-      ASSET_IDENTITIES.ensureDiscovered(listedPresets.map((asset) => ({
+      ensureDiscoveredAssetIdentities(listedPresets.map((asset) => ({
         kind: 'preset',
         storageKey: asset.file,
         displayName: asset.name,
@@ -6065,13 +11505,20 @@ const server = createServer(async (req, res) => {
       if (expected === null) return;
       const body = await readBody(req);
       const file = readAssetReference('preset', body.assetId ?? body.file);
-      const prompts = Array.isArray(body.prompts) ? body.prompts as { role?: string; name?: string; enabled?: boolean; content?: string }[] : [];
+          const prompts = Array.isArray(body.prompts)
+              ? (body.prompts as { role?: string; name?: string; enabled?: boolean; content?: string }[])
+              : [];
       if (!file) return json(res, { error: '缺少或无法解析预设引用' }, 400);
       if (prompts.some((x) => typeof x.content !== 'string')) return json(res, { error: 'prompts 缺少 content' }, 400);
       const payload = JSON.stringify({ name: body.name ?? file.replace(/\.json$/, ''), prompts }, null, 2);
       try {
-        const mutation = saveUserAssetCas('preset', file, payload, expected);
-        const identity = ensureAssetIdentity('preset', file, String(body.name ?? assetDisplayName(file)));
+        const { mutation, identity } = AGENT_CONTROL_STORE.withAssetMutation(() => {
+          const mutation = saveUserAssetCas('preset', file, payload, expected);
+          const identity = ensureAssetIdentityInMutation(
+            'preset', file, String(body.name ?? assetDisplayName(file)),
+          );
+          return { mutation, identity };
+        });
         eventHub.publish({ type: 'asset.changed', resource: { kind: 'asset', id: `preset:${identity.assetId}`, revision: mutation.revision }, requestId });
         return revisionJson(res, {
           ok: true,
@@ -6095,8 +11542,11 @@ const server = createServer(async (req, res) => {
       const file = readAssetReference('preset', body.assetId ?? body.file);
       if (!file) return json(res, { error: '预设引用非法' }, 400);
       try {
-        const mutation = deleteUserAssetCas('preset', file, expected);
-        const identity = ensureAssetIdentity('preset', file);
+        const { mutation, identity } = AGENT_CONTROL_STORE.withAssetMutation(() => {
+          const mutation = deleteUserAssetCas('preset', file, expected);
+          const identity = ensureAssetIdentityInMutation('preset', file);
+          return { mutation, identity };
+        });
         eventHub.publish({ type: 'asset.changed', resource: { kind: 'asset', id: `preset:${identity.assetId}`, revision: mutation.revision }, requestId });
         return revisionJson(res, {
           ok: true,
@@ -6114,7 +11564,7 @@ const server = createServer(async (req, res) => {
     // 世界书列表（用户层 + 源）
     if (method === 'GET' && p === '/api/worldbooks') {
       const listedWorldbooks = listAssets('worldbook');
-      ASSET_IDENTITIES.ensureDiscovered(listedWorldbooks.map((asset) => ({
+      ensureDiscoveredAssetIdentities(listedWorldbooks.map((asset) => ({
         kind: 'worldbook',
         storageKey: asset.file,
         displayName: asset.name,
@@ -6170,7 +11620,7 @@ const server = createServer(async (req, res) => {
       if (expected === null) return;
       const body = await readBody(req);
       const file = readAssetReference('worldbook', body.assetId ?? body.file);
-      const entries = Array.isArray(body.entries) ? body.entries as Record<string, unknown>[] : [];
+          const entries = Array.isArray(body.entries) ? (body.entries as Record<string, unknown>[]) : [];
       if (!file) return json(res, { error: '缺少或无法解析世界书引用' }, 400);
       const record: Record<string, unknown> = {};
       for (const e of entries) {
@@ -6180,8 +11630,11 @@ const server = createServer(async (req, res) => {
       }
       const payload = JSON.stringify({ entries: record }, null, 2);
       try {
-        const mutation = saveUserAssetCas('worldbook', file, payload, expected);
-        const identity = ensureAssetIdentity('worldbook', file);
+        const { mutation, identity } = AGENT_CONTROL_STORE.withAssetMutation(() => {
+          const mutation = saveUserAssetCas('worldbook', file, payload, expected);
+          const identity = ensureAssetIdentityInMutation('worldbook', file);
+          return { mutation, identity };
+        });
         eventHub.publish({ type: 'asset.changed', resource: { kind: 'asset', id: `worldbook:${identity.assetId}`, revision: mutation.revision }, requestId });
         return revisionJson(res, {
           ok: true,
@@ -6206,10 +11659,13 @@ const server = createServer(async (req, res) => {
       if (!file) return json(res, { error: '世界书引用非法' }, 400);
       try {
         // force=新建会话列表的全量删除（一次删除当前可见层）；不带 force=恢复源文件。
-        const mutation = body.force === true
-          ? deleteWorldbookFileCas(file, expected)
-          : { ...deleteUserAssetCas('worldbook', file, expected), layer: 'user' as const };
-        const identity = ensureAssetIdentity('worldbook', file);
+        const { mutation, identity } = AGENT_CONTROL_STORE.withAssetMutation(() => {
+          const mutation = body.force === true
+            ? deleteWorldbookFileCas(file, expected)
+            : { ...deleteUserAssetCas('worldbook', file, expected), layer: 'user' as const };
+          const identity = ensureAssetIdentityInMutation('worldbook', file);
+          return { mutation, identity };
+        });
         eventHub.publish({ type: 'asset.changed', resource: { kind: 'asset', id: `worldbook:${identity.assetId}`, revision: mutation.revision }, requestId });
         return revisionJson(res, {
           ok: true,
@@ -6245,9 +11701,71 @@ const server = createServer(async (req, res) => {
     }
 
     // ── Skill 系统（公共格式 data/skills/<name>/SKILL.md）──
+    if (method === 'GET' && p === '/api/skills/shadow-metrics') {
+      res.setHeader('Cache-Control', 'no-store');
+      const selectionMetrics = SESSION_AGENT_SKILL_SHADOW_METRICS.snapshot();
+      const runnerMetrics = SESSION_AGENT_SKILL_SHADOW_RUNNER.snapshot();
+      const contextShadow = CONTEXT_COMPILER_SHADOW_RUNNER.snapshot();
+      const canaryScope = CONTEXT_COMPILER_CANARY?.scope;
+      let canaryEnabled = false;
+      try { canaryEnabled = Boolean(canaryScope && contextCompilerRuntimeAllows(
+        parseContextCompilerRuntimeConfig(process.env), canaryScope.sessionId)); } catch { /* report disabled */ }
+      const catalogCache = SESSION_AGENT_SKILL_SHADOW_CATALOG.snapshot();
+      const shadowEnabled = SESSION_AGENT_SKILL_SHADOW_RUNTIME_CONFIG.enabled;
+      const windowHealth = SESSION_AGENT_SKILL_SHADOW_HEALTH_WINDOW.snapshot(
+        selectionMetrics.catalogRevision,
+        {
+          failed: runnerMetrics.failed,
+          dropped: runnerMetrics.dropped,
+          catalogRefreshFailures: catalogCache.refreshFailures,
+        },
+      );
+      const promotionStatus = evaluateSessionAgentSkillShadowPromotion(selectionMetrics, {
+        enabled: shadowEnabled,
+        validationWindowHealthAligned: windowHealth.aligned,
+        failed: windowHealth.failed,
+        dropped: windowHealth.dropped,
+        inFlight: runnerMetrics.inFlight,
+        pending: runnerMetrics.pending,
+        faulted: runnerMetrics.faulted,
+        catalogRefreshFailures: windowHealth.catalogRefreshFailures,
+      });
+      return json(res, {
+        enabled: shadowEnabled,
+        runtimeConfig: publicAgentSkillShadowRuntimeSummary(
+          SESSION_AGENT_SKILL_SHADOW_RUNTIME_CONFIG,
+        ),
+        metrics: {
+          ...selectionMetrics,
+          ...runnerMetrics,
+          validationWindowHealthAligned: windowHealth.aligned,
+          validationWindowFailed: windowHealth.failed,
+          validationWindowDropped: windowHealth.dropped,
+          validationWindowCatalogRefreshFailures: windowHealth.catalogRefreshFailures,
+          // Selection promotion is based only on turns that actually triggered candidate/legacy
+          // evidence. Runner attempts remain a separate operational-health accounting identity.
+          ...promotionStatus,
+        },
+        catalogCache,
+        contextCompilerCanary: canaryScope && CONTEXT_COMPILER_CANARY ? {
+          configured: true, enabled: canaryEnabled,
+          scope: { sessionCount: 1, providerId: canaryScope.providerId, model: canaryScope.model,
+            profileDigest: canaryScope.profileDigest },
+          ...CONTEXT_COMPILER_CANARY.snapshot(), successMeaning: 'validated-capsule',
+        } : { configured: false, enabled: false },
+        contextCompilerShadow: { configured: CONTEXT_COMPILER_RUNTIME.mode === 'shadow',
+          attempts: contextShadow.attempts, sourceRead: contextShadow.sourceRead, sent: contextShadow.sent,
+          completed: contextShadow.completed, failed: contextShadow.failed, dropped: contextShadow.dropped,
+          cancelled: contextShadow.cancelled, inFlight: contextShadow.inFlight, pending: contextShadow.pending,
+          closed: contextShadow.closed, adopted: contextShadow.adopted, semanticQuality: contextShadow.semanticQuality },
+        stylePackage: { enabled: STYLE_PACKAGE_SHADOW_ENABLED, ...STYLE_PACKAGE_SHADOW.snapshot() },
+        stylePackageCanary: STYLE_PACKAGE_CANARY.snapshot(),
+      });
+    }
     if (method === 'GET' && p === '/api/skills') {
       const { listSkills } = await import('../../packages/core/src/skills.ts');
-      return json(res, { skills: listSkills() });
+      const { buildAgentSkillCatalog } = await import('./agent-skill-read-model.ts');
+      return json(res, buildAgentSkillCatalog(listSkills()));
     }
     if (method === 'POST' && p === '/api/skills/match') {
       const { matchSkills } = await import('../../packages/core/src/skills.ts');
@@ -6283,23 +11801,182 @@ const server = createServer(async (req, res) => {
         return json(res, { error: `文风库导入失败: ${(e as Error).message}` }, 400);
       }
     }
+    if (method === 'POST' && p === '/api/skills/candidates/compile') {
+        const reply = submitSkillCompile(SKILL_COMPILE_RUNTIME, await readBody(req, 8_192));
+        return json(res, reply.body, reply.status);
+    }
+    const skillCompileJobRoute = matchRouteTemplate('/api/skills/compile-jobs/:jobId', p);
+    if (method === 'GET' && skillCompileJobRoute) {
+        const reply = readSkillCompile(SKILL_COMPILE_RUNTIME, skillCompileJobRoute.jobId);
+        return json(res, reply.body, reply.status);
+    }
+    if (method === 'POST' && p === '/api/skills/candidates/evaluate') {
+        const reply = submitSkillEvaluate(SKILL_EVALUATE_RUNTIME, await readBody(req, 4_096));
+        return json(res, reply.body, reply.status);
+    }
+    const skillEvaluateJobRoute = matchRouteTemplate('/api/skills/evaluate-jobs/:jobId', p);
+    if (method === 'GET' && skillEvaluateJobRoute) {
+        const reply = readSkillEvaluate(SKILL_EVALUATE_RUNTIME, skillEvaluateJobRoute.jobId);
+        return json(res, reply.body, reply.status);
+    }
+    if (method === 'POST' && p === '/api/skills/candidates/sample') {
+        const reply = submitSkillSample(SKILL_SAMPLE_RUNTIME, await readBody(req, 4_096));
+        return json(res, reply.body, reply.status);
+    }
+    if (method === 'POST' && p === '/api/skills/candidates/sample-suite') {
+        const reply = submitSkillSampleSuite(SKILL_SAMPLE_RUNTIME, await readBody(req, 4_096));
+        return json(res, reply.body, reply.status);
+    }
+    const skillSampleJobRoute = matchRouteTemplate('/api/skills/sample-jobs/:jobId', p);
+    if (method === 'GET' && skillSampleJobRoute) {
+        const reply = readSkillSample(SKILL_SAMPLE_RUNTIME, skillSampleJobRoute.jobId);
+        return json(res, reply.body, reply.status);
+    }
+    const skillSampleSuiteRoute = matchRouteTemplate('/api/skills/sample-suites/:suiteId', p);
+    if (method === 'GET' && skillSampleSuiteRoute) {
+        const reply = readSkillSampleSuite(SKILL_SAMPLE_RUNTIME, skillSampleSuiteRoute.suiteId);
+        return json(res, reply.body, reply.status);
+    }
+    if (method === 'POST' && p === '/api/skills/candidates/quality-suite') {
+        const reply = submitSkillQualitySuite(SKILL_QUALITY_RUNTIME, await readBody(req, 4_096));
+        return json(res, reply.body, reply.status);
+    }
+    const skillQualitySuiteRoute = matchRouteTemplate('/api/skills/quality-suites/:suiteId', p);
+    if (method === 'GET' && skillQualitySuiteRoute) {
+        const reply = readSkillQualitySuite(SKILL_QUALITY_RUNTIME, skillQualitySuiteRoute.suiteId);
+        return json(res, reply.body, reply.status);
+    }
+    if (method === 'GET' && p === ADMISSION_DECISIONS_ROUTE) {
+        const url = new URL(req.url ?? '/', `http://${HOST}`);
+        const sessionId = url.searchParams.get('sessionId');
+        const runId = url.searchParams.get('runId');
+        const limit = url.searchParams.get('limit');
+        const reply = readAdmissionDecisionsApi(AGENT_ADMISSION_LEDGER, {
+            ...(sessionId === null ? {} : { sessionId }),
+            ...(runId === null ? {} : { runId }),
+            ...(limit === null ? {} : { limit }),
+        });
+        return json(res, reply.body, reply.status);
+    }
+    if (p === '/api/skills/governance/pin' && (method === 'GET' || method === 'POST')) {
+        res.setHeader('Cache-Control', 'no-store');
+        const reply = method === 'GET' ? readSkillPinApi(STYLE_PACKAGE_CANARY)
+          : await setSkillPinApi(STYLE_PACKAGE_CANARY, await readBody(req, 4_096));
+        return json(res, reply.body, reply.status);
+    }
+    const skillActiveDiffRoute = matchRouteTemplate(SKILL_PROMOTION_ROUTE_TEMPLATES.activeDiff, p);
+    if (method === 'GET' && skillActiveDiffRoute) {
+        res.setHeader('Cache-Control', 'no-store');
+        const reply = await readSkillActiveDiffApi(SKILL_PROMOTION_RUNTIME, skillActiveDiffRoute.candidateId);
+        return json(res, reply.body, reply.status);
+    }
+    if (method === 'GET' && p === SKILL_PROMOTION_ROUTE_TEMPLATES.overview) {
+        const url = new URL(req.url ?? '/', `http://${HOST}`);
+        const limit = url.searchParams.get('limit');
+        const cursor = url.searchParams.get('cursor');
+        const reply = readSkillPromotionOverviewApi(SKILL_PROMOTION_RUNTIME, {
+            ...(limit === null ? {} : { limit }),
+            ...(cursor === null ? {} : { cursor }),
+        });
+        return json(res, reply.body, reply.status);
+    }
+    if (method === 'POST' && p === SKILL_PROMOTION_ROUTE_TEMPLATES.preflight) {
+        const reply = readSkillPromotionPreflightApi(
+            SKILL_PROMOTION_RUNTIME, await readBody(req, 8_192));
+        return json(res, reply.body, reply.status);
+    }
+    if (method === 'POST' && p === SKILL_PROMOTION_ROUTE_TEMPLATES.adopt) {
+        const reply = adoptSkillCandidateApi(SKILL_PROMOTION_RUNTIME, await readBody(req, 8_192));
+        return json(res, reply.body, reply.status);
+    }
+    if (method === 'POST' && p === SKILL_PROMOTION_ROUTE_TEMPLATES.promote) {
+        const reply = promoteSkillCandidateApi(SKILL_PROMOTION_RUNTIME, await readBody(req, 8_192));
+        return json(res, reply.body, reply.status);
+    }
+    if (method === 'POST' && p === SKILL_PROMOTION_ROUTE_TEMPLATES.retire) {
+        const reply = retireSkillCandidateApi(SKILL_PROMOTION_RUNTIME, await readBody(req, 8_192));
+        return json(res, reply.body, reply.status);
+    }
+    if (method === 'POST' && p === SKILL_PROMOTION_ROUTE_TEMPLATES.reconcile) {
+        // 无入参：body 允许为空，读了就丢，避免沿用上一层的 JSON 形状校验。
+        await readBody(req, 1_024);
+        const reply = reconcileSkillRetirementsApi(SKILL_PROMOTION_RUNTIME);
+        return json(res, reply.body, reply.status);
+    }
+    const skillChannelRoute = matchRouteTemplate('/api/skills/channels/:channelId', p);
+    if (method === 'GET' && skillChannelRoute) {
+        const reply = readSkillChannelApi(SKILL_PROMOTION_RUNTIME, skillChannelRoute.channelId);
+        return json(res, reply.body, reply.status);
+    }
+    const skillChannelEvidenceRoute = matchRouteTemplate(SKILL_PROMOTION_ROUTE_TEMPLATES.channelEvidence, p);
+    if (method === 'GET' && skillChannelEvidenceRoute) {
+        res.setHeader('Cache-Control', 'no-store');
+        const reply = readSkillChannelEvidenceApi(SKILL_PROMOTION_RUNTIME, skillChannelEvidenceRoute.channelId);
+        return json(res, reply.body, reply.status);
+    }
+    const skillCandidateDiffRoute = matchRouteTemplate(
+        SKILL_PROMOTION_ROUTE_TEMPLATES.candidateDiff, p,
+    );
+    if (method === 'GET' && skillCandidateDiffRoute) {
+        const url = new URL(req.url ?? '/', `http://${HOST}`);
+        const against = url.searchParams.get('against');
+        const reply = readSkillCandidateDiffApi(
+            SKILL_PROMOTION_RUNTIME, skillCandidateDiffRoute.candidateId,
+            against === null ? undefined : against,
+        );
+        return json(res, reply.body, reply.status);
+    }
+    const skillPromotionEvidenceRoute = matchRouteTemplate(SKILL_PROMOTION_ROUTE_TEMPLATES.evidence, p);
+    if (method === 'GET' && skillPromotionEvidenceRoute) {
+        res.setHeader('Cache-Control', 'no-store');
+        const url = new URL(req.url ?? '/', `http://${HOST}`);
+        const reply = listSkillPromotionEvidenceApi(SKILL_PROMOTION_RUNTIME, skillPromotionEvidenceRoute.candidateId,
+            url.searchParams.get('batchCursor') ?? '', url.searchParams.get('qualityCursor') ?? '',
+            url.searchParams.get('expectedBatchId') ?? '');
+        return json(res, reply.body, reply.status);
+    }
+    const skillOperationalSourcesRoute = matchRouteTemplate('/api/skills/candidates/:candidateId/operational-sources', p);
+    if (method === 'GET' && skillOperationalSourcesRoute) {
+      const reply = listSkillOperationalSources(SKILL_OPERATIONAL_SOURCE, AGENT_CLOSURE_STORE,
+        skillOperationalSourcesRoute.candidateId, AGENT_SKILL_CANDIDATE_RUNTIME);
+      return json(res, reply.body, reply.status);
+    }
+    const skillOperationalSourceRoute = matchRouteTemplate(
+      '/api/skills/candidates/:candidateId/operational-sources/:operationId', p,
+    );
+    if (method === 'GET' && skillOperationalSourceRoute) {
+      const reply = readSkillOperationalSource(
+        SKILL_OPERATIONAL_SOURCE,
+        skillOperationalSourceRoute.candidateId,
+        skillOperationalSourceRoute.operationId,
+      );
+      return json(res, reply.body, reply.status);
+    }
     const skillsActionPostRoute = matchRouteTemplate('/api/skills/:name/:action', p);
     if (method === 'POST' && skillsActionPostRoute) {
-      const { setSkillEnabled, deleteSkill } = await import('../../packages/core/src/skills.ts');
+      const {
+        AgentSkillActionError,
+        executeAgentSkillAction,
+      } = await import('./agent-skill-actions.ts');
       let name: string;
       try {
         name = decodeURIComponent(skillsActionPostRoute.name);
       } catch {
-        return json(res, { error: '技能名编码非法' }, 400);
+        return json(res, {
+          error: 'Agent Skill 名称编码非法',
+          code: 'agent-skill-name-invalid',
+        }, 400);
       }
-      const action = skillsActionPostRoute.action;
       try {
-        if (action === 'enable') return json(res, { ok: true, skill: setSkillEnabled(name, true) });
-        if (action === 'disable') return json(res, { ok: true, skill: setSkillEnabled(name, false) });
-        if (action === 'delete') { deleteSkill(name); return json(res, { ok: true }); }
-        return json(res, { error: `未知操作: ${action}` }, 400);
-      } catch (e) {
-        return json(res, { error: (e as Error).message }, 404);
+        return json(res, executeAgentSkillAction({
+          name,
+          action: skillsActionPostRoute.action,
+        }));
+      } catch (error) {
+        if (error instanceof AgentSkillActionError) {
+          return json(res, { error: error.message, code: error.code }, error.status);
+        }
+        throw error;
       }
     }
 
@@ -6324,7 +12001,7 @@ const server = createServer(async (req, res) => {
       sse(res);
       try {
         const cfg = (await import('../../packages/proxy/src/config.ts')).loadProviderConfig();
-        const providerClient = providerClientForServer();
+        const providerClient = providerClientForServer(cfg);
         if (!providerClient) (await import('../../packages/proxy/src/config.ts')).assertProviderReady(cfg);
         const mem = new MemoryDb({ path: resolve(DATA_DIR, `storyboard-${Date.now()}.db`) });
         const ret = new RetrievalEngine(mem);
@@ -6334,7 +12011,9 @@ const server = createServer(async (req, res) => {
           ret.setEmbeddingProvider(new HashEmbeddingProvider());
         }
         const orch = new StoryboardOrchestrator({
-          client: observeServerModelClient(providerClient ?? new OpenAICompatibleClient(cfg)),
+          client: arbitratedAgentClient(
+            observeServerModelClient(providerClient ?? new OpenAICompatibleClient(cfg), () => cfg.providerId),
+            { providerId: cfg.providerId, model: cfg.model }, 'story-index'),
           ret,
           scanner: new LorebookScanner(mem),
           vms: new VariableManager(),
@@ -6362,7 +12041,44 @@ const server = createServer(async (req, res) => {
     }
 
     // ── 导演模式（对话内选区触发：选中文本 → 复用会话真实记忆/世界书/变量跑分镜管线，SSE 阶段进度 + done）
-    // 与 /api/storyboard/run 同引擎，但上下文来自本会话（非空库）；结果落 memory_state(storyboard) 可检索 + 探窗展示/下载
+    // Independent creation namespace; the source RP database is read-only.
+    const creativeCollection = matchRouteTemplate('/api/session/:sessionId/creative', p);
+    const creativeItem = matchRouteTemplate('/api/session/:sessionId/creative/:creativeId', p);
+    const creativeBlindBoard = matchRouteTemplate('/api/session/:sessionId/creative/:creativeId/board/:boardId', p);
+    if ((method === 'POST' && creativeCollection) || (method === 'GET' && creativeBlindBoard)
+        || (creativeItem && (method === 'GET' || method === 'POST'))) {
+      res.setHeader('Cache-Control', 'no-store');
+      if (!DIRECTOR_CREATIVE_ENABLED || !DIRECTOR_CREATIVE_SERVICE) return json(res, { error: 'director-disabled' }, 409);
+      try {
+        const owner = (creativeCollection ?? creativeBlindBoard ?? creativeItem)!.sessionId;
+        if (DIRECTOR_NSFW_ENABLED && !sessions.has(owner) && directorPersistedNsfw(owner)) await loadSessionById(owner);
+        if (creativeCollection) return json(res, DIRECTOR_CREATIVE_SERVICE.create(creativeCollection.sessionId, await readBody(req)));
+        if (creativeBlindBoard) {
+          if ([...url.searchParams.keys()].length) return json(res, { error: 'director-request-invalid' }, 400);
+          return json(res, DIRECTOR_CREATIVE_SERVICE.readBlindBoard(creativeBlindBoard.sessionId, creativeBlindBoard.creativeId, creativeBlindBoard.boardId));
+        }
+        const { sessionId, creativeId } = creativeItem!;
+        if (method === 'GET') {
+          const revision = url.searchParams.get('revision');
+          if ([...url.searchParams.keys()].some(key => key !== 'revision') || url.searchParams.getAll('revision').length > 1
+              || revision !== null && (!/^[1-9][0-9]*$/u.test(revision) || !Number.isSafeInteger(Number(revision))))
+            return json(res, { error: 'director-request-invalid' }, 400);
+          return json(res, DIRECTOR_CREATIVE_SERVICE.read(sessionId, creativeId, revision === null ? undefined : Number(revision)));
+        }
+        const result = await DIRECTOR_CREATIVE_SERVICE.command(sessionId, creativeId, await readBody(req), requestAbortController?.signal);
+        return json(res, result);
+      } catch (error) {
+        if (error instanceof ProviderRegistryError) {
+          console.warn(`[director-creative] provider=${error.code} diagnostic=${error.diagnosticCode ?? 'unknown'} upstreamStatus=${error.upstreamStatus ?? 'unknown'}`);
+          return json(res, { error: 'director-provider-failed' }, providerFailureStatus(error));
+        }
+        const code = error instanceof Error && /^director-[a-z-]+$/u.test(error.message) ? error.message : 'director-request-failed';
+        const status = code === 'director-session-not-found' ? 404 : code.includes('forbidden') || code.includes('permission')
+          || code.includes('partition-denied') ? 403 : /conflict|stale|running|cancelled|limit|exhausted|already-attempted/u.test(code) ? 409 : 400;
+        return json(res, { error: code }, status);
+      }
+    }
+    // Legacy storyboard engine still writes its original memory_state output.
     const directorPostRoute = matchRouteTemplate('/api/session/:sessionId/director', p);
     if (method === 'POST' && directorPostRoute) {
       const id = directorPostRoute.sessionId;
@@ -6428,10 +12144,13 @@ const server = createServer(async (req, res) => {
       sse(res);
       try {
         const cfg = loadProviderConfig();
-        const providerClient = providerClientForServer();
+        const providerClient = providerClientForServer(cfg);
         if (!providerClient) assertProviderReady(cfg);
         const gen = new VideoPromptGenerator({
-          client: observeServerModelClient(providerClient ?? new OpenAICompatibleClient(cfg)),
+          // P17-01.3：视频提示词是用户在等的前台生成（interactive-prelude），不是后台索引。
+          client: arbitratedAgentClient(
+            observeServerModelClient(providerClient ?? new OpenAICompatibleClient(cfg), () => cfg.providerId),
+            { providerId: cfg.providerId, model: cfg.model }, 'interactive-prelude'),
           cardName: '导演分镜',
           round: 1,
           signal: requestAbortController?.signal,
@@ -6461,7 +12180,7 @@ const server = createServer(async (req, res) => {
     if (p === '/api/quality/overrides') {
       if (method === 'GET') return json(res, { config: readAdaptiveConfig() });
       if (method === 'POST') {
-        const body = await readBody(req) as Record<string, unknown>;
+              const body = (await readBody(req)) as Record<string, unknown>;
         if (body.reset === true) {
           writeAdaptiveConfig({});
         } else {
@@ -6485,7 +12204,11 @@ const server = createServer(async (req, res) => {
 
     // 健康检查
     if (method === 'GET' && p === '/api/health') {
-      return json(res, { ok: true, sessions: sessions.size });
+      return json(res, {
+        ok: true,
+        sessions: sessions.size,
+        agentClosure: AGENT_CLOSURE_DEGRADED ? 'degraded' : 'ok',
+      });
     }
 
     securityAuditSpan?.annotate({ reasonCode: 'route-not-found' });
@@ -6522,6 +12245,7 @@ let startPromise: Promise<void>;
 async function startWebServer(): Promise<void> {
   // 插件完成原子激活（或明确失败）后再接流量，避免启动窗口内行为随机。
   const loadResults = await dshHost.loadAll(pluginRegistry.list(), (rec) => resolve(PLUGINS_DIR, rec.name));
+  if (shuttingDown) return;
   for (const result of loadResults) {
     if (result.status === 'failed') dshRuntimeErrors.set(result.id, result.error ?? '加载失败');
     else dshRuntimeErrors.delete(result.id);
@@ -6535,21 +12259,127 @@ async function startWebServer(): Promise<void> {
       );
     }
   }
+  STYLE_COMPILE_RUNTIME = createServerStyleCompileRuntime();
+  const deletionRecovery = await SESSION_DELETION_COORDINATOR.resumePending();
+  if (shuttingDown) return;
+  if (deletionRecovery.some((result) => result.status === 'accepted')) {
+    console.warn('[SessionDeletion] CLEANUP_PENDING（已保留永久 fence，后续重启继续补偿）');
+  }
+  agentLoopManagerReadersReady = true;
   await turnJobs.recoverAvailable();
+  if (shuttingDown) return;
+  MAINTENANCE_PROPOSAL_REJECTION_EVIDENCE_SCHEDULER?.recoverRetained();
+  MAINTENANCE_PROPOSAL_APPROVAL_EVIDENCE_SCHEDULER?.recoverRetained();
+  ARC_COMMIT_EVIDENCE_SCHEDULER?.recoverRetained();
+  WORLDBOOK_APPLY_EVIDENCE_SCHEDULER?.recoverRetained();
+  REPORTED_EFFECT_EVIDENCE_SCHEDULER?.recoverRetained();
+  NPC_OPERATION_EVIDENCE_SCHEDULER?.recoverRetained();
+  // Delivery survives a disabled forward gate and does not need the player to reopen a session.
+  for (const file of readdirSync(DATA_DIR)) {
+    if (file.endsWith('.db') && resolveSessionDatabase(DATA_DIR, file)) {
+      const sessionId = file.slice(0, -3);
+      try { recoverEffectWatchForSession(sessionId); }
+      catch { console.warn('[AgentClosure] EFFECT_WATCH_RECOVERY_PENDING'); }
+      SKILL_CONSUMPTION_SCHEDULER?.schedule(sessionId);
+      LEARNING_PREFERENCE_SOURCE_SCHEDULER?.schedule(sessionId);
+      EXPLICIT_PREFERENCE_EVIDENCE_SCHEDULER?.schedule(sessionId);
+      CLOSURE_SKILL_EVIDENCE_SCHEDULER?.schedule(sessionId);
+      MAINTENANCE_MEMORY_EVIDENCE_SCHEDULER?.schedule(sessionId);
+      MAINTENANCE_SUMMARY_EVIDENCE_SCHEDULER?.schedule(sessionId);
+      REGENERATION_EVIDENCE_SCHEDULER?.schedule(sessionId);
+      STYLE_COMPILE_ADOPTION_EVIDENCE_SCHEDULER?.schedule(sessionId);
+      VARIABLE_APPLY_EVIDENCE_SCHEDULER?.schedule(sessionId);
+      VARIABLE_INVALIDATION_EVIDENCE_SCHEDULER?.schedule(sessionId);
+      REPORTED_EFFECT_EVIDENCE_SCHEDULER?.schedule(sessionId);
+      BRANCH_MODIFIED_EVIDENCE_SCHEDULER?.schedule(sessionId);
+      BRANCH_ATTRIBUTION_EVIDENCE_SCHEDULER?.schedule(sessionId);
+      PREFERENCE_INFERENCE_EVIDENCE_SCHEDULER?.schedule(sessionId);
+      AQL_ADVISORY_EVIDENCE_SCHEDULER?.schedule(sessionId);
+      NSFW_SCENE_EVIDENCE_SCHEDULER?.schedule(sessionId);
+      MAINTENANCE_MEMORY_CONSUMPTION_SCHEDULER?.schedule(sessionId);
+      MAINTENANCE_SUMMARY_CONSUMPTION_SCHEDULER?.schedule(sessionId);
+    }
+  }
   maintenanceHarness!.recoverExpired();
+  // Finish older startup observations first, then repair only the exact
+  // pristine p14 namespace in fixed pages. Each page drains below Runtime's
+  // queue bound before the next page is read.
+  await AGENT_LOOP_RUNTIME.whenIdle();
+  if (shuttingDown) return;
+  let projectionRecoveryCursor: MaintenanceProductionProjectionRecoveryCursor | null = null;
+  for (;;) {
+    const recovery = maintenanceJobs.scanAgentLoopProductionProjectionRecovery(
+      projectionRecoveryCursor,
+    );
+    for (const queued of recovery.jobs) {
+      AGENT_LOOP_RUNTIME.observeMaintenanceJobPhase({
+        runId: queued.runId,
+        phase: 'enqueued',
+      });
+    }
+    await AGENT_LOOP_RUNTIME.whenIdle();
+    if (shuttingDown) return;
+    if (!recovery.nextCursor) break;
+    projectionRecoveryCursor = recovery.nextCursor;
+  }
+  agentLoopLegacySourceReady = true;
+  await AGENT_LOOP_RECOVERY_LIFECYCLE.whenIdle();
+  await AGENT_LOOP_RECOVERY_LIFECYCLE.runOnce();
+  if (shuttingDown) return;
+  agentLoopTaskInvalidationDrainer?.start();
+  MAINTENANCE_MEMORY_SKILL_SCHEDULER?.schedule();
+  MAINTENANCE_MEMORY_WRITE_SCHEDULER?.schedule();
+  MAINTENANCE_SUMMARY_WRITE_SCHEDULER?.schedule();
+  // Construct the one bounded pump only after every startup projection page
+  // is idle. Earlier startup wakes are intentionally coalesced by the single
+  // explicit durable-queue request below.
+  maintenanceDrainPump = createMaintenanceDrainPump({
+    drain: (maxJobs) => maintenanceHarness!.drainAvailable(maxJobs),
+    onFailure: () => {
+      // Background wake failures never affect foreground turns; queued work is
+      // durable and the next enqueue/settled/recovery scan can retry it.
+      console.warn('[维护] global drain pump 失败（任务保留待重试）');
+    },
+  });
   maintenanceHarness!.setMode('shadow');
   // 宿主环境只是能力上限；持久 global kill switch 不因重启被偷偷打开。
-  if (!MAINTENANCE_RUNTIME.enabled) maintenanceHarness!.setGlobalEnabled(false);
+  // 该分支会改写用户持久配置（global_enabled），因此无论是否发生变化都要留一行可查的日志：
+  // 裸环境调试启动（缺 JG_HARNESS_BACKGROUND=shadow）曾静默关闭用户的维护总开关且无任何痕迹。
+  if (!MAINTENANCE_RUNTIME.enabled) {
+    const maintenanceGlobalWasEnabled = maintenanceJobs.globalEnabled();
+    maintenanceHarness!.setGlobalEnabled(false);
+    console.warn(maintenanceGlobalWasEnabled
+      ? '[维护] 启动时 JG_HARNESS_BACKGROUND 未设为 shadow：持久总开关 global_enabled 已由 1 改为 0'
+        + '（宿主未启用后台维护时不自动打开）。若为调试性启动，请改用 一键启动.bat（加载 profile）重启，再重新开启后台维护。'
+      : '[维护] 启动时 JG_HARNESS_BACKGROUND 未设为 shadow：持久总开关保持关闭（global_enabled=0）。');
+  }
   if (MAINTENANCE_RUNTIME.enabled && maintenanceJobs.globalEnabled()) {
-    queueMicrotask(() => { void maintenanceHarness?.drainAvailable(2); });
+    maintenanceDrainPump?.request();
   }
   if (shuttingDown) return;
+  await OPERATIONAL_REPLAY_BRIDGE?.start();
+  if (shuttingDown) return;
+  styleCompileStartupReady = true;
+  void STYLE_COMPILE_RUNTIME?.runOnce();
   server.listen(PORT, HOST, () => {
     console.log(`[web-api] http://${HOST}:${PORT}`);
     console.log(`[web-api] GET /api/cards | POST /api/session/new(SSE) | POST /api/turn(SSE)`);
   });
 }
-startPromise = startWebServer().catch((error) => {
+startPromise = startWebServer().catch(async (error) => {
+  agentLoopLegacySourceReady = false;
+  styleCompileStartupReady = false;
+  AGENT_LOOP_RECOVERY_LIFECYCLE.stop();
+  const maintenanceDrainPumpClosed = maintenanceDrainPump?.close();
+  // Stop new recovery/pump work and join the recovery tail while Manager and
+  // AL Store are still open; only then may Harness close its Manager.
+  await quiesceAgentLoopRecovery();
+  await maintenanceHarness?.close();
+  await maintenanceDrainPumpClosed;
+  await STYLE_COMPILE_RUNTIME?.close();
+  await CONTEXT_COMPILER_SHADOW_RUNNER.close();
+  // Producers own their logical/physical tails. Drain them while their Manager and AL Store remain open.
+  await OPERATIONAL_REPLAY_BRIDGE?.close();
   console.error(`[web-api] 启动失败: ${(error as Error).message.slice(0, 200)}`);
   process.exitCode = 1;
 });
@@ -6574,20 +12404,69 @@ async function reloadDshPlugin(id: string): Promise<void> {
 async function shutdownWebServer(signal: string): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
+  agentLoopLegacySourceReady = false;
+  styleCompileStartupReady = false;
+  STYLE_COMPILE_RUNTIME?.stop();
+  AGENT_LOOP_RECOVERY_LIFECYCLE.stop();
+  MAINTENANCE_MEMORY_SKILL_SCHEDULER?.close();
+  MAINTENANCE_MEMORY_WRITE_SCHEDULER?.close();
+  MAINTENANCE_SUMMARY_WRITE_SCHEDULER?.close();
+  MAINTENANCE_MEMORY_CONSUMPTION_SCHEDULER?.close();
+  MAINTENANCE_SUMMARY_CONSUMPTION_SCHEDULER?.close();
+  LEARNING_PREFERENCE_SOURCE_SCHEDULER?.close();
+  EXPLICIT_PREFERENCE_EVIDENCE_SCHEDULER?.close();
+  CLOSURE_SKILL_EVIDENCE_SCHEDULER?.close();
+  MAINTENANCE_MEMORY_EVIDENCE_SCHEDULER?.close();
+  MAINTENANCE_SUMMARY_EVIDENCE_SCHEDULER?.close();
+  MAINTENANCE_PROPOSAL_REJECTION_EVIDENCE_SCHEDULER?.close();
+  MAINTENANCE_PROPOSAL_APPROVAL_EVIDENCE_SCHEDULER?.close();
+  ARC_COMMIT_EVIDENCE_SCHEDULER?.close();
+  WORLDBOOK_APPLY_EVIDENCE_SCHEDULER?.close();
+  NPC_OPERATION_EVIDENCE_SCHEDULER?.close();
+  REGENERATION_EVIDENCE_SCHEDULER?.close();
+  STYLE_COMPILE_ADOPTION_EVIDENCE_SCHEDULER?.close();
+  VARIABLE_APPLY_EVIDENCE_SCHEDULER?.close();
+  VARIABLE_INVALIDATION_EVIDENCE_SCHEDULER?.close();
+  REPORTED_EFFECT_EVIDENCE_SCHEDULER?.close();
+  BRANCH_MODIFIED_EVIDENCE_SCHEDULER?.close();
+  BRANCH_ATTRIBUTION_EVIDENCE_SCHEDULER?.close();
+  PREFERENCE_INFERENCE_EVIDENCE_SCHEDULER?.close();
+  AQL_ADVISORY_EVIDENCE_SCHEDULER?.close();
+  NSFW_SCENE_EVIDENCE_SCHEDULER?.close();
   console.log(`[web-api] 收到 ${signal}，正在 drain DSH 插件...`);
   const closePromise = server.listening
     ? new Promise<void>((resolveClose) => server.close(() => resolveClose()))
     : Promise.resolve();
   await pluginMutationTail;
+  const maintenanceDrainPumpClosed = maintenanceDrainPump?.close();
   await maintenanceHarness?.close();
+  await maintenanceDrainPumpClosed;
   await turnJobs.close();
+  await STYLE_COMPILE_RUNTIME?.close();
+  await CONTEXT_COMPILER_SHADOW_RUNNER.close();
+  await quiesceAgentLoopRecovery();
+  await SKILL_QUALITY_RUNTIME?.shutdown();
+  await SKILL_SAMPLE_RUNTIME?.shutdown();
+  CANDIDATE_EVALUATION_SAMPLE_HOST.close();
+  SKILL_EVALUATION_BATCH_STORE?.close();
+  SKILL_PROMOTION_RUNTIME?.close();
+  STYLE_PACKAGE_PIN_STORE.close();
+  await SKILL_EVALUATE_RUNTIME?.shutdown();
+  await SKILL_COMPILE_RUNTIME?.shutdown();
+  await OPERATIONAL_REPLAY_BRIDGE?.close();
+  await DIRECTOR_CREATIVE_SERVICE?.close();
   INTERACTIVE_CALL_LEDGER?.close();
   MODEL_USAGE_LEDGER.close();
   AGENT_ADMISSION_LEDGER?.close();
   AGENT_LEARNING_LEDGER?.close();
+  AGENT_EVIDENCE_LEDGER?.close();
+  DIRECTOR_CREATIVE_STORE?.close();
+  AGENT_SKILL_CANDIDATE_RUNTIME?.close();
   ARC_PROJECTIONS?.close();
   WORLDBOOK_REPAIR_CONTROL?.close();
   AGENT_CONTROL_STORE.close();
+  SKILL_CONSUMPTION_SCHEDULER?.close();
+  AGENT_CLOSURE_STORE?.close();
   await providerRegistry.clear();
   await dshHost.dispose();
   await startPromise;

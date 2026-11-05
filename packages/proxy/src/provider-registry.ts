@@ -1,4 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { transferOfficialDeepSeekModelEvidence } from './client.ts';
+import { registerProviderWorkSettlement } from './provider-work-lifecycle.ts';
 import {
   PROVIDER_PROTOCOL_VERSION,
   type ProviderAdapter,
@@ -68,9 +70,12 @@ export class ProviderRegistryError extends Error {
   readonly diagnosticCode?: ProviderFailureDiagnosticCode;
   /** Bounded, content-free backoff hint copied from a trusted adapter field only. */
   readonly retryAfterSeconds?: number;
+  /** Bounded HTTP failure status only; response headers/body/message never cross the registry. */
+  readonly upstreamStatus?: number;
 
   constructor(code: ProviderRegistryErrorCode, providerId: string, message: string,
-    diagnosticCode?: ProviderFailureDiagnosticCode, retryAfterSeconds?: number) {
+    diagnosticCode?: ProviderFailureDiagnosticCode, retryAfterSeconds?: number,
+    upstreamStatus?: number) {
     super(message);
     this.name = 'ProviderRegistryError';
     this.code = code;
@@ -79,6 +84,11 @@ export class ProviderRegistryError extends Error {
     if (typeof retryAfterSeconds === 'number' && Number.isSafeInteger(retryAfterSeconds)
       && retryAfterSeconds >= 1 && retryAfterSeconds <= 300) {
       this.retryAfterSeconds = retryAfterSeconds;
+    }
+    if (diagnosticCode === 'provider-request-invalid'
+      && typeof upstreamStatus === 'number' && Number.isSafeInteger(upstreamStatus)
+      && upstreamStatus >= 400 && upstreamStatus <= 499) {
+      this.upstreamStatus = upstreamStatus;
     }
   }
 }
@@ -93,6 +103,17 @@ export function providerFailureRetryAfterSeconds(error: unknown): number | undef
   catch { return undefined; }
   return typeof value === 'number' && Number.isSafeInteger(value)
     && value >= 1 && value <= MAX_PROVIDER_RETRY_AFTER_SECONDS
+    ? value : undefined;
+}
+
+/** Reads only a bounded status scalar; response headers/body/message remain private. */
+export function providerFailureUpstreamStatus(error: unknown): number | undefined {
+  if (!error || typeof error !== 'object') return undefined;
+  let value: unknown;
+  try { value = (error as { status?: unknown }).status; }
+  catch { return undefined; }
+  return typeof value === 'number' && Number.isSafeInteger(value)
+    && value >= 400 && value <= 499
     ? value : undefined;
 }
 
@@ -149,7 +170,12 @@ export function providerFailureDiagnosticCode(error: unknown): ProviderFailureDi
   // distinct from a received 5xx response without inspecting error text/cause.
   if (code === 'COMMANDCODE_PROVIDER_UPSTREAM_FAILED') return 'provider-transport-failed';
   if (name === 'CommandCodeStreamIdleTimeoutError' || name === 'TimeoutError') return 'provider-timeout';
-  if (status === 401 || status === 403) return 'provider-authentication-failed';
+  if (status === 401) return 'provider-authentication-failed';
+  // A 403 means the upstream understood the credential but refused this
+  // operation. In practice this includes model/account-policy restrictions.
+  // Reporting it as a bad credential sends operators toward rotating a valid
+  // key and hid the actual model-access problem observed by operational replay.
+  if (status === 403) return 'provider-request-invalid';
   if (status === 408) return 'provider-timeout';
   if (status === 429) return 'provider-rate-limited';
   if (typeof status === 'number' && Number.isInteger(status) && status >= 500 && status <= 599) {
@@ -352,7 +378,7 @@ function validateCompletion(value: unknown, providerId: string): ProviderComplet
   } else if (usage === null) {
     normalizedUsage = null;
   }
-  return {
+  const normalized: ProviderCompletionResult = {
     content: candidate.content as string | null,
     toolCalls,
     finishReason: candidate.finishReason,
@@ -361,6 +387,8 @@ function validateCompletion(value: unknown, providerId: string): ProviderComplet
     // 不透传插件任意对象，避免把 Key/Cookie/内部 URL 夹带回宿主调用链。
     raw: { providerId },
   };
+  if (providerId === 'builtin.openai') transferOfficialDeepSeekModelEvidence(value, normalized);
+  return normalized;
 }
 
 function validateHealth(value: unknown, providerId: string): ProviderHealth {
@@ -440,6 +468,7 @@ function requestCapabilities(
  */
 export class ProviderRegistry {
   private readonly entries = new Map<string, ProviderEntry>();
+  private readonly bindingTokens = new WeakMap<ProviderEntry, object>();
   private readonly instances = new Set<ProviderEntry>();
   private readonly invocationScope = new AsyncLocalStorage<ReadonlySet<string>>();
   private readonly drainTimeoutMs: number;
@@ -493,6 +522,17 @@ export class ProviderRegistry {
   describe(id: string): ProviderDescriptor | undefined {
     const descriptor = this.entries.get(id)?.descriptor;
     return descriptor ? publicDescriptor(descriptor) : undefined;
+  }
+
+  /** Opaque identity of the currently active registration; never exposes the adapter. */
+  bindingToken(id: string): object | undefined {
+    const entry = this.entries.get(id);
+    if (!entry || entry.phase !== 'active') return undefined;
+    const existing = this.bindingTokens.get(entry);
+    if (existing) return existing;
+    const created: object = Object.freeze(Object.create(null));
+    this.bindingTokens.set(entry, created);
+    return created;
   }
 
   list(): ProviderDescriptor[] {
@@ -717,22 +757,33 @@ export class ProviderRegistry {
     if (ctx.signal && callerAbortListener) {
       ctx.signal.addEventListener('abort', callerAbortListener, { once: true });
     }
+    const { beforeAdapterDispatch, ...providerContext } = ctx;
     const callContext: ProviderCallContext = {
-      ...ctx,
+      ...providerContext,
       signal: linked.signal,
     };
     const scope = new Set(parentScope ?? []);
     scope.add(id);
     const work = this.invocationScope.run(scope, () => (
-      Promise.resolve().then(() => call(
-        entry.adapter,
-        callContext,
+      Promise.resolve().then(() => {
+        if (linked.signal.aborted || operation.isForced()) throw this.callError('invocation-aborted', id, `Provider 调用已中止: ${id}`);
+        if (beforeAdapterDispatch) {
+          const returned: unknown = beforeAdapterDispatch();
+          if (returned !== undefined) {
+            try { void Promise.prototype.then.call(returned, () => {}, () => {}); } catch { /* reject thenables */ }
+            throw new Error('provider-adapter-dispatch-fence-invalid');
+          }
+        }
+        return call(entry.adapter, callContext,
         // AbortController 会同步分发 signal listener。linked listener 比下面的
         // callerAbortListener 更早注册，因此必须直接检查 signal，堵住 adapter 在
         // abort handler 内同步 emit 的窗口；owner drain abort 同理。
-        () => consumerOpen && !operation.isForced() && !linked.signal.aborted,
-      ))
+          () => consumerOpen && !operation.isForced() && !linked.signal.aborted);
+      })
     ));
+    // The caller-facing Promise below can reject on abort/forced unload while the
+    // adapter still runs. Physical host accounting must track this actual work.
+    registerProviderWorkSettlement(work);
     // 记录底层工作真正 settle 时 signal 的状态。自然完成释放最后一个租约后，
     // unload 会立即 abort owner signal；不能让这个“完成后的 abort”把已经完成的
     // value/error 误判成调用中止。
@@ -779,10 +830,14 @@ export class ProviderRegistry {
         if (abortedAtWorkSettlement) {
           throw this.callError('invocation-aborted', id, `Provider 调用已中止: ${id}`);
         }
+        const diagnosticCode = providerFailureDiagnosticCode(outcome.error);
         throw this.callError(
           'provider-failed', id, `Provider 调用失败: ${id}`,
-          providerFailureDiagnosticCode(outcome.error),
+          diagnosticCode,
           providerFailureRetryAfterSeconds(outcome.error),
+          diagnosticCode === 'provider-request-invalid'
+            ? providerFailureUpstreamStatus(outcome.error)
+            : undefined,
         );
       }
       // 协作式 adapter 可能在 abort handler 中 resolve。即使 value 先赢得
@@ -805,8 +860,11 @@ export class ProviderRegistry {
     message: string,
     diagnosticCode?: ProviderFailureDiagnosticCode,
     retryAfterSeconds?: number,
+    upstreamStatus?: number,
   ): ProviderRegistryError {
-    return new ProviderRegistryError(code, providerId, message, diagnosticCode, retryAfterSeconds);
+    return new ProviderRegistryError(
+      code, providerId, message, diagnosticCode, retryAfterSeconds, upstreamStatus,
+    );
   }
 
   private removeEntry(entry: ProviderEntry): Promise<void> {

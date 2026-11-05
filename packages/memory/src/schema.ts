@@ -66,6 +66,43 @@ CREATE INDEX IF NOT EXISTS idx_learning_outbox_run
   ON learning_outbox(run_id, event_kind) WHERE run_id IS NOT NULL;
 `;
 
+/**
+ * P15 Director continuity is Session-owned durable state.  Keeping its DDL in
+ * the Session schema package lets schema-v17 install authority triggers before
+ * any Director adapter can write the tables.
+ */
+export const DIRECTOR_CONTINUITY_SQL = `
+CREATE TABLE IF NOT EXISTS director_continuity_snapshot (
+  session_id TEXT NOT NULL,
+  projection_version INTEGER NOT NULL CHECK (projection_version >= 1),
+  source_revision TEXT NOT NULL,
+  source_round INTEGER NOT NULL CHECK (source_round >= 1),
+  parent_digest TEXT,
+  input_digest TEXT NOT NULL,
+  projection_digest TEXT NOT NULL,
+  projection_json TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (session_id, projection_version),
+  UNIQUE (session_id, source_revision),
+  UNIQUE (session_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_director_continuity_turn
+  ON director_continuity_snapshot(session_id, source_round, projection_version);
+CREATE TABLE IF NOT EXISTS director_continuity_invalidation (
+  session_id TEXT NOT NULL,
+  invalidation_version INTEGER NOT NULL CHECK (invalidation_version >= 1),
+  invalid_from_round INTEGER NOT NULL CHECK (invalid_from_round >= 1),
+  through_projection_version INTEGER NOT NULL CHECK (through_projection_version >= 1),
+  reason TEXT NOT NULL CHECK (reason IN ('regenerate','delete')),
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (session_id, invalidation_version),
+  UNIQUE (session_id, invalid_from_round, through_projection_version, reason)
+);
+CREATE INDEX IF NOT EXISTS idx_director_continuity_invalidation_cut
+  ON director_continuity_invalidation(session_id, invalid_from_round, through_projection_version);
+`;
+
 /** 数据库 schema v3 定义（对应审查 §4.1/§4.5/§4.6 修正） */
 export const SCHEMA_V3 = `
 PRAGMA journal_mode = WAL;
@@ -75,7 +112,9 @@ PRAGMA synchronous = NORMAL;
 CREATE TABLE IF NOT EXISTS memory_meta (
   id INTEGER PRIMARY KEY,
   arc_id TEXT, stage TEXT, plot_round INTEGER,
-  bars TEXT, config TEXT
+  bars TEXT, config TEXT,
+  longterm TEXT DEFAULT "",
+  summary_round INTEGER DEFAULT 0
 );
 
 -- 总体大纲表（AM 编码，平台分配码号）
@@ -455,6 +494,31 @@ CREATE TABLE IF NOT EXISTS character_alias (
 );
 CREATE INDEX IF NOT EXISTS idx_character_alias_lookup ON character_alias(session_key, alias);
 
+/**
+ * Maintenance 写入的身份别名操作账。别名正文只保留在业务库；控制库的回滚锚点
+ * 仅保存 alias_digest，避免把人物私有内容复制到控制面。
+ */
+CREATE TABLE IF NOT EXISTS character_alias_operation (
+  id INTEGER PRIMARY KEY,
+  session_key TEXT NOT NULL,
+  character_id TEXT NOT NULL,
+  operation_id TEXT NOT NULL,
+  alias TEXT NOT NULL,
+  alias_digest TEXT NOT NULL,
+  mention_key TEXT NOT NULL,
+  expected_entity_version INTEGER NOT NULL,
+  rollback_entity_version INTEGER NOT NULL,
+  created_alias INTEGER NOT NULL DEFAULT 0,
+  source_refs TEXT NOT NULL DEFAULT '[]',
+  provenance_digest TEXT NOT NULL,
+  intent_fingerprint TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  rolled_back_at TEXT,
+  UNIQUE (operation_id)
+);
+CREATE INDEX IF NOT EXISTS idx_character_alias_operation_target
+  ON character_alias_operation(session_key, character_id, alias, rolled_back_at);
+
 CREATE TABLE IF NOT EXISTS character_fact_log (
   id INTEGER PRIMARY KEY,
   session_key TEXT NOT NULL,
@@ -483,16 +547,16 @@ CREATE INDEX IF NOT EXISTS idx_character_fact_op ON character_fact_log(operation
  *
  * ── 为什么需要它（两处已实证的失败）────────────────────────────────
  * ① 未注册的 NPC 只能落进 `unresolved`，而 unresolved 由 `character_pending` **覆盖写**，
- *    跨轮证据被冲掉：实测「角色乙」在正文出现 12+ 轮、`memory_state` 里 round 3 就有
- *    `('npc','角色乙')`，却始终进不了 `character_registry` —— 因为旧链路只允许
+ *    跨轮证据被冲掉：实测「示例角色A」在正文出现 12+ 轮、`memory_state` 里 round 3 就有
+ *    `('npc','示例角色A')`，却始终进不了 `character_registry` —— 因为旧链路只允许
  *    `entity_type='protagonist'` 按 `entity_id` 建人，npc 一律拒绝。它防的是
- *    `char_001|角色甲` / `entity_alpha` 这类卡引擎实体键，但判据用错了轴，
+ *    `char_001|示例角色B` / `sample_alias` 这类卡引擎实体键，但判据用错了轴，
  *    连人类可读的名字（本可用 `isPlausibleCharacterName` 拦住）也一起被杀。
  * ② 只在**单轮**出现过的非人实体（实测有 `char_003='主角所在地点'`、`char_004='祥子外观'`）
  *    会被直接建人，注册表被污染。
  *
  * ── 判据：用「持续性」，不用名字形态 ────────────────────────────────
- * 名字形态无法区分人 / 地点 / 字段（「角色乙」「示例学园」「主角所在地点」都是纯汉字）。
+ * 名字形态无法区分人 / 地点 / 字段（「示例角色A」「示例学园」「主角所在地点」都是纯汉字）。
  * 能区分的是**持续存在**：`rounds_json` 按【轮】去重累计（同一轮写多条 state_changes 只算一次），
  * 累计到阈值且拿到可读名 → 一次性促升，走既有 `admit` 入口（不新增写入通道）。
  * 同一个机制同时解决 ① 和 ②，不需要任何名字词表。
@@ -500,7 +564,7 @@ CREATE INDEX IF NOT EXISTS idx_character_fact_op ON character_fact_log(operation
  * ── 边界（不破坏既有纪律）────────────────────────────────────────
  *  - **不参与任何读路径**：factBlock / resolveMentions / list 都不查池子 → 对 prompt 零 token 影响
  *  - **不是第二套权威库**：`pending_json` 只是暂存，促升后即转正并清空
- *  - `mention_key` 只作累计键，**绝不当人物名**（`char_001` / `char_001|角色甲` 都不是显示名）
+ *  - `mention_key` 只作累计键，**绝不当人物名**（`char_001` / `char_001|示例角色B` 都不是显示名）
  */
 export const CHARACTER_POOL_SQL = `
 CREATE TABLE IF NOT EXISTS character_mention_pool (
@@ -547,8 +611,29 @@ export const DEFAULT_BRANCH_KEY = 'main';
 /** session_control 中保存历史代际的控制键（不随剧情回滚退回） */
 export const CONTROL_HISTORY_EPOCH = 'history_epoch';
 
-/** 当前 schema 版本号（v13：turn outcome；v14：Observation；v15：transactional learning outbox） */
-export const SCHEMA_VERSION = 15;
+/** 当前 schema 版本号（v17：Session claim authority + Director continuity ownership） */
+/** Session-owned task results, deliberately outside narrative truth and FTS. */
+export const RP_CHILD_ANALYSIS_SQL = `
+CREATE TABLE rp_child_analysis (
+    payload_ref TEXT PRIMARY KEY,
+    payload_digest TEXT NOT NULL,
+    binding_json TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    child_task_id TEXT NOT NULL,
+    child_attempt_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL CHECK (length(payload_json) <= 32768),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+    expires_at_ms INTEGER NOT NULL CHECK (expires_at_ms > created_at_ms),
+    UNIQUE (session_id, child_task_id, child_attempt_id)
+);
+CREATE INDEX idx_rp_child_analysis_session ON rp_child_analysis(session_id, created_at_ms);
+CREATE TRIGGER rp_child_analysis_update_guard BEFORE UPDATE ON rp_child_analysis
+BEGIN SELECT RAISE(ABORT, 'rp-child-analysis-immutable'); END;
+CREATE TRIGGER rp_child_analysis_delete_guard BEFORE DELETE ON rp_child_analysis
+BEGIN SELECT RAISE(ABORT, 'rp-child-analysis-immutable'); END;
+`;
+
+export const SCHEMA_VERSION = 17;
 
 /** 记忆衰减（Ebbinghaus 遗忘曲线）+ 访问提升 默认参数（均可用 env / RecallQuery 覆盖） */
 export const DECAY_LAMBDA_DEFAULT = 0.1;  // 每天衰减系数：7 天≈50% 残留（exp(-0.7)≈0.497）

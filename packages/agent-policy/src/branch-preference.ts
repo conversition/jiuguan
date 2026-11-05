@@ -120,7 +120,14 @@ interface MutableProfile {
 function validEvidence(row: BranchPreferenceEvidence): {
   tag: BranchActionTag; selectedIndex: number; branchCount: number;
 } | null {
-  if ((row.eventKind !== 'branch_exact_selected' && row.eventKind !== 'branch_semantic_selected')
+  // P16 W1（用户裁定 2026-10-08）：模型**语义猜测**（用户改写输入后模型判断指向）
+  // 只做记录、不进画像 —— 它是低置信猜测，不是用户的选择。来源记录在 features 里
+  // （selectionSource / matchConfidence），按任一信号排除，双保险。
+  // `branch_semantic_selected` 此前是**死类型**（LEARNING_EVENT_KINDS 里没有、无写入点），
+  // 一并从接受列表移除；实现它需要动 event_kind 的 CHECK 约束 + 迁移，不值。
+  if (row.eventKind !== 'branch_exact_selected'
+    || row.features.selectionSource === 'semantic'
+    || row.features.matchConfidence === 'semantic-low'
     || !OPAQUE_TOKEN.test(row.sessionId) || !OPAQUE_TOKEN.test(row.cardId)
     || (row.contentMode !== 'nsf' && row.contentMode !== 'nsfw')
     || !SHA256.test(row.subjectDigest)) return null;

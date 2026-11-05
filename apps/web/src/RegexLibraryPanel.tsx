@@ -19,7 +19,7 @@ export function RegexLibraryPanel() {
   const [rules, setRules] = useState<RegexRule[] | null>(null);
   const [cards, setCards] = useState<CardInfo[]>([]);
   const [editing, setEditing] = useState<RegexRule | null>(null);
-  const [testText, setTestText] = useState('角色甲说：<think>我在思考</think>今天天气不错。<UpdateVariable>{"a":1}</UpdateVariable>');
+  const [testText, setTestText] = useState('示例角色B说：<think>我在思考</think>今天天气不错。<UpdateVariable>{"a":1}</UpdateVariable>');
   const [testResult, setTestResult] = useState<{ text: string; applied: string[] } | null>(null);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState('');

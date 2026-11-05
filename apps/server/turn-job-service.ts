@@ -2,8 +2,9 @@ import type {
   BranchSelectionReference,
   ImageAttachment,
   TurnCommitControl,
-} from '../../tools/cli/session.ts';
-import type { PublicTurnJob, TurnJobAction } from '../../packages/mobile-contracts/src/index.ts';
+} from '../../packages/session/src/session.ts';
+import { isTurnProgress, type PublicTurnJob, type TurnJobAction, type TurnProgress, type TurnProgressPhase }
+  from '../../packages/mobile-contracts/src/index.ts';
 import {
   TurnJobManager,
   type CreateTurnJobResult,
@@ -21,6 +22,7 @@ export interface TurnJobSession {
     requestedRunId: string,
     commitControl: TurnCommitControl,
     branchSelection?: BranchSelectionReference,
+    nsfwState?: unknown,
   ): Promise<string>;
   regenerate(
     round: number,
@@ -58,6 +60,8 @@ export interface CreateServerTurnJobInput {
   contentMode?: 'nsfw' | 'nsf';
   attachments?: ImageAttachment[];
   branchSelection?: BranchSelectionReference;
+  /** Per-turn canonical object or bounded JSON/XML envelope for the NSFW preflight agent. */
+  nsfwState?: unknown;
   /** 旧 SSE 客户端预先生成的临时身份；只用于进程内兼容取消，不进入公开 DTO。 */
   compatibilityRunId?: string;
 }
@@ -76,34 +80,57 @@ export interface TurnJobServiceOptions {
   /** P11-09：host release drain 后拒绝所有新旧 HTTP 入口创建任务。 */
   admissionOpen?: () => boolean;
   /**
+   * Per-session admission fence.  Session deletion owns this boundary so a
+   * queued/recovered turn cannot resurrect state after its durable tombstone.
+   */
+  sessionAdmissionOpen?: (sessionId: string) => boolean;
+  /**
    * P7-05：任务生命周期的失效通知旁路（queued/running/settled）。
    * 只投影公开 job DTO；通知异常绝不回写任务状态，也不依赖任何订阅者存活。
    */
   onJobEvent?(input: { job: PublicTurnJob; phase: TurnJobEventPhase }): void;
+  onProgress?(input: { job: PublicTurnJob; progress: TurnProgress }): void;
   onSettled?(input: {
     job: PublicTurnJob;
     session: TurnJobSession;
     value?: TurnJobValue;
   }): void | Promise<void>;
+  /** Drain metadata observers after producers settle, while Manager readback is still available. */
+  beforeManagerClose?(): Promise<void>;
 }
 
 export class TurnJobAdmissionError extends Error {
   readonly name = 'TurnJobAdmissionError';
-  readonly code = 'release-draining';
+  constructor(
+    message: string,
+    readonly code: 'release-draining' | 'session-deleting' = 'release-draining',
+  ) { super(message); }
 }
 
 function assistantValue(
   session: TurnJobSession,
   outcome: TurnJobCommittedOutcome,
-  action: TurnJobAction,
+  job: PublicTurnJob,
   replanSuggestion?: string | null,
 ): TurnJobValue {
-  const row = session.getHistory().find((message) => (
-    message.id === outcome.assistantMessageId
-    && message.round === outcome.round
-    && message.role === 'assistant'
-  ));
+  if (
+    outcome.runId !== job.runId ||
+    outcome.sessionId !== job.sessionId ||
+    outcome.action !== job.action ||
+    (job.round !== undefined && outcome.round !== job.round) ||
+    (job.status === 'succeeded' &&
+      (outcome.assistantMessageId !== job.result?.assistantMessageId || outcome.revision !== job.result?.revision))
+  ) {
+    throw new Error('turn outcome 与任务结果身份不匹配');
+  }
+  const row = session
+    .getHistory()
+    .find(
+      (message) =>
+        message.id === outcome.assistantMessageId && message.round === outcome.round && message.role === 'assistant',
+    );
   if (!row) throw new Error('turn outcome 引用的 assistant 消息不存在');
+  const action = job.action;
   return action === 'turn'
     ? { action, prose: row.content, round: outcome.round, assistantMsgId: outcome.assistantMessageId }
     : {
@@ -125,8 +152,13 @@ export class TurnJobService {
   readonly #resolveSession: TurnJobServiceOptions['resolveSession'];
   readonly #loadSession?: TurnJobServiceOptions['loadSession'];
   readonly #onJobEvent?: TurnJobServiceOptions['onJobEvent'];
+  readonly #onProgress?: TurnJobServiceOptions['onProgress'];
+  readonly #progress = new Map<string, TurnProgress>();
+  readonly #progressSubscribers = new Map<string, Set<(progress: TurnProgress) => void>>();
   readonly #onSettled?: TurnJobServiceOptions['onSettled'];
+  readonly #beforeManagerClose?: TurnJobServiceOptions['beforeManagerClose'];
   readonly #admissionOpen: () => boolean;
+  readonly #sessionAdmissionOpen: (sessionId: string) => boolean;
   readonly #compatibilityAliases = new Map<string, string>();
   readonly #compatibilityCancels = new Map<string, { round?: number; expiresAt: number }>();
   readonly #notified = new Set<string>();
@@ -151,13 +183,19 @@ export class TurnJobService {
     this.#resolveSession = options.resolveSession;
     this.#loadSession = options.loadSession;
     this.#onJobEvent = options.onJobEvent;
+    this.#onProgress = options.onProgress;
     this.#onSettled = options.onSettled;
+    this.#beforeManagerClose = options.beforeManagerClose;
     this.#admissionOpen = options.admissionOpen ?? (() => true);
+    this.#sessionAdmissionOpen = options.sessionAdmissionOpen ?? (() => true);
   }
 
   create(input: CreateServerTurnJobInput): CreateTurnJobResult {
     if (this.#closing) throw new Error('turn job 服务正在关闭');
     if (!this.#admissionOpen()) throw new TurnJobAdmissionError('主机版本切换正在收口，请稍后重试');
+    if (!this.#sessionAdmissionOpen(input.sessionId)) {
+      throw new TurnJobAdmissionError('会话正在删除，已拒绝创建新的生成任务', 'session-deleting');
+    }
     const session = this.#resolveSession(input.sessionId);
     if (!session) throw new Error('会话不存在，请先创建或恢复');
     const requestBody = input.action === 'turn'
@@ -166,6 +204,7 @@ export class TurnJobService {
           contentMode: input.contentMode ?? 'nsfw',
           attachments: input.attachments ?? [],
           ...(input.branchSelection ? { branchSelection: input.branchSelection } : {}),
+          ...(input.nsfwState === undefined ? {} : { nsfwState: input.nsfwState }),
         }
       : {};
     const created = this.manager.create({
@@ -196,6 +235,38 @@ export class TurnJobService {
   }
 
   get(runId: string): PublicTurnJob | null { return this.manager.get(runId); }
+
+  reportProgress(sessionId: string, runId: string, phase: TurnProgressPhase): void {
+    const progress = Object.freeze({ runId, phase });
+    if (!isTurnProgress(progress)) throw new Error('turn-progress-invalid');
+    const job = this.manager.get(runId);
+    if (!job || job.sessionId !== sessionId || job.status !== 'running' || !this.#sessionAdmissionOpen(sessionId)) return;
+    this.#progress.set(runId, progress);
+    try { this.#onProgress?.({ job, progress }); } catch { /* Progress cannot alter execution. */ }
+    for (const subscriber of [...(this.#progressSubscribers.get(runId) ?? [])]) {
+      try { subscriber(progress); } catch { /* A disconnected subscriber cannot alter execution. */ }
+    }
+  }
+
+  getProgress(runId: string): TurnProgress | null {
+    const job = this.manager.get(runId);
+    return job?.status === 'running' ? this.#progress.get(runId) ?? null : null;
+  }
+
+  progressForSession(sessionId: string): TurnProgress | null {
+    const job = this.manager.getActiveForSession(sessionId);
+    return job ? this.getProgress(job.runId) : null;
+  }
+
+  subscribeProgress(runId: string, subscriber: (progress: TurnProgress) => void): () => void {
+    const job = this.manager.get(runId);
+    if (!job || (job.status !== 'running' && job.status !== 'queued')) return () => {};
+    const subscribers = this.#progressSubscribers.get(runId) ?? new Set();
+    subscribers.add(subscriber); this.#progressSubscribers.set(runId, subscribers);
+    const latest = this.getProgress(runId);
+    if (latest) { try { subscriber(latest); } catch { /* Ignore a detached connection. */ } }
+    return () => { subscribers.delete(subscriber); if (!subscribers.size) this.#progressSubscribers.delete(runId); };
+  }
 
   getActiveForSession(sessionId: string): PublicTurnJob | null {
     return this.manager.getActiveForSession(sessionId);
@@ -256,13 +327,56 @@ export class TurnJobService {
     return this.manager.get(active.runId);
   }
 
+  /**
+   * Remove the durable job/idempotency sidecar only after quiesceSession() and
+   * a permanent session-deletion fence have both completed.
+   */
+  deleteSession(sessionId: string): ReturnType<TurnJobManager['deleteSession']> {
+    if (this.manager.getActiveForSession(sessionId)) {
+      throw new Error('turn-session-delete-not-quiescent');
+    }
+    return this.#deleteSessionSidecars(sessionId);
+  }
+
+  /**
+   * Startup privacy recovery runs before ordinary job recovery. A durable
+   * deletion fence makes a persisted queued/running row permanently
+   * inadmissible, so it is safe to remove that stale row as long as this
+   * process is not executing it. Requiring the injected fence prevents this
+   * escape hatch from becoming a general active-job deletion API.
+   */
+  deleteSessionAfterPrivacyFence(sessionId: string): ReturnType<TurnJobManager['deleteSession']> {
+    if (this.#sessionAdmissionOpen(sessionId)) {
+      throw new Error('turn-session-delete-fence-missing');
+    }
+    const active = this.manager.getActiveForSession(sessionId);
+    if (active && this.runner.isExecuting(active.runId)) {
+      throw new Error('turn-session-delete-not-quiescent');
+    }
+    return this.#deleteSessionSidecars(sessionId);
+  }
+
+  #deleteSessionSidecars(sessionId: string): ReturnType<TurnJobManager['deleteSession']> {
+    for (const key of this.#compatibilityAliases.keys()) {
+      if (key.startsWith(`${sessionId.length}:${sessionId}`)) this.#compatibilityAliases.delete(key);
+    }
+    for (const key of this.#compatibilityCancels.keys()) {
+      if (key.startsWith(`${sessionId.length}:${sessionId}`)) this.#compatibilityCancels.delete(key);
+    }
+    return this.manager.deleteSession(sessionId);
+  }
+
   valueFromCommittedJob(job: PublicTurnJob): TurnJobValue | null {
     if (job.status !== 'succeeded' || !job.result?.assistantMessageId) return null;
     const session = this.#resolveSession(job.sessionId);
     if (!session) return null;
-    const outcome = session.turnOutcome(job.runId);
-    if (!outcome) return null;
-    return assistantValue(session, outcome, job.action);
+    try {
+      const outcome = session.turnOutcome(job.runId);
+      return outcome ? assistantValue(session, outcome, job) : null;
+    } catch {
+      // A historical success does not resurrect an artifact removed by regeneration/deletion.
+      return null;
+    }
   }
 
   /** 启动及 lease 到期后的恢复入口；串行扫描，事件/HTTP 都不是真值。 */
@@ -286,7 +400,8 @@ export class TurnJobService {
         while (this.#settledPromises.size > 0) {
           await Promise.allSettled([...this.#settledPromises.values()]);
         }
-        this.manager.close();
+        try { await this.#beforeManagerClose?.(); }
+        finally { this.manager.close(); }
       })();
     }
     return this.#closePromise;
@@ -297,6 +412,18 @@ export class TurnJobService {
     for (const record of this.manager.listActiveExecutions()) {
       if (this.#closing) return;
       const { job } = record;
+      if (!this.#sessionAdmissionOpen(job.sessionId)) {
+        if (job.status === 'queued') {
+          const failed = this.manager.transition({
+            runId: job.runId,
+            expectedVersion: job.version,
+            to: 'failed',
+            publicErrorCode: 'session_deleting',
+          });
+          await this.#notifySettled(failed);
+        }
+        continue;
+      }
       let session = this.#resolveSession(job.sessionId);
       if (!session && this.#loadSession) {
         try {
@@ -326,8 +453,9 @@ export class TurnJobService {
         try {
           const outcome = session.turnOutcome(job.runId);
           if (outcome) {
+            const value = assistantValue(session, outcome, job);
             const succeeded = this.manager.completeFromOutcome(outcome);
-            await this.#notifySettled(succeeded, assistantValue(session, outcome, job.action));
+            await this.#notifySettled(succeeded, value);
             continue;
           }
         } catch {
@@ -363,6 +491,8 @@ export class TurnJobService {
 
   #notifySettled(job: PublicTurnJob, value?: TurnJobValue): Promise<void> {
     const runId = job.runId;
+    this.#progress.delete(runId);
+    this.#progressSubscribers.delete(runId);
     const active = this.#settledPromises.get(runId);
     if (active) return active;
     if (this.#notified.has(runId)) return Promise.resolve();
@@ -417,6 +547,7 @@ export class TurnJobService {
           const contentMode = context.record.requestBody.contentMode;
           const attachments = context.record.requestBody.attachments;
           const branchSelection = context.record.requestBody.branchSelection;
+          const nsfwState = context.record.requestBody.nsfwState;
           if (typeof input !== 'string'
             || (contentMode !== 'nsfw' && contentMode !== 'nsf')
             || !Array.isArray(attachments)
@@ -426,6 +557,11 @@ export class TurnJobService {
               || Number((branchSelection as Record<string, unknown>).round) < 1
               || typeof (branchSelection as Record<string, unknown>).branchId !== 'string'
               || !/^branch:[a-f0-9]{24}$/u.test(String((branchSelection as Record<string, unknown>).branchId))
+            ))
+            || (nsfwState !== undefined && (
+              nsfwState === null
+              || (typeof nsfwState !== 'string' && typeof nsfwState !== 'object')
+              || Array.isArray(nsfwState)
             ))) {
             throw new Error('turn job 请求载荷已损坏');
           }
@@ -438,10 +574,11 @@ export class TurnJobService {
             runId,
             control,
             branchSelection as BranchSelectionReference | undefined,
+            nsfwState,
           );
           const outcome = session.turnOutcome(runId);
           if (!outcome) throw new Error('turn job 完成但缺少 outcome marker');
-          return { value: assistantValue(session, outcome, 'turn'), outcome };
+          return { value: assistantValue(session, outcome, context.record.job), outcome };
         }
 
         const round = context.record.job.round;
@@ -460,12 +597,12 @@ export class TurnJobService {
           // 后处理异常必须按已提交成功对账，不能把 job 反向标为 failed。
           const committed = session.turnOutcome(runId);
           if (!committed) throw error;
-          return { value: assistantValue(session, committed, 'regenerate'), outcome: committed };
+          return { value: assistantValue(session, committed, context.record.job), outcome: committed };
         }
         const outcome = session.turnOutcome(runId);
         if (!outcome) throw new Error('regenerate job 完成但缺少 outcome marker');
         return {
-          value: assistantValue(session, outcome, 'regenerate', regenerated.replanSuggestion),
+          value: assistantValue(session, outcome, context.record.job, regenerated.replanSuggestion),
           outcome,
         };
       } catch (error) {
@@ -480,7 +617,7 @@ export class TurnJobService {
           throw error;
         }
         return {
-          value: assistantValue(session, committed, context.record.job.action),
+          value: assistantValue(session, committed, context.record.job),
           outcome: committed,
         };
       }

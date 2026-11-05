@@ -12,6 +12,23 @@ import {
   rmSync,
 } from 'node:fs';
 import { resolve, dirname } from 'node:path';
+import {
+  credentialLockdownActive,
+  DSH_CREDENTIAL_NAMES,
+} from './credential-lockdown.ts';
+
+/**
+ * P16 T-1 的凭据封锁开关从这里转出：`apps/server/server.ts` 已经允许 import
+ * `packages/proxy/src/config.ts`，转出可以避免新增跨包私有源码边（import 门禁禁止）。
+ */
+export {
+  CREDENTIAL_LOCKDOWN_ENV,
+  DSH_CREDENTIAL_NAMES,
+  NON_LOOPBACK_FETCH_ERROR,
+  credentialLockdownActive,
+  installLoopbackNetworkGuard,
+  isLoopbackTarget,
+} from './credential-lockdown.ts';
 
 export interface ProviderConfig {
   /** 酒馆内部选中的 Provider；仅保存公开 id，不包含任何凭据。 */
@@ -81,8 +98,13 @@ function providerIdValue(value: unknown): string {
   return value;
 }
 
-/** 从 .env.local 加载（KEY=VALUE 每行，忽略 # 注释） */
+/**
+ * 从 .env.local 加载（KEY=VALUE 每行，忽略 # 注释）。
+ * P16 T-1：凭据封锁模式下**完全不读文件**——这是"零 Provider 测试"成立的前提，
+ * 因为把环境变量置空并不阻止这里回退到用户的真实凭据文件。
+ */
 function loadDotEnvLocal(): Record<string, string> {
+  if (credentialLockdownActive()) return {};
   const out: Record<string, string> = {};
   const candidates = [resolve(process.cwd(), '.env.local'), resolve(process.cwd(), '.env')];
   for (const p of candidates) {
@@ -108,6 +130,8 @@ export function readLocalEnvCredential(
   env: Readonly<Record<string, string | undefined>> = process.env,
   fileEnv: Readonly<Record<string, string>> = loadDotEnvLocal(),
 ): { value: string; source: 'env' | '.env.local' } | null {
+  // P16 T-1：封锁模式对进程环境与注入参数同时生效，调用方无法通过传入 env/fileEnv 绕过。
+  if (credentialLockdownActive() || credentialLockdownActive(env)) return null;
   const direct = env[name];
   if (direct) return { value: direct, source: 'env' };
   const fromFile = fileEnv[name];
@@ -117,6 +141,16 @@ export function readLocalEnvCredential(
 
 /** 读取 data/provider.json（UI 运行时配置；不存在返回空） */
 export function readProviderJson(): Partial<ProviderConfig> {
+  // P16 T-1：封锁模式下不读取任何 provider 配置文件（即使它存在于隔离路径）。
+  if (credentialLockdownActive()) return {};
+  return readProviderJsonUnlocked();
+}
+
+/**
+ * 未受封锁影响的原始读取。仅供 `writeProviderJson` 做合并使用：
+ * 封锁只应影响"测试看到什么"，绝不能让一次测试写入丢掉用户磁盘上的真实配置。
+ */
+function readProviderJsonUnlocked(): Partial<ProviderConfig> {
   if (!existsSync(PROVIDER_JSON_PATH)) return {};
   try {
     const parsed: unknown = JSON.parse(readFileSync(PROVIDER_JSON_PATH, 'utf8'));
@@ -141,7 +175,8 @@ export function readProviderJson(): Partial<ProviderConfig> {
 
 /** 写运行时配置（同目录临时文件 + rename，避免半写入；损坏文件不可被静默覆盖） */
 export function writeProviderJson(partial: Partial<ProviderConfig>): void {
-  const prev = readProviderJson();
+  // 合并基准使用原始读取：封锁模式下也不允许一次测试写入清空真实配置。
+  const prev = readProviderJsonUnlocked();
   const next: Partial<ProviderConfig> = { ...prev, ...partial };
   const targetDir = dirname(PROVIDER_JSON_PATH);
   const tempPath = `${PROVIDER_JSON_PATH}.${process.pid}.${++providerWriteSequence}.tmp`;
@@ -155,13 +190,36 @@ export function writeProviderJson(partial: Partial<ProviderConfig>): void {
   }
 }
 
-const env = { ...loadDotEnvLocal(), ...process.env };
+/**
+ * 模块加载时的 env 快照（loadDotEnvLocal 已按封锁模式返回空）。
+ * P16 T-1：封锁模式下还要剔除进程环境里的宿主凭据名，否则"置空环境变量"依旧
+ * 会被真实的 `JG_API_KEY` / `DEEPSEEK_*` 顶回来。
+ */
+const env: Record<string, string | undefined> = (() => {
+  const merged: Record<string, string | undefined> = { ...loadDotEnvLocal(), ...process.env };
+  if (credentialLockdownActive()) {
+    for (const name of DSH_CREDENTIAL_NAMES) delete merged[name];
+  }
+  return merged;
+})();
 
 /** 已打印过的 key 指纹（避免每次 loadProviderConfig 刷日志；来源变化时重新打印） */
 let printedKeyAnchor = '';
 
+/**
+ * 空字符串 / 纯空白的环境变量视为"未配置"。
+ * `??` 不会拦截空字符串，所以 `JG_PROVIDER_ID=''` 会被当成合法 id 送进校验并直接抛
+ * `Provider id 非法`（P16 T-1 交接文档 §5.0 的隔离配方就踩到这个坑）。
+ */
+function envText(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
 export function loadProviderConfig(overrides: Partial<ProviderConfig> = {}): ProviderConfig {
   const file = readProviderJson();
+  const envApiKey = envText(env.JG_API_KEY);
   let keySource: ProviderConfig['keySource'];
   let apiKey: string;
   if (overrides.apiKey) {
@@ -170,23 +228,23 @@ export function loadProviderConfig(overrides: Partial<ProviderConfig> = {}): Pro
   } else if (file.apiKey) {
     keySource = 'provider.json'; // UI 面板唯一权威
     apiKey = file.apiKey;
-  } else if (env.JG_API_KEY) {
+  } else if (envApiKey) {
     keySource = 'env'; // 仅未在面板配置时兜底
-    apiKey = env.JG_API_KEY;
+    apiKey = envApiKey;
   } else {
     keySource = 'none';
     apiKey = '';
   }
   const cfg: ProviderConfig = {
     providerId: providerIdValue(
-      overrides.providerId ?? file.providerId ?? env.JG_PROVIDER_ID ?? DEFAULT_PROVIDER_ID,
+      overrides.providerId ?? file.providerId ?? envText(env.JG_PROVIDER_ID) ?? DEFAULT_PROVIDER_ID,
     ),
-    baseUrl: overrides.baseUrl ?? file.baseUrl ?? env.JG_API_BASE ?? 'https://opencode.ai/zen/go',
+    baseUrl: overrides.baseUrl ?? file.baseUrl ?? envText(env.JG_API_BASE) ?? 'https://opencode.ai/zen/go',
     apiKey,
-    model: overrides.model ?? file.model ?? env.JG_MODEL ?? 'deepseek-v4-flash',
+    model: overrides.model ?? file.model ?? envText(env.JG_MODEL) ?? 'deepseek-v4-flash',
     kind: overrides.kind ?? file.kind ?? (env.JG_PROVIDER_KIND === 'anthropic' ? 'anthropic' : 'openai'),
-    prefixCacheThreshold: Number(overrides.prefixCacheThreshold ?? file.prefixCacheThreshold ?? env.JG_PREFIX_THRESHOLD ?? 1024),
-    timeoutMs: Number(overrides.timeoutMs ?? file.timeoutMs ?? env.JG_TIMEOUT_MS ?? 120000),
+    prefixCacheThreshold: Number(overrides.prefixCacheThreshold ?? file.prefixCacheThreshold ?? envText(env.JG_PREFIX_THRESHOLD) ?? 1024),
+    timeoutMs: Number(overrides.timeoutMs ?? file.timeoutMs ?? envText(env.JG_TIMEOUT_MS) ?? 120000),
     keySource,
     keyFingerprint: fingerprintKey(apiKey),
   };

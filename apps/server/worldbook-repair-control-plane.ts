@@ -11,6 +11,8 @@ import {
   worldbookRepairForwardAllowsSession,
   type WorldbookRepairRuntimeConfig,
 } from './worldbook-repair-runtime-config.ts';
+import type { MaintenanceStrictProposalContext } from './maintenance-types.ts';
+import type { MaintenanceWorldbookSkillProposalProof } from './skill-hub/maintenance-worldbook-proposal-proof.ts';
 
 export interface WorldbookRepairSessionBinding {
   readonly sessionId: string;
@@ -46,6 +48,9 @@ function publicSummary(
     status: summary.status,
     revision: summary.revision,
     changeCount: summary.changeCount,
+    reasonCodes: Object.freeze([...summary.reasonCodes]),
+    // 审阅视图只在 includeContent=true（本机可操作者）时存在；远端默认不携带。
+    ...(summary.changes ? { changes: summary.changes } : {}),
     forwardAllowed,
     createdAt: summary.createdAt,
     updatedAt: summary.updatedAt,
@@ -72,19 +77,34 @@ export class WorldbookRepairControlPlane {
     this.#resolveSessionBinding = input.resolveSessionBinding;
   }
 
-  list(sessionId: string, limit = 50): readonly PublicWorldbookRepairControl[] {
+  list(
+    sessionId: string,
+    limit = 50,
+    includeContent = false,
+  ): readonly PublicWorldbookRepairControl[] {
     const forwardAllowed = worldbookRepairForwardAllowsSession(this.#runtime, sessionId);
-    return Object.freeze(this.#control.list(sessionId, limit).map((summary) => (
+    return Object.freeze(this.#control.list(sessionId, limit, includeContent).map((summary) => (
       publicSummary(summary, forwardAllowed)
     )));
   }
 
   /** Internal producer entrypoint only. No HTTP route accepts proposal bytes. */
-  async create(input: { readonly operationId: string; readonly proposal: unknown }): Promise<WorldbookRepairSummary> {
+  async create(input: { readonly operationId: string; readonly proposal: unknown;
+    readonly skillProof?: MaintenanceWorldbookSkillProposalProof;
+    readonly context?: MaintenanceStrictProposalContext;
+    readonly assertCurrent?: () => void;
+  }): Promise<WorldbookRepairSummary> {
+    const required = Object.hasOwn(input, 'skillProof');
+    if (required && (!input.context || typeof input.assertCurrent !== 'function')) {
+      throw new Error('maintenance-worldbook-skill-registration-required');
+    }
     const proposal = normalizeWorldbookRepairProposal(input.proposal);
     this.#assertForwardAllowed(proposal.sessionId);
     await this.#assertBound(proposal.sessionId, proposal.file);
-    return this.#control.create({ operationId: input.operationId, proposal });
+    // Binding may await external state; recheck live authority at the synchronous write boundary.
+    if (required) input.assertCurrent!();
+    return this.#control.create({ operationId: input.operationId, proposal,
+      ...(required ? { skillProof: input.skillProof, context: input.context } : {}) });
   }
 
   async mutate(input: {

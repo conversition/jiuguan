@@ -15,7 +15,10 @@
     "node": ">=22.7.0"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json"
+    "pretest": "pnpm build && pnpm test:types",
+    "build": "tsc -p tsconfig.json",
+    "test:types": "tsc -p tsconfig.tests.json",
+    "test": "node tests/run-all.mjs"
   },
   "dependencies": {}
 }

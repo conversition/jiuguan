@@ -46,6 +46,8 @@ export interface ScanOptions {
 export interface ActivatedEntry {
   id: number;
   uid: string;
+  /** Stable source boundary for downstream typed selectors (never inferred from prose). */
+  book: string;
   comment: string;
   content: string;
   constant: boolean;
@@ -173,7 +175,7 @@ export class LorebookScanner {
       // 语义补充不重复应用确定性概率门（概率已作为融合信号计入得分，避免双重过滤）；
       // 注入可读设定（剥 EJS/MVU/{{//}} 代码），模型看到的是设定正文而非代码噪音
       supplements.push({
-        id: row.id, uid: row.uid, comment: row.comment, content: readableLoreContent(row.content),
+        id: row.id, uid: row.uid, book: row.book, comment: row.comment, content: readableLoreContent(row.content),
         constant: false, matchType: 'semantic', score: s.score, order: 2,
         priority: s.priority, triggeredBy: s.triggeredBy,
       });
@@ -200,7 +202,7 @@ export class LorebookScanner {
     for (const row of rows) {
       // 1. 常量恒激活
       if (row.constant === 1) {
-        activated.push({ id: row.id, uid: row.uid, comment: row.comment, content: readableLoreContent(row.content), constant: true, matchType: 'constant', score: 1.0, order: 0 });
+        activated.push({ id: row.id, uid: row.uid, book: row.book, comment: row.comment, content: readableLoreContent(row.content), constant: true, matchType: 'constant', score: 1.0, order: 0 });
         stats.constant++;
         continue;
       }
@@ -235,7 +237,7 @@ export class LorebookScanner {
       }
 
       activated.push({
-        id: row.id, uid: row.uid, comment: row.comment, content: readableLoreContent(row.content),
+        id: row.id, uid: row.uid, book: row.book, comment: row.comment, content: readableLoreContent(row.content),
         constant: false, matchType, score: matchType === 'regex' ? 0.9 : 0.8, order: row.constant === 1 ? 0 : 1,
       });
     }

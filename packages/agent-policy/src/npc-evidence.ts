@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 
 export const NPC_EVIDENCE_VERSION = 'npc-evidence-v1';
 
-export type NpcEvidenceCategory = 'objective' | 'knowledge' | 'belief' | 'secret' | 'goal' | 'relationship';
+export type NpcEvidenceCategory = 'presence' | 'objective' | 'knowledge' | 'belief' | 'secret' | 'goal' | 'relationship';
 export type NpcProposalKind = 'npc_ambiguity_review' | 'npc_conflict_review' | 'npc_promotion_review';
 
 export interface NpcEvidenceRecord {
@@ -15,8 +15,19 @@ export interface NpcEvidenceRecord {
   readonly relationship?: boolean;
 }
 
+/**
+ * 只证明一个已注册 NPC 或人物候选在某轮被结构化声明为出场；它不是人物事实。
+ * entityKey 会在输出前摘要化，round 只用于让相邻回合的出场形成不同的 dirty signal。
+ */
+export interface NpcPresenceEvidenceRecord {
+  readonly entityKey: string;
+  readonly entityKind: 'registered' | 'candidate';
+  readonly round: number;
+}
+
 export interface BuildNpcEvidenceInput {
   readonly records: readonly NpcEvidenceRecord[];
+  readonly presences?: readonly NpcPresenceEvidenceRecord[];
   readonly outcome: {
     readonly hasAmbiguity: boolean;
     readonly hasConflict: boolean;
@@ -69,13 +80,13 @@ export interface NpcSessionProjection {
 
 const TOKEN = /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,239}$/u;
 const DIGEST = /^sha256:[a-f0-9]{64}$/u;
-const SIGNAL = /^npc:(objective|knowledge|belief|secret|goal|relationship):([a-f0-9]{64}):([a-f0-9]{64})$/u;
+const SIGNAL = /^npc:(presence|objective|knowledge|belief|secret|goal|relationship):([a-f0-9]{64}):([a-f0-9]{64})$/u;
 const PROPOSALS = new Set<NpcProposalKind>([
   'npc_ambiguity_review', 'npc_conflict_review', 'npc_promotion_review',
 ]);
 const SECRET_FIELD = /(?:^|[._:/-])(?:secret|secrets|classified|confidential)(?:$|[._:/-])|秘密|隐瞒|机密/u;
 const CATEGORIES: readonly NpcEvidenceCategory[] = Object.freeze([
-  'objective', 'knowledge', 'belief', 'secret', 'goal', 'relationship',
+  'presence', 'objective', 'knowledge', 'belief', 'secret', 'goal', 'relationship',
 ]);
 
 function shaHex(value: string): string {
@@ -110,7 +121,7 @@ function categoryOf(record: NpcEvidenceRecord): NpcEvidenceCategory {
  * hypothesis 固定映射到 belief，永远不能成为 objective。
  */
 export function buildDeterministicNpcEvidence(input: BuildNpcEvidenceInput): NpcEvidenceFeatures {
-  const signals = input.records.filter((record) => record.characterId.trim().length > 0).map((record) => {
+  const factSignals = input.records.filter((record) => record.characterId.trim().length > 0).map((record) => {
     const category = categoryOf(record);
     const character = shaHex(record.characterId.trim());
     const evidence = shaHex(JSON.stringify({
@@ -123,13 +134,22 @@ export function buildDeterministicNpcEvidence(input: BuildNpcEvidenceInput): Npc
     }));
     return `npc:${category}:${character}:${evidence}`;
   });
+  const presenceSignals = (input.presences ?? [])
+    .filter((record) => record.entityKey.trim().length > 0
+      && (record.entityKind === 'registered' || record.entityKind === 'candidate')
+      && Number.isSafeInteger(record.round) && record.round > 0)
+    .map((record) => {
+      const entity = shaHex(record.entityKey.trim());
+      const evidence = shaHex(JSON.stringify({ entityKind: record.entityKind, round: record.round }));
+      return `npc:presence:${entity}:${evidence}`;
+    });
   const proposals: NpcProposalKind[] = [];
   if (input.outcome.hasAmbiguity) proposals.push('npc_ambiguity_review');
   if (input.outcome.hasConflict) proposals.push('npc_conflict_review');
   if (input.outcome.hasPromotion) proposals.push('npc_promotion_review');
   return Object.freeze({
     npcEvidenceVersion: NPC_EVIDENCE_VERSION,
-    npcSignals: Object.freeze([...new Set(signals)].sort().slice(0, 32)),
+    npcSignals: Object.freeze([...new Set([...factSignals, ...presenceSignals])].sort().slice(0, 32)),
     npcProposalKinds: Object.freeze(proposals.sort()),
   });
 }
@@ -168,7 +188,7 @@ function validEvidence(row: NpcEvidenceEvent): NpcEvidenceFeatures | null {
 }
 
 function emptyCounts(): Record<NpcEvidenceCategory, number> {
-  return { objective: 0, knowledge: 0, belief: 0, secret: 0, goal: 0, relationship: 0 };
+  return { presence: 0, objective: 0, knowledge: 0, belief: 0, secret: 0, goal: 0, relationship: 0 };
 }
 
 function proposalId(sessionId: string, kind: NpcProposalKind, revision: string): string {

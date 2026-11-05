@@ -12,7 +12,9 @@
     "./public-record": "./dist/public-record.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json"
+    "build": "tsc -p tsconfig.json",
+    "test": "node --experimental-strip-types --experimental-transform-types tests/verify.ts && node --experimental-strip-types --experimental-transform-types tests/verify-dsh-host.ts",
+    "test:public-record": "node --experimental-strip-types --experimental-transform-types tests/verify-public-record.ts"
   },
   "dependencies": {}
 }

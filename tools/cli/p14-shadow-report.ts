@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-import { existsSync, lstatSync } from 'node:fs';
-import { resolve, join } from 'node:path';
+import { copyFileSync, existsSync, lstatSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { basename, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { TurnObservationStore, type TurnObservationRecord } from '../../packages/memory/src/turn-observation.ts';
@@ -28,6 +29,28 @@ import { resolveOperationalDataDirectory } from './operational-data-root.ts';
 export const P14_SHADOW_REPORT_VERSION = 'p14-shadow-report-v1' as const;
 export type EvidenceClass = 'operational' | 'fixture';
 
+export type P14SessionDbReadIssueCode =
+  | 'session-db-candidate-invalid'
+  | 'session-db-active-wal-read-failed'
+  | 'session-db-snapshot-read-failed';
+
+export interface P14SessionDbReadIssue {
+  /** Basename only: diagnostics must not disclose the host data-root path. */
+  readonly database: string;
+  readonly code: P14SessionDbReadIssueCode;
+  readonly sqliteCode?: string;
+  readonly sqliteErrcode?: number;
+}
+
+export interface P14ObservationReadSummary {
+  readonly candidateDatabases: number;
+  readonly directlyReadDatabases: number;
+  readonly snapshotRecoveredDatabases: number;
+  readonly skippedDatabases: number;
+  readonly complete: boolean;
+  readonly issues: readonly P14SessionDbReadIssue[];
+}
+
 export interface MaintenanceReportJob {
   readonly runId: string;
   readonly parentRunId: string | null;
@@ -46,6 +69,7 @@ export interface P14ShadowReportInput {
   readonly maintenanceJobs: readonly MaintenanceReportJob[];
   readonly evidenceClass: EvidenceClass;
   readonly generatedAt: string;
+  readonly observationRead?: P14ObservationReadSummary;
 }
 
 type CountMap = Readonly<Record<string, number>>;
@@ -80,6 +104,14 @@ export function buildP14ShadowReport(input: P14ShadowReportInput) {
     throw new Error('generatedAt-invalid');
   }
   const generatedAtMs = Date.parse(input.generatedAt);
+  const observationRead = input.observationRead ?? Object.freeze({
+    candidateDatabases: 0,
+    directlyReadDatabases: 0,
+    snapshotRecoveredDatabases: 0,
+    skippedDatabases: 0,
+    complete: true,
+    issues: Object.freeze([]),
+  });
   const observations = input.observations.filter((observation) => Date.parse(observation.createdAt) <= generatedAtMs);
   const accepted = new Set(observations.flatMap((observation) => {
     const key = acceptedKey(observation.sessionId, observation.runId);
@@ -156,11 +188,12 @@ export function buildP14ShadowReport(input: P14ShadowReportInput) {
   const observedDays = new Set(successfulObservations.map((row) => row.createdAt.slice(0, 10))).size;
   const successfulSamples = successfulObservations.length;
   const sampleThresholdMet = observedDays >= 7 || successfulSamples >= 100;
-  const operationalReady = input.evidenceClass === 'operational' && sampleThresholdMet;
+  const operationalReady = input.evidenceClass === 'operational' && sampleThresholdMet && observationRead.complete;
   return Object.freeze({
     reportVersion: P14_SHADOW_REPORT_VERSION,
     generatedAt: input.generatedAt,
     evidenceClass: input.evidenceClass,
+    observationRead,
     acceptedTurns: Object.freeze({ total: observations.length, successfulSamples, observedDays }),
     usage: Object.freeze({
       modelCalls: usage.length,
@@ -219,7 +252,8 @@ export function buildP14ShadowReport(input: P14ShadowReportInput) {
       minimumSuccessfulSamples: 100,
       sampleThresholdMet,
       operationalReady,
-      status: operationalReady ? 'ready' as const
+      status: !observationRead.complete ? 'source-read-incomplete' as const
+        : operationalReady ? 'ready' as const
         : input.evidenceClass === 'fixture' ? 'fixture-evidence-never-unlocks' as const
           : 'insufficient-operational-evidence' as const,
     }),
@@ -238,8 +272,12 @@ function readMaintenanceReportJobs(file: string): MaintenanceReportJob[] {
   if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('maintenance-report-file-invalid');
   const db = new DatabaseSync(file, { readOnly: true });
   try {
+    const version = pragma(db, 'user_version');
+    // v3 adds the fifth (worldbook_repair) task to the audit contract. Read-only reports must
+    // remain able to inspect a pre-upgrade v2 store, whose genuine four-task history is retained
+    // as-is; absence of a v2 worldbook row is evidence, not a row to synthesize.
     if (pragma(db, 'application_id') !== MAINTENANCE_JOB_APPLICATION_ID
-      || pragma(db, 'user_version') !== MAINTENANCE_JOB_SCHEMA_VERSION) {
+      || ![2, 3, 4, 5, 6, 7, MAINTENANCE_JOB_SCHEMA_VERSION].includes(version)) {
       throw new Error('maintenance-report-metadata-mismatch');
     }
     const rows = db.prepare(`
@@ -275,18 +313,104 @@ function readMaintenanceReportJobs(file: string): MaintenanceReportJob[] {
   }
 }
 
-function readObservations(dataDir: string): TurnObservationRecord[] {
+function readSessionObservations(file: string): TurnObservationRecord[] {
+  const db = new DatabaseSync(file, { readOnly: true });
+  try {
+    const table = db.prepare("SELECT 1 AS ok FROM sqlite_master WHERE type='table' AND name='turn_observation'").get();
+    return table ? new TurnObservationStore(db).list() : [];
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Open a private session database through an isolated copy. This is deliberately limited to
+ * databases without live WAL/SHM sidecars: copying an active WAL set is not an atomic snapshot.
+ * SQLite may create recovery sidecars beside the temporary copy, never beside the source DB.
+ */
+export function readP14SessionObservationsFromSnapshot(file: string): TurnObservationRecord[] {
+  if (existsSync(`${file}-wal`) || existsSync(`${file}-shm`)) {
+    throw new Error('session-db-active-wal-snapshot-refused');
+  }
+  const root = mkdtempSync(join(tmpdir(), 'jg-p14-report-session-'));
+  const copy = join(root, 'session.db');
+  try {
+    copyFileSync(file, copy);
+    return readSessionObservations(copy);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function sqliteDiagnostic(error: unknown): Pick<P14SessionDbReadIssue, 'sqliteCode' | 'sqliteErrcode'> {
+  if (!error || typeof error !== 'object') return {};
+  const value = error as { code?: unknown; errcode?: unknown };
+  return {
+    ...(typeof value.code === 'string' && /^[A-Z0-9_]{1,64}$/u.test(value.code)
+      ? { sqliteCode: value.code }
+      : {}),
+    ...(Number.isSafeInteger(value.errcode) && Number(value.errcode) >= 0
+      ? { sqliteErrcode: Number(value.errcode) }
+      : {}),
+  };
+}
+
+export function readP14Observations(dataDir: string): {
+  readonly observations: readonly TurnObservationRecord[];
+  readonly summary: P14ObservationReadSummary;
+} {
   const rows: TurnObservationRecord[] = [];
-  for (const file of scanSessionDbs(dataDir)) {
-    const db = new DatabaseSync(file, { readOnly: true });
+  const issues: P14SessionDbReadIssue[] = [];
+  const candidates = scanSessionDbs(dataDir);
+  let directlyReadDatabases = 0;
+  let snapshotRecoveredDatabases = 0;
+  for (const file of candidates) {
+    const database = basename(file);
+    let validCandidate = false;
     try {
-      const table = db.prepare("SELECT 1 AS ok FROM sqlite_master WHERE type='table' AND name='turn_observation'").get();
-      if (table) rows.push(...new TurnObservationStore(db).list());
-    } finally {
-      db.close();
+      const stat = lstatSync(file);
+      validCandidate = stat.isFile() && !stat.isSymbolicLink();
+    } catch {
+      // Report the stable reason code below; host paths and OS error messages stay private.
+    }
+    if (!validCandidate) {
+      issues.push(Object.freeze({ database, code: 'session-db-candidate-invalid' }));
+      continue;
+    }
+    try {
+      rows.push(...readSessionObservations(file));
+      directlyReadDatabases += 1;
+      continue;
+    } catch (directError) {
+      if (existsSync(`${file}-wal`) || existsSync(`${file}-shm`)) {
+        issues.push(Object.freeze({
+          database,
+          code: 'session-db-active-wal-read-failed',
+          ...sqliteDiagnostic(directError),
+        }));
+        continue;
+      }
+      try {
+        rows.push(...readP14SessionObservationsFromSnapshot(file));
+        snapshotRecoveredDatabases += 1;
+      } catch (snapshotError) {
+        issues.push(Object.freeze({
+          database,
+          code: 'session-db-snapshot-read-failed',
+          ...sqliteDiagnostic(snapshotError),
+        }));
+      }
     }
   }
-  return rows;
+  const summary = Object.freeze({
+    candidateDatabases: candidates.length,
+    directlyReadDatabases,
+    snapshotRecoveredDatabases,
+    skippedDatabases: issues.length,
+    complete: issues.length === 0,
+    issues: Object.freeze(issues),
+  });
+  return Object.freeze({ observations: Object.freeze(rows), summary });
 }
 
 export function buildP14ShadowReportFromDataDir(input: {
@@ -296,14 +420,16 @@ export function buildP14ShadowReportFromDataDir(input: {
 }) {
   const dataDir = resolve(input.dataDir);
   const admission = readAgentAdmissionFile(join(dataDir, AGENT_ADMISSION_DB_FILE));
+  const observationRead = readP14Observations(dataDir);
   return buildP14ShadowReport({
-    observations: readObservations(dataDir),
+    observations: observationRead.observations,
     usageRows: readModelUsageFile(join(dataDir, MODEL_USAGE_DB_FILE), { limit: 10_000 }),
     interactiveAdmissions: admission.interactive,
     maintenanceAdmissions: admission.maintenance,
     maintenanceJobs: readMaintenanceReportJobs(join(dataDir, MAINTENANCE_JOB_DB_FILE)),
     evidenceClass: input.evidenceClass ?? 'operational',
     generatedAt: input.generatedAt ?? new Date().toISOString(),
+    observationRead: observationRead.summary,
   });
 }
 
@@ -327,6 +453,7 @@ function main(): void {
   });
   process.stdout.write(`${JSON.stringify({ ...report, dataSource: data.source }, null,
     argv.includes('--compact') ? 0 : 2)}\n`);
+  if (!report.observationRead.complete) process.exitCode = 2;
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main();

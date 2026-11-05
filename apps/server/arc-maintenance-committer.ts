@@ -21,12 +21,29 @@ export class ArcMaintenanceCommitter {
     private readonly currentRevision: (sessionId: string) => string,
   ) {}
 
+  /** Exact historical readback; no current-source check and no business write. */
+  readCommitEvidence(input: ArcMaintenanceCommitRequest): ReturnType<ArcProjectionStore['readCommitEvidence']> {
+    return this.store.readCommitEvidence({ runId: input.runId, provenanceDigest: input.provenanceDigest,
+      proposal: () => normalizeArcMaintenanceProposal(input.proposal, input.context) });
+  }
+
+  /** Exact historical readback; no current-source check and no business write. */
+  recover(input: ArcMaintenanceCommitRequest): Extract<ArcProjectionCommitResult, { status: 'committed' }> | null {
+    return this.store.recover({ runId: input.runId, provenanceDigest: input.provenanceDigest,
+      proposal: () => normalizeArcMaintenanceProposal(input.proposal, input.context) });
+  }
+
   commit(input: ArcMaintenanceCommitRequest): ArcProjectionCommitResult {
     const proposal = normalizeArcMaintenanceProposal(input.proposal, input.context);
+    const expectedProjectionDigest = input.context.arcProjectionDigest;
+    if (!expectedProjectionDigest) {
+      throw new Error('arc-maintenance-projection-cas-required');
+    }
     return this.store.commit({
       runId: input.runId,
       proposal,
       provenanceDigest: input.provenanceDigest,
+      expectedProjectionDigest,
       currentRevision: () => this.currentRevision(proposal.sessionId),
     });
   }

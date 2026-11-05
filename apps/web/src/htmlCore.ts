@@ -163,7 +163,7 @@ export const PARENT_PROXY_SNIPPET = `<script>(function(){
   var realParent = null;
   try { realParent = window['parent']; } catch (e) { realParent = null; }
   // 宿主能力注册表：真实实现由 ST_COMPAT_SNIPPET 注册（reg()），代理只做按名转发。
-  // 早期版本用硬编码白名单「查 window 上有没有」，而真实卡（示例卡 开场页）自建局部
+  // 早期版本用硬编码白名单「查 window 上有没有」，而真实卡（WuWa 开场页）自建局部
   // getSTFn 查 ST_WIN[fnName] —— 白名单未覆盖 getWorldbook / updateWorldbookWith /
   // getCharWorldbookNames / getLastMessageId / Mvu，导致卡拿到 null 后在世界书写入处
   // catch→return，永远走不到「填草稿」那一步。
@@ -194,7 +194,7 @@ export const PARENT_PROXY_SNIPPET = `<script>(function(){
       var v = hostLookup(p);
       if (typeof v !== 'undefined') return v;
       // 2) 本 realm 全局回落：共享脚本把导出写在 window / globalThis 上
-      //    （如 calculateStoryLogic / CardShared），而开局页经 ST_WIN[name] 读取 ——
+      //    （如 calculateStoryLogic / WuWaShared），而开局页经 ST_WIN[name] 读取 ——
       //    **写入位置与读取位置必须一致**。此前只查注册表，导致卡自检
       //    checkGlobal('calculateStoryLogic') 恒为 false（面板误报「剧情逻辑未检测到」）。
       //    自指保护：读回代理自身视为不存在，避免与父窗口引用形成环。
@@ -319,9 +319,9 @@ function interactiveHead(
 /**
  * 延后卡页面的**内联**脚本：改写为不执行的类型，等共享脚本就绪后由引导器原位恢复执行。
  *
- * 为什么必须延后：真实卡（示例卡）在页面加载时对依赖**只检测一次**
+ * 为什么必须延后：真实卡（WuWa）在页面加载时对依赖**只检测一次**
  * （`await detectEnvironment()` → `initializeUI()`），而共享脚本是异步加载的
- * （MVU 内核为远程 ESM）。不延后 → 检测时 `CardShared` 尚不存在 → 版本下拉框永远为空。
+ * （MVU 内核为远程 ESM）。不延后 → 检测时 `WuWaShared` 尚不存在 → 版本下拉框永远为空。
  *
  * FE-03 修正：**不再「只延后内联」** —— 外链脚本同样延后，恢复时按文档原序、并可等待外链
  * 加载完成（复现原解析阻塞语义）。分策略依据见 compat/resourceLoader.ts#planScriptDeferral：
@@ -483,7 +483,7 @@ window.__jgfhRpc = function(ns, op, payload){
  *  - toastr（info/success/warning/error）→ console 占位（宿主暂无 UI toast 通道）
  *  - 脚本向 #send_textarea 填值 / 触发 input（酒馆"注入输入框"习惯）→ __jgfh draft → 宿主真实输入框
  *  - SillyTavern.getContext().generateQuietPrompt(prompt)（AI 补全）→ __jgfh rpc ai.generate → 宿主后端静默生成，消费 reply 回真实文本
- *  - SillyTavern.getContext().isGenerating（无声生成进行中）→ 往返期 truthy（示例卡 类卡轮询等待）
+ *  - SillyTavern.getContext().isGenerating（无声生成进行中）→ 往返期 truthy（WuWa 类卡轮询等待）
  *  - SillyTavern.getContext() 其余字段（name1/name2/character/chat…）→ 起步拉一次 __jgfh rpc session.getContext 回填真实会话数据，未取到用安全默认
  * 需在 PARENT_PROXY 之后、AUTO_HEIGHT 之前注入；并经 PARENT_PROXY 白名单让 ST_WIN=window.parent 能取到 shim。 */
 export const ST_COMPAT_SNIPPET = buildStCompatSnippet();
@@ -622,7 +622,7 @@ export function buildStCompatSnippet(): string {
   }
 
   // ══ 宿主能力注册表：PARENT_PROXY 的 __jgSafeParent 按名转发到这里 ══
-  // 卡（示例卡 开场页）不调用 window.getSTFn，而是自建局部 getSTFn 查 ST_WIN[fnName]；
+  // 卡（WuWa 开场页）不调用 window.getSTFn，而是自建局部 getSTFn 查 ST_WIN[fnName]；
   // 所以能力必须挂在**父窗口查找路径**上，否则卡拿到 null 后会在写入处 catch→return。
   var hostApi = (function(){
     var existing = window.__jgHostApi;

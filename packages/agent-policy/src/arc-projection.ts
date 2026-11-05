@@ -88,13 +88,20 @@ function digest(value: string): string {
   return `sha256:${createHash('sha256').update(value.normalize('NFKC').trim(), 'utf8').digest('hex')}`;
 }
 
-function arcId(value: string): string { return `arc:${digest(value)}`; }
+/**
+ * Stable Arc identity shared by the central digest-only projection and
+ * trusted-local review surfaces.  Callers must never reimplement this hash:
+ * even a small normalization difference would make a human-readable label
+ * appear to describe a different Arc.
+ */
+export function arcProjectionIdForName(value: string): string { return `arc:${digest(value)}`; }
 
 function boundedUnique(values: readonly string[], limit = 32): readonly string[] {
   return Object.freeze([...new Set(values)].sort().slice(0, limit));
 }
 
-function currentArcNames(value: string): string[] {
+/** Split `roadmap.current_arc` exactly as the Arc evidence projector does. */
+export function arcProjectionNames(value: string): string[] {
   return value.normalize('NFKC').split(/[|/｜／\n]+/u).map((item) => item.trim()).filter(Boolean).slice(0, 8);
 }
 
@@ -109,8 +116,8 @@ function statusSignal(stage: string, milestone: string): ArcStatusSignal {
 /** 从已校验 game_turn 的结构化字段生成摘要/枚举；返回值不携带任何来源正文。 */
 export function buildDeterministicArcEvidence(input: BuildArcEvidenceInput): ArcEvidenceFeatures {
   const roadmap = input.plan.roadmap ?? {};
-  const names = currentArcNames(roadmap.current_arc ?? '');
-  const arcIds = boundedUnique(names.map(arcId), 8);
+  const names = arcProjectionNames(roadmap.current_arc ?? '');
+  const arcIds = boundedUnique(names.map(arcProjectionIdForName), 8);
   const stage = roadmap.current_stage ?? '';
   const milestone = roadmap.next_milestone ?? input.plan.next_plan ?? '';
   const foreshadowing = (roadmap.active_foreshadowing ?? []).slice(0, 32);

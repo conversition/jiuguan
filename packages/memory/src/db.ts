@@ -3,13 +3,93 @@
  * node:sqlite (DatabaseSync) 封装：schema 初始化、WAL、备份、健康检查。
  */
 import { DatabaseSync } from 'node:sqlite';
-import { SCHEMA_V3, SCHEMA_VERSION, STATE_STORE_SQL, SNAPSHOT_PROVENANCE_SQL, STATE_EPOCH_SQL, CHARACTER_STORE_SQL, CHARACTER_POOL_SQL, TURN_OBSERVATION_SQL, LEARNING_OUTBOX_SQL } from './schema.ts';
+import {
+  CHARACTER_POOL_SQL,
+  CHARACTER_STORE_SQL,
+  DIRECTOR_CONTINUITY_SQL,
+  LEARNING_OUTBOX_SQL,
+  SCHEMA_V3,
+  SCHEMA_VERSION,
+  SNAPSHOT_PROVENANCE_SQL,
+  STATE_EPOCH_SQL,
+  STATE_STORE_SQL,
+  TURN_OBSERVATION_SQL,
+} from './schema.ts';
+import {
+  ensureSessionAuthorityV17,
+  inspectSessionAuthoritySchema,
+  inspectSessionPredecessorV16Storage,
+  inspectSessionAuthorityStorage,
+  readSessionAuthorityCoordinate,
+  rotateSessionAuthorityGeneration,
+  sessionFenceCallbackIsDeferred,
+  sessionFenceCallbackIsProxy,
+  sessionFenceResultIsAsynchronous,
+  type SessionAuthorityCoordinate,
+} from './session-authority.ts';
+import { SESSION_STORAGE_PREDECESSOR_VERSION } from './session-storage-contract.ts';
+import { inspectRpChildAnalysisStorage } from './rp-child-analysis.ts';
+import { inspectToolResultBodyStorage } from './tool-result-body.ts';
+import {
+  computeSessionDatabaseSnapshotInTransaction,
+  type SessionDatabaseSnapshot,
+} from './session-snapshot.ts';
 
 export interface MemoryDbOptions {
   /** 数据库文件路径；缺省为内存库（测试用） */
   path?: string;
   /** 自动执行 schema + migration */
   autoInit?: boolean;
+  /** 严格只读观察；隐含不执行 schema、迁移或 authority generation 轮换。 */
+  readOnly?: boolean;
+}
+
+/** Frozen Session truth observed under the private claim writer reservation. */
+export interface SessionClaimFenceSnapshot {
+  readonly authority: SessionAuthorityCoordinate;
+  readonly databaseSnapshot: SessionDatabaseSnapshot;
+}
+
+const SESSION_EXTERNAL_CONTENT_FTS_REBUILDS = Object.freeze([
+  {
+    table: 'fts_arc',
+    select: "SELECT id,summary,'arc' FROM memory_arc",
+  },
+  {
+    table: 'fts_summary',
+    select: "SELECT id,delta,'summary' FROM memory_summary",
+  },
+  {
+    table: 'fts_event',
+    select: "SELECT id,description,'event' FROM memory_event",
+  },
+  {
+    table: 'fts_state',
+    select: "SELECT id,name || ' ' || state_json,'state' FROM memory_state",
+  },
+  {
+    table: 'fts_lore',
+    select: "SELECT id,comment || ' ' || content,'lore' FROM lorebook_entry",
+  },
+] as const);
+const SESSION_EXTERNAL_CONTENT_FTS_TRIGGER_NAMES = Object.freeze([
+  'arc_ai', 'arc_ad', 'arc_au',
+  'sum_ai', 'sum_ad', 'sum_au',
+  'evt_ai', 'evt_ad', 'evt_au',
+  'st_ai', 'st_ad', 'st_au',
+  'lore_ai', 'lore_ad', 'lore_au',
+] as const);
+
+function rebuildSessionFtsSynchronizationTriggers(db: DatabaseSync): void {
+  for (const name of SESSION_EXTERNAL_CONTENT_FTS_TRIGGER_NAMES) {
+    const definition = SCHEMA_V3.match(new RegExp(
+      `CREATE TRIGGER IF NOT EXISTS\\s+${name}\\b[\\s\\S]*?\\bEND;`,
+      'iu',
+    ))?.[0];
+    if (!definition) throw new Error(`session-fts-trigger-definition-missing:${name}`);
+    db.exec(`DROP TRIGGER IF EXISTS ${name};`);
+    db.exec(definition);
+  }
 }
 
 /** 增量迁移（v1 → 当前版本，幂等：已存在的列/表自动跳过）。
@@ -241,24 +321,127 @@ const MIGRATIONS: { version: number; apply: (db: DatabaseSync) => void }[] = [
       db.exec(LEARNING_OUTBOX_SQL);
     },
   },
+  {
+    version: 16,
+    apply: (db) => {
+      // P14 NPC identity：只新增操作账；既有 character_alias 不伪造历史来源。
+      db.exec(CHARACTER_STORE_SQL);
+    },
+  },
+  {
+    version: 17,
+    apply: (db) => {
+      // P17 §13.90-A2: empty Director tables + no-ABA Session authority.
+      // Existing facts are preserved and begin at revision zero; no history is fabricated.
+      // Reconcile partial legacy/test files whose user_version says the old
+      // migrations ran even though one of their tables or columns is absent.
+      // Every statement is idempotent; no existing business row is rewritten.
+      db.exec(STATE_STORE_SQL);
+      for (const sql of SNAPSHOT_PROVENANCE_SQL.split(';').map((x) => x.trim()).filter(Boolean)) {
+        try { db.exec(sql); } catch { /* column already exists */ }
+      }
+      for (const sql of STATE_EPOCH_SQL.split(';').map((x) => x.trim()).filter(Boolean)) {
+        try { db.exec(sql); } catch { /* column/table already exists */ }
+      }
+      db.exec(CHARACTER_STORE_SQL);
+      db.exec(CHARACTER_POOL_SQL);
+      const metaColumns = new Set((db.prepare('PRAGMA table_info(memory_meta)').all() as Array<{
+        name: string;
+      }>).map((row) => row.name));
+      if (!metaColumns.has('longterm')) {
+        db.exec('ALTER TABLE memory_meta ADD COLUMN longterm TEXT DEFAULT ""');
+      }
+      if (!metaColumns.has('summary_round')) {
+        db.exec('ALTER TABLE memory_meta ADD COLUMN summary_round INTEGER DEFAULT 0');
+      }
+      // SCHEMA_V3 recreates a missing external-content FTS table, but SQLite
+      // does not backfill its index from the content table automatically.
+      // Rebuild every derived index while authority is still absent so a v16
+      // file cannot migrate successfully yet silently lose historic recall.
+      // The same-name source triggers are replaced from the canonical baseline
+      // first: CREATE IF NOT EXISTS alone would preserve a stale no-op trigger.
+      rebuildSessionFtsSynchronizationTriggers(db);
+      for (const { table, select } of SESSION_EXTERNAL_CONTENT_FTS_REBUILDS) {
+        // SQLite's built-in FTS5 `rebuild` command reads same-named columns
+        // from the external content table.  Our canonical index deliberately
+        // maps heterogeneous source columns into (content, category), so the
+        // only correct rebuild is the same explicit mapping used by triggers.
+        db.exec(`
+          INSERT INTO ${table}(${table}) VALUES('delete-all');
+          INSERT INTO ${table}(rowid,content,category) ${select};
+        `);
+      }
+      db.exec(DIRECTOR_CONTINUITY_SQL);
+      ensureSessionAuthorityV17(db);
+    },
+  },
 ];
 
 export class MemoryDb {
   readonly db: DatabaseSync;
   #transactionDepth = 0;
+  readonly #readOnly: boolean;
+  readonly #filePath: string | null;
+  #sessionClaimFenceAvailable = false;
 
   constructor(opts: MemoryDbOptions = {}) {
-    this.db = opts.path ? new DatabaseSync(opts.path) : new DatabaseSync(':memory:');
-    if (opts.autoInit !== false) {
-      // 新库全量建表（幂等）；旧库仅建缺失表，遗留差异由 MIGRATIONS 补齐
-      this.db.exec(SCHEMA_V3);
-      this.migrate();
+    this.#readOnly = opts.readOnly === true;
+    const requestedPath = opts.path ?? ':memory:';
+    if (this.#readOnly && requestedPath === ':memory:') {
+      throw new Error('memory-db-read-only-file-required');
+    }
+    this.db = this.#readOnly
+      ? new DatabaseSync(requestedPath, { readOnly: true })
+      : new DatabaseSync(requestedPath);
+    this.#filePath = this.db.location('main');
+    try {
+      // Every mode, including read-only metadata and autoInit:false tools,
+      // must reject unknown future semantics before returning a usable handle.
+      const openingVersion = this.userVersion();
+      if (openingVersion > SCHEMA_VERSION) {
+        throw new Error('session-schema-too-new');
+      }
+      // A current authoritative database may repair only its trigger layer
+      // under a new generation. Required source storage must exist before
+      // SCHEMA_V3 gets any chance to recreate an empty table over lost truth.
+      if (openingVersion === SESSION_STORAGE_PREDECESSOR_VERSION) {
+        inspectSessionPredecessorV16Storage(this.db);
+      } else if (openingVersion === SCHEMA_VERSION) {
+        inspectSessionAuthorityStorage(this.db);
+      }
+      inspectRpChildAnalysisStorage(this.db);
+      inspectToolResultBodyStorage(this.db);
+      if (!this.#readOnly && opts.autoInit !== false) {
+        if (openingVersion < SCHEMA_VERSION) {
+          // New/legacy databases need the full idempotent baseline before the
+          // numbered migrations fill predecessor-specific differences.
+          this.db.exec(SCHEMA_V3);
+          this.migrate();
+        } else {
+          // A current authoritative database must never run CREATE IF NOT
+          // EXISTS between validation and generation rotation: another writer
+          // could otherwise drop truth in that window and have it recreated as
+          // an empty table. Connection PRAGMAs contain no repair DDL; rotate()
+          // revalidates storage after acquiring its own writer reservation.
+          this.db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;');
+        }
+        rotateSessionAuthorityGeneration(this.db);
+        this.#sessionClaimFenceAvailable = true;
+      }
+    } catch (error) {
+      // A constructor that fails validation/migration must not strand a
+      // Windows file handle or writer lock that masks the primary error.
+      if (this.db.isOpen) {
+        try { this.db.close(); } catch { /* preserve the primary error */ }
+      }
+      throw error;
     }
   }
 
   /** 版本化迁移：把旧库逐级升到当前 SCHEMA_VERSION（0.5.0 引入 user_version 追踪） */
   private migrate(): void {
     let current = this.userVersion();
+    if (current > SCHEMA_VERSION) throw new Error('session-schema-too-new');
     while (current < SCHEMA_VERSION) {
       const target = current + 1;
       const mig = MIGRATIONS.find((m) => m.version === target);
@@ -287,7 +470,7 @@ export class MemoryDb {
   /** 可组合同步事务：内层调用复用外层事务，不重复 BEGIN/COMMIT。 */
   transaction<T>(work: () => T): T {
     if (this.#transactionDepth > 0) return work();
-    this.db.exec('BEGIN IMMEDIATE');
+    this.db.exec(this.#readOnly ? 'BEGIN' : 'BEGIN IMMEDIATE');
     this.#transactionDepth = 1;
     try {
       const result = work();
@@ -303,6 +486,75 @@ export class MemoryDb {
 
   get inTransaction(): boolean {
     return this.#transactionDepth > 0;
+  }
+
+  /** Point-in-time observation only; no claim lock survives this call. */
+  readSessionAuthority(): SessionAuthorityCoordinate {
+    return readSessionAuthorityCoordinate(this.db);
+  }
+
+  /**
+   * Holds a private writer reservation on this durable Session database while
+   * a synchronous callback consumes a frozen authority coordinate and business
+   * snapshot.  The callback never receives the private connection.  Therefore
+   * even code that captured the public `db` handle cannot COMMIT through the
+   * fence: every other Session writer remains excluded for the dynamic scope.
+   */
+  withSessionClaimFence<T>(
+    callback: (snapshot: SessionClaimFenceSnapshot) => T,
+  ): T {
+    if (typeof callback !== 'function' || sessionFenceCallbackIsProxy(callback)
+      || sessionFenceCallbackIsDeferred(callback as (...args: never[]) => unknown)) {
+      throw new Error('session-claim-fence-callback-invalid');
+    }
+    if (this.#readOnly || !this.#filePath) {
+      throw new Error('session-claim-fence-file-backed-required');
+    }
+    if (!this.#sessionClaimFenceAvailable) {
+      throw new Error('session-claim-fence-managed-open-required');
+    }
+    if (this.#transactionDepth > 0 || this.db.isTransaction) {
+      throw new Error('session-claim-fence-transaction-active');
+    }
+
+    // TEMP triggers are connection-local. Validate the public connection too,
+    // otherwise a captured raw handle could hide a rogue TEMP trigger from the
+    // private fence connection's sqlite_temp_master inspection.
+    inspectSessionAuthoritySchema(this.db);
+    const fenceDb = new DatabaseSync(this.#filePath);
+    let failed = false;
+    let primaryError: unknown;
+    let output!: T;
+    let hasOutput = false;
+    try {
+      fenceDb.exec('PRAGMA busy_timeout=0; BEGIN IMMEDIATE;');
+      inspectSessionAuthoritySchema(fenceDb);
+      const snapshot: SessionClaimFenceSnapshot = Object.freeze({
+        authority: readSessionAuthorityCoordinate(fenceDb),
+        databaseSnapshot: computeSessionDatabaseSnapshotInTransaction(fenceDb),
+      });
+      const result = callback(snapshot);
+      if (sessionFenceResultIsAsynchronous(result)) {
+        throw new Error('session-claim-fence-result-async');
+      }
+      output = result;
+      hasOutput = true;
+    } catch (error) {
+      failed = true;
+      primaryError = error;
+    }
+
+    let cleanupError: unknown;
+    if (fenceDb.isTransaction) {
+      try { fenceDb.exec('ROLLBACK;'); } catch (error) { cleanupError = error; }
+    }
+    if (fenceDb.isOpen) {
+      try { fenceDb.close(); } catch (error) { cleanupError ??= error; }
+    }
+    if (failed) throw primaryError;
+    if (cleanupError !== undefined) throw cleanupError;
+    if (!hasOutput) throw new Error('session-claim-fence-result-missing');
+    return output;
   }
 
   /** WAL checkpoint（备份/退出前调用） */

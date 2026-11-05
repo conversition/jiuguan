@@ -11,6 +11,7 @@ import {
   writeSync,
 } from 'node:fs';
 import { randomUUID } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { basename, dirname, join, resolve } from 'node:path';
 import { snapshotRestoreWorkspacePath } from './snapshot-restore-layout.ts';
 
@@ -67,6 +68,29 @@ function artifactSuffix(randomId: () => string): string {
   return value;
 }
 
+/**
+ * Windows 上复核 PID 是否真的存在。
+ *
+ * Node/libuv 在 Windows 的 EPERM 语义与 POSIX 不同：已终止、但 PID 尚未被系统回收的
+ * “僵尸 PID”同样返回 EPERM（实测该 pid 已从 Get-Process / Win32_Process 中消失，
+ * 仍稳定返回 EPERM；而真正不存在的 pid 返回 ESRCH）。因此 EPERM 不能直接采信为存活，
+ * 否则一次非正常退出（崩溃 / taskkill /F）留下的进程锁会永久 fail-closed，服务再也起不来。
+ * 这里用 tasklist 复核；tasklist 自身探测失败时返回 true，继续保持 fail-closed 安全语义。
+ */
+function isWindowsProcessAlive(pid: number): boolean {
+  try {
+    const output = execFileSync('tasklist.exe', ['/FI', `PID eq ${pid}`, '/NH', '/FO', 'CSV'], {
+      encoding: 'utf8',
+      windowsHide: true,
+      timeout: 5_000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    return new RegExp(`,"${pid}",|,${pid},`).test(output);
+  } catch {
+    return true;
+  }
+}
+
 function defaultIsProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -74,7 +98,11 @@ function defaultIsProcessAlive(pid: number): boolean {
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === 'ESRCH') return false;
-    if (code === 'EPERM') return true;
+    if (code === 'EPERM') {
+      // POSIX：进程存在但当前身份无权发信号 → 存活（PID 复用最多 fail-closed，不会双写）。
+      // Windows：僵尸 PID 也给 EPERM → 必须复核，否则残留锁永久拒绝启动。
+      return process.platform === 'win32' ? isWindowsProcessAlive(pid) : true;
+    }
     throw error;
   }
 }

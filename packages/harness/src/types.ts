@@ -1,4 +1,7 @@
 /** P13 有界 Harness 的可注入核心；生产仅能由已接受 ADR 的服务端 lane 复用。 */
+import type { HarnessResultCompleteness } from './engine-result-contract.ts';
+import type { HarnessFailureMetadata } from './engine-failure-contract.ts';
+import type { ToolResultContractMetadata } from './tool-result-contract.ts';
 
 export interface HarnessClock { nowMs(): number; }
 
@@ -29,12 +32,24 @@ export interface HarnessMessage {
   readonly role: 'user' | 'assistant' | 'tool';
   readonly content: string;
   readonly toolCallId?: string;
+  /** Trusted host metadata stays available even when a tiny payload cap cannot fit the partial marker. */
+  readonly toolResultMetadata?: ToolResultContractMetadata;
 }
 
 export interface HarnessTool<S = unknown> {
   readonly name: string;
   readonly description: string;
-  validate(args: unknown): { ok: true; value: S } | { ok: false; error: string };
+  validate(args: unknown):
+    | { ok: true; value: S }
+    | {
+      readonly ok: false;
+      readonly error: string;
+      /**
+       * Explicitly safe, value-free code that may be returned to the model and trace.
+       * The Harness still validates its syntax and falls back to `schema-rejected`.
+       */
+      readonly rejectionCode?: string;
+    };
   execute(value: S, context: ToolContext): Promise<ToolOutcome>;
 }
 
@@ -255,10 +270,14 @@ export interface HarnessResult {
   readonly status: 'final-answer' | 'budget-exhausted' | 'model-error' | 'cancelled';
   /** 稳定的一等终止合同；调用方不得再通过反扫 trace 推断。 */
   readonly terminationReason: HarnessTerminationReason;
+  /** Closed terminal diagnostics; null on success, independent of bounded trace and payload completeness. */
+  readonly failure: HarnessFailureMetadata | null;
   readonly finalAnswer: string | null;
   readonly state: Record<string, unknown>;
   readonly trace: readonly TraceStep[];
   readonly budget: BudgetSnapshot;
   /** 只有 final-answer 才允许为 true。 */
   readonly committed: boolean;
+  /** Independent of task status and bounded trace; covers every observed successful string tool output. */
+  readonly completeness: HarnessResultCompleteness;
 }

@@ -1,0 +1,23 @@
+{
+  "name": "@jiuguan/skill-hub",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Pure contracts, deterministic selection, whole-body admission and candidate lifecycle for Agent Skills",
+  "sideEffects": false,
+  "exports": {
+    ".": "./src/index.ts",
+    "./manifest": "./src/manifest.ts",
+    "./selector": "./src/selector.ts",
+    "./materialization": "./src/materialization.ts",
+    "./consumption": "./src/consumption.ts",
+    "./lifecycle": "./src/lifecycle.ts",
+    "./evidence": "./src/evidence.ts",
+    "./operational-source": "./src/operational-source.ts"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --experimental-transform-types tests/verify-manifest.ts && node --experimental-strip-types --experimental-transform-types tests/verify-selector.ts && node --experimental-strip-types --experimental-transform-types tests/verify-consumption.ts && node --experimental-strip-types --experimental-transform-types tests/verify-lifecycle.ts && node --experimental-strip-types --experimental-transform-types tests/verify-evidence.ts && node --experimental-strip-types --experimental-transform-types tests/verify-operational-source.ts && node --experimental-strip-types --experimental-transform-types tests/verify-import-boundaries.ts && node --experimental-strip-types --experimental-transform-types tests/verify-package-v2.ts",
+    "test:evidence": "node --experimental-strip-types --experimental-transform-types tests/verify-evidence.ts",
+    "typecheck": "tsc -p tsconfig.json"
+  }
+}

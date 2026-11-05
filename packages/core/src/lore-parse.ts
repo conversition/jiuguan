@@ -3,14 +3,14 @@
  *
  * 背景：角色卡/世界书的 lorebook_entry.content 绝大多数是「{{//…}} 注释 + <%_…%> EJS/MVU 变量逻辑」
  * 混合体，直接整条向量化会把模板/代码语言当成语义特征，导致「会长」这类称谓检索不到
- * 「角色乙（学生会长）」。本模块把每条切成三类段：
+ * 「示例角色A（学生会长）」。本模块把每条切成三类段：
  *   ① 注释段（{{//…}}）   —— 人设/指令说明，提取为设定候选
  *   ② EJS/MVU 代码段     —— 识别其中变量读写并结构化保留（variableRules，不参与向量切分、不丢失）
  *   ③ 纯设定文本段       —— markdown/YAML 正文，作为可检索的自然语言设定（语义切分对象）
  *
  * 别名策略：除逐条 alias/identity 外，做「职位简写推导」——把「示例学园学生会长」推导出
  * 「学生会长/会长」，仅当全库该简写唯一映射时注册（避免「大小姐」等多实体歧义）。
- * 建成全局别名索引后，检索「会长」即可确定性命中「角色乙」条目。
+ * 建成全局别名索引后，检索「会长」即可确定性命中「示例角色A」条目。
  */
 import type { LoreRow } from './scanner.ts';
 
@@ -99,7 +99,7 @@ export interface ParsedLoreEntry {
 
 /** 别名索引条目 */
 export interface AliasEntry {
-  /** 实体规范名（如 角色乙） */
+  /** 实体规范名（如 示例角色A） */
   entityName: string;
   /** 该别名的所有条目 id（通常多个条目描述同一实体） */
   entryIds: number[];
@@ -212,8 +212,8 @@ export function parseLoreEntries(entries: LoreEntryLike[], book = ''): ParsedLor
 
 /**
  * 解析「名册式」YAML：`- 实体名:` 头下的 `alias:` 子项绑定为「实体名 → 别名」。
- * 例：角色名册条目里 each `- 角色乙:` → alias: [示例学园学生会长, 角色乙…]。
- * 返回：{ entityName, aliases }[]（entityName 由实体头规范化，如 角色乙）。
+ * 例：示例卡组列表条目里 each `- 示例角色A:` → alias: [示例学园学生会长, 示例名…]。
+ * 返回：{ entityName, aliases }[]（entityName 由实体头规范化，如 示例角色A）。
  */
 export function extractYamlEntities(content: string): { entityName: string; aliases: string[] }[] {
   const out: { entityName: string; aliases: string[] }[] = [];
@@ -222,7 +222,7 @@ export function extractYamlEntities(content: string): { entityName: string; alia
   for (const hm of content.matchAll(headerRe)) {
     const headIndent = hm[1].length;
     let name = hm[2].trim();
-    // 规范化实体名：剥掉列表符号「- 」、去「（…」、合并空格（角色 乙 → 角色乙）
+    // 规范化实体名：剥掉列表符号「- 」、去「（…」、合并空格（示例 角色A → 示例角色A）
     name = name.replace(/^[-·•]\s*/, '').split('（')[0].replace(/\s+/g, '').trim();
     if (!name || name.length < 2 || /^(alias|mahoshojos|characters|entity)$/.test(name)) continue;
     if (name.endsWith('）')) name = name.slice(0, -1);
@@ -251,9 +251,9 @@ export function extractYamlEntities(content: string): { entityName: string; alia
 /**
  * 从 content + comment 提取显式别名。
  * 来源：
- *   - YAML alias: 列表（角色名册等）
+ *   - YAML alias: 列表（示例卡组列表等）
  *   - YAML identity: / 身份: 数组字面量
- *   - comment 开头的人名（如「角色 乙」）
+ *   - comment 开头的人名（如「示例 角色A」）
  */
 export function extractAliases(content: string, comment: string): string[] {
   const out = new Set<string>();
@@ -280,12 +280,12 @@ export function extractAliases(content: string, comment: string): string[] {
     for (const m of after.matchAll(/^([ \t]*)-\s*['"']?([^'"#\n]+)['"']?\s*$/gm)) {
       if (m[1].length <= baseIndent) break; // 离开本块缩进层级
       const a = m[2].trim();
-      if (/[:：]$/.test(a)) break; // 下一个实体头（- 角色丙:）
+      if (/[:：]$/.test(a)) break; // 下一个实体头（- 神乐坂琴音:）
       if (a.length >= 2) out.add(a);
     }
   }
 
-  // (c) comment 里的人名（形如「角色 乙」「【线索】角色 乙」）
+  // (c) comment 里的人名（形如「示例 角色A」「【线索】示例 角色A」）
   const nameM = comment.match(/([一-龥]{2,4})\s*([一-龥]{1,3})/);
   if (nameM) {
     const full = nameM[1] + nameM[2];
@@ -301,7 +301,7 @@ export function extractAliases(content: string, comment: string): string[] {
 /** 职位称谓词（用于简写推导）→ 检测后缀 */
 const POSITION_SUFFIXES = ['学生会长', '会长', '委员长', '大小姐', '大天使', '巫女', '偶像', '大姐头', '前辈姐姐', '千金', '继承人'];
 
-/** 实体名规范化：去掉尾随括号/冒号，合并空格（角色 乙 → 角色乙） */
+/** 实体名规范化：去掉尾随括号/冒号，合并空格（示例 角色A → 示例角色A） */
 function normalizeEntityName(name: string): string {
   return name.trim().split('（')[0].replace(/[:：]\s*$/, '').replace(/\s+/g, '');
 }
@@ -327,7 +327,7 @@ export function buildAliasIndex(parsed: ParsedLoreEntry[]): Map<string, AliasEnt
     index.set(alias, { entityName, entryIds: [entryId], explicit });
   };
 
-  /** 注册别名 + 「·」分隔后缀简写（示例组织·角色甲 → 角色甲），登记 entityByName */
+  /** 注册别名 + 「·」分隔后缀简写（示例卡组·示例别名 → 示例别名），登记 entityByName */
   const addWithDot = (a: string, entryId: number, entityName: string) => {
     add(a, entryId, entityName, true);
     const list = entityByName.get(entityName) ?? [];
@@ -385,7 +385,7 @@ export function buildAliasIndex(parsed: ParsedLoreEntry[]): Map<string, AliasEnt
   return index;
 }
 
-/** 从 comment 推断实体规范名（姓+名，如 角色乙）。优先取「像人名」的候选，排除列表/职位/非人名。 */
+/** 从 comment 推断实体规范名（姓+名，如 示例角色A）。优先取「像人名」的候选，排除列表/职位/非人名。 */
 const NAME_SUFFIX_ALLOW = 4;
 const NON_NAME_SUFFIX = /(列表|大全|索引|标题|知识库|名册|概要|规则|奖励|记录|档案|库|表)$/;
 const SURNAME_HINTS = '桐物神月森因宇井白夜夏星雾天宫飞千高坂上凉道';
@@ -407,7 +407,7 @@ function inferEntityName(comment: string, aliases: string[]): string {
     const cand = m[1] + m[2];
     if (looksLikeName(cand)) return cand;
   }
-  // 2) 从别名里找带姓氏的人名（角色乙、角色丙…）
+  // 2) 从别名里找带姓氏的人名（示例角色A、神乐坂琴音…）
   for (const a of aliases) {
     const head = a.slice(0, 1);
     if (SURNAME_HINTS.includes(head) && looksLikeName(a)) return a;

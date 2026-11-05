@@ -76,6 +76,7 @@ export {
 } from './native-asset-download.ts';
 export {
   EventStreamClient,
+  parseTaskInvalidation,
   DEFAULT_EVENT_STREAM_PATH,
   DEFAULT_HEARTBEAT_TIMEOUT_MS,
   DEFAULT_RECONNECT_BASE_MS,
@@ -89,6 +90,7 @@ export {
   type EventStreamStopReason,
   type EventStreamSubscription,
   type SyncRequiredReason,
+  type TaskInvalidation,
 } from './event-stream.ts';
 export {
   TurnJobPoller,

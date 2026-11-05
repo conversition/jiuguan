@@ -1,8 +1,15 @@
+import {
+  parseRuntimeSessionScope,
+  runtimeSessionScopeAllows,
+  type RuntimeSessionScope,
+} from './managed-local-session-scope.ts';
+
 export interface AgentAdmissionRuntimeConfig {
   readonly mode: 'off' | 'shadow' | 'quality-beta';
   readonly enabled: boolean;
   readonly executionEnabled: boolean;
   readonly sessionAllowlist: ReadonlySet<string>;
+  readonly sessionScope: RuntimeSessionScope;
 }
 
 const QUALITY_BETA_ACK = 'p14-quality-beta-v1';
@@ -29,24 +36,32 @@ export function parseAgentAdmissionRuntimeConfig(
   const mode = (env.JG_AGENT_ADMISSION ?? 'off').trim().toLowerCase();
   if (mode === 'off') return Object.freeze({
     mode: 'off', enabled: false, executionEnabled: false, sessionAllowlist: new Set<string>(),
+    sessionScope: 'exact',
   });
   if (mode === 'shadow') return Object.freeze({
     mode: 'shadow', enabled: true, executionEnabled: false, sessionAllowlist: new Set<string>(),
+    sessionScope: 'exact',
   });
   if (mode !== 'quality-beta') throw new Error('JG_AGENT_ADMISSION 只允许 off、shadow 或 quality-beta');
   if (env.JG_AGENT_ADMISSION_ACK !== QUALITY_BETA_ACK) {
     throw new Error(`JG_AGENT_ADMISSION=quality-beta 需要 JG_AGENT_ADMISSION_ACK=${QUALITY_BETA_ACK}`);
   }
   const sessionAllowlist = parseAllowlist(env.JG_AGENT_ADMISSION_SESSION_ALLOWLIST);
-  if (sessionAllowlist.size === 0) {
-    throw new Error('quality-beta 需要非空 JG_AGENT_ADMISSION_SESSION_ALLOWLIST');
+  const sessionScope = parseRuntimeSessionScope(env);
+  if (sessionAllowlist.size === 0 && sessionScope === 'exact') {
+    throw new Error(
+      'quality-beta 需要非空 JG_AGENT_ADMISSION_SESSION_ALLOWLIST 或显式 managed-local scope',
+    );
   }
-  return Object.freeze({ mode: 'quality-beta', enabled: true, executionEnabled: true, sessionAllowlist });
+  return Object.freeze({
+    mode: 'quality-beta', enabled: true, executionEnabled: true, sessionAllowlist, sessionScope,
+  });
 }
 
 export function agentAdmissionAllowsSession(
   config: AgentAdmissionRuntimeConfig,
   sessionId: string,
 ): boolean {
-  return config.executionEnabled && config.sessionAllowlist.has(sessionId);
+  return config.executionEnabled
+    && runtimeSessionScopeAllows(config.sessionScope, config.sessionAllowlist, sessionId);
 }

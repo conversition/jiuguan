@@ -14,7 +14,7 @@ import { RetrievalEngine } from '../../packages/memory/src/retrieval.ts';
 import { HashEmbeddingProvider, createEmbeddingProvider } from '../../packages/memory/src/embedding.ts';
 import { LorebookScanner } from '../../packages/core/src/scanner.ts';
 import { VariableManager } from '../../packages/variable/src/vms.ts';
-import { StoryboardOrchestrator } from './storyboard-orchestrator.ts';
+import { StoryboardOrchestrator } from '../../packages/session/src/storyboard-orchestrator.ts';
 
 function arg(k: string, d?: string): string | undefined {
   const i = process.argv.indexOf(k);

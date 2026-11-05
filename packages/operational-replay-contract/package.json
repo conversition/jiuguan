@@ -1,0 +1,9 @@
+{
+  "name": "@jiuguan/operational-replay-contract",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./index.ts"
+  }
+}

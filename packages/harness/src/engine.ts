@@ -1,4 +1,4 @@
-/** P13-A：只供离线评测使用的有界循环，不定义生产 API。 */
+/** P13 有界循环：离线评测与已准入 Maintenance lane 复用；本模块不自行授予生产权限。 */
 import {
   createBudgetLedger,
   type HarnessBudgetLimit,
@@ -15,6 +15,14 @@ import {
   type TraceStep,
 } from './types.ts';
 import type { HarnessStore } from './store.ts';
+import { createHarnessResultCollector, type HarnessToolResultDisposition } from './engine-result-contract.ts';
+import { boundToolResult } from './tool-result-contract.ts';
+import {
+  classifyHarnessFailure,
+  readHarnessErrorField,
+  type HarnessFailureEffect,
+  type HarnessFailureStage,
+} from './engine-failure-contract.ts';
 
 export interface TraceImpl extends TraceRecorder {
   readonly steps: TraceStep[];
@@ -89,9 +97,12 @@ function stateChanged(before: Record<string, unknown>, after: Record<string, unk
   catch { return null; }
 }
 
-function safeToolMessage(value: string, maxChars: number): string {
-  const clipped = value.length > maxChars ? `${value.slice(0, maxChars)}\n[TRUNCATED]` : value;
-  return `UNTRUSTED_TOOL_RESULT\n${clipped}`;
+const SAFE_TOOL_REJECTION_CODE = /^[a-z][a-z0-9]*(?:-[a-z0-9]+){0,7}$/u;
+
+function safeToolRejectionCode(value: unknown): string | null {
+  return typeof value === 'string' && value.length <= 64 && SAFE_TOOL_REJECTION_CODE.test(value)
+    ? value
+    : null;
 }
 
 const SAFE_MODEL_ERROR_CODES = new Set([
@@ -113,24 +124,21 @@ const BUDGET_MODEL_ERROR_CODES = new Map<string, HarnessTerminationReason>([
 ]);
 
 function errorCode(error: unknown): HarnessTerminationReason {
-  if (error instanceof DOMException && error.name === 'AbortError') return 'model-failed';
+  try {
+    if (error instanceof DOMException && readHarnessErrorField(error, 'name') === 'AbortError') return 'model-failed';
+  } catch { /* A hostile prototype trap is not a public diagnostic. */ }
   if (error && typeof error === 'object') {
-    let diagnosticCode: unknown;
-    try { diagnosticCode = (error as { diagnosticCode?: unknown }).diagnosticCode; }
-    catch { diagnosticCode = undefined; }
+    const diagnosticCode = readHarnessErrorField(error, 'diagnosticCode');
     if (typeof diagnosticCode === 'string' && SAFE_MODEL_ERROR_CODES.has(diagnosticCode)) {
       return diagnosticCode as HarnessTerminationReason;
     }
-    let code: unknown;
-    try { code = (error as { code?: unknown }).code; }
-    catch { code = undefined; }
+    const code = readHarnessErrorField(error, 'code');
     if (typeof code === 'string') {
+      if (code === 'gateway-provider-call-cancelled') return 'external-cancelled';
       const reason = BUDGET_MODEL_ERROR_CODES.get(code);
       if (reason) return reason;
     }
-    let message: unknown;
-    try { message = (error as { message?: unknown }).message; }
-    catch { message = undefined; }
+    const message = readHarnessErrorField(error, 'message');
     if (typeof message === 'string') {
       const reason = BUDGET_MODEL_ERROR_CODES.get(message);
       if (reason) return reason;
@@ -163,6 +171,7 @@ function budgetTermination(limit: HarnessBudgetLimit): HarnessTerminationReason 
 
 export async function runBoundedLoop(input: HarnessLoopInput): Promise<HarnessResult> {
   const budget = createBudgetLedger(input.budget, input.clock);
+  const resultCollector = createHarnessResultCollector();
   const internalTrace = createTrace(input.clock, input.budget.maxTraceSteps);
   const trace: TraceImpl = {
     steps: internalTrace.steps,
@@ -181,6 +190,8 @@ export async function runBoundedLoop(input: HarnessLoopInput): Promise<HarnessRe
   // 不能 unref：即使模型 Promise 永不 settle，deadline 也必须保持事件循环直到完成拒绝。
   const deadline = setTimeout(() => controller.abort(), input.budget.maxWallMs);
   let invalidSteps = 0;
+  let failureStage: HarnessFailureStage = 'admission';
+  let failureEffect: HarnessFailureEffect = 'not-started';
   const maxInvalid = input.maxInvalidModelSteps ?? 2;
   if (!Number.isSafeInteger(maxInvalid) || maxInvalid < 0) {
     clearTimeout(deadline);
@@ -193,21 +204,26 @@ export async function runBoundedLoop(input: HarnessLoopInput): Promise<HarnessRe
     finalAnswer: string | null,
     terminationReason: HarnessTerminationReason,
     detail?: { kind: TraceKind; detail: string },
+    cause?: unknown,
   ): HarnessResult => {
     if (detail) trace.push(detail);
     let committed = false;
     let finalStatus = status;
     let answer = finalAnswer;
     let finalReason = terminationReason;
+    let finalCause = cause;
     if (status === 'final-answer' && input.store !== undefined) {
       try {
         input.store.save(state);
         committed = true;
         trace.push({ kind: 'store-commit', detail: 'store-committed' });
-      } catch {
+      } catch (error) {
         finalStatus = 'model-error';
         answer = null;
         finalReason = 'store-commit-failed';
+        finalCause = error;
+        failureStage = 'store-commit';
+        failureEffect = 'unknown-commit';
         trace.push({ kind: 'model-error', detail: 'store-commit-failed' });
       }
     }
@@ -216,11 +232,15 @@ export async function runBoundedLoop(input: HarnessLoopInput): Promise<HarnessRe
     return {
       status: finalStatus,
       terminationReason: finalReason,
+      failure: finalStatus === 'final-answer' ? null : classifyHarnessFailure({
+        reason: finalReason, cause: finalCause, stage: failureStage, effect: failureEffect,
+      }),
       finalAnswer: answer,
       state: structuredClone(state),
       trace: [...trace.steps],
       budget: budget.snapshot(input.clock),
       committed,
+      completeness: resultCollector.snapshot(),
     };
   };
 
@@ -250,6 +270,7 @@ export async function runBoundedLoop(input: HarnessLoopInput): Promise<HarnessRe
   };
 
   for (;;) {
+    failureStage = 'admission';
     const stop = stopped();
     if (stop) return stop;
     if (!budget.consumeStep(input.clock)) return finish(
@@ -270,6 +291,7 @@ export async function runBoundedLoop(input: HarnessLoopInput): Promise<HarnessRe
       });
     }
     trace.push({ kind: 'model', detail: 'model-call' });
+    failureStage = 'model';
     let completion;
     try {
       completion = await raceWithAbort(input.model.complete({
@@ -288,11 +310,15 @@ export async function runBoundedLoop(input: HarnessLoopInput): Promise<HarnessRe
         });
       }
       const reason = errorCode(error);
+      if (reason === 'external-cancelled') return finish('cancelled', null, reason, {
+        kind: 'cancelled', detail: 'model-call-cancelled',
+      }, error);
       if (isBudgetTermination(reason)) return finish('budget-exhausted', null, reason, {
         kind: 'budget-exhausted', detail: reason,
-      });
-      return finish('model-error', null, reason, { kind: 'model-error', detail: reason });
+      }, error);
+      return finish('model-error', null, reason, { kind: 'model-error', detail: reason }, error);
     }
+    failureStage = 'model-output';
     if (typeof completion?.content !== 'string' || completion.usage === undefined) {
       return finish('model-error', null, 'invalid-model-completion', {
         kind: 'model-error', detail: 'invalid-model-completion',
@@ -308,6 +334,7 @@ export async function runBoundedLoop(input: HarnessLoopInput): Promise<HarnessRe
       });
     }
 
+    failureStage = 'protocol';
     const decision = parseDecision(completion.content, input.budget.maxFinalChars);
     if (decision === null) {
       invalidSteps += 1;
@@ -326,6 +353,7 @@ export async function runBoundedLoop(input: HarnessLoopInput): Promise<HarnessRe
       });
     }
 
+    failureStage = 'tool-input';
     if (!budget.consumeTool(input.clock)) {
       const reason = budgetTermination(budget.hardLimitReason(input.clock) ?? 'tool-call');
       return finish('budget-exhausted', null, reason, { kind: 'budget-exhausted', detail: reason });
@@ -345,8 +373,18 @@ export async function runBoundedLoop(input: HarnessLoopInput): Promise<HarnessRe
     const validated = tool.validate(decision.tool.args);
     if (!validated.ok) {
       invalidSteps += 1;
-      trace.push({ kind: 'tool-invalid', detail: `schema-rejected:${tool.name}` });
-      messages.push({ role: 'tool', content: 'UNTRUSTED_TOOL_RESULT\nschema-rejected', toolCallId: tool.name });
+      const rejectionCode = safeToolRejectionCode(validated.rejectionCode);
+      trace.push({
+        kind: 'tool-invalid',
+        detail: rejectionCode
+          ? `schema-rejected:${tool.name}:${rejectionCode}`
+          : `schema-rejected:${tool.name}`,
+      });
+      messages.push({
+        role: 'tool',
+        content: `UNTRUSTED_TOOL_RESULT\n${rejectionCode ?? 'schema-rejected'}`,
+        toolCallId: tool.name,
+      });
       if (invalidSteps > maxInvalid) {
         return finish('budget-exhausted', null, 'invalid-protocol-limit', {
           kind: 'budget-exhausted', detail: 'invalid-protocol-limit',
@@ -358,6 +396,9 @@ export async function runBoundedLoop(input: HarnessLoopInput): Promise<HarnessRe
     const draft = structuredClone(state);
     const budgetAtCall = budget.snapshot(input.clock);
     let outcome;
+    failureStage = 'tool-execution';
+    // A tool Promise can perform external effects before settling or observing cancellation.
+    failureEffect = 'unknown';
     try {
       outcome = await raceWithAbort(tool.execute(validated.value, {
         state: draft,
@@ -384,7 +425,21 @@ export async function runBoundedLoop(input: HarnessLoopInput): Promise<HarnessRe
       messages.push({ role: 'tool', content: 'UNTRUSTED_TOOL_RESULT\nexecute-failed', toolCallId: tool.name });
       continue;
     }
+    failureStage = 'tool-output';
+    const boundedResult = typeof outcome === 'object' && outcome !== null && outcome.ok === true
+      && typeof outcome.result === 'string'
+      ? boundToolResult(outcome.result, input.budget.maxToolResultChars) : null;
+    const recordResult = (disposition: HarnessToolResultDisposition): void => {
+      if (boundedResult === null) return;
+      resultCollector.record({
+        toolCallId: `tool-${budgetAtCall.toolCallsUsed}`,
+        toolName: tool.name,
+        disposition,
+        metadata: boundedResult.metadata,
+      });
+    };
     const hardLimit = budget.hardLimitReason(input.clock);
+    if (hardLimit) recordResult('discarded-hard-limit');
     if (hardLimit) return finish('budget-exhausted', null, budgetTermination(hardLimit), {
       kind: 'budget-exhausted', detail: budgetTermination(hardLimit),
     });
@@ -393,25 +448,29 @@ export async function runBoundedLoop(input: HarnessLoopInput): Promise<HarnessRe
       messages.push({ role: 'tool', content: 'UNTRUSTED_TOOL_RESULT\ninvalid-outcome', toolCallId: tool.name });
       continue;
     }
-    if (!outcome.ok || typeof outcome.result !== 'string') {
+    if (!outcome.ok || typeof outcome.result !== 'string' || boundedResult === null) {
       trace.push({ kind: 'tool-error', detail: `tool-failed:${tool.name}` });
       messages.push({ role: 'tool', content: 'UNTRUSTED_TOOL_RESULT\ntool-failed', toolCallId: tool.name });
       continue;
     }
+    failureStage = 'state-admission';
     const changed = stateChanged(state, draft);
     if (changed === null) {
+      recordResult('discarded-invalid-state');
       trace.push({ kind: 'tool-error', detail: `invalid-state:${tool.name}` });
       messages.push({ role: 'tool', content: 'UNTRUSTED_TOOL_RESULT\ninvalid-state', toolCallId: tool.name });
       continue;
     }
     if (changed) {
       if (!budget.consumeWrite(input.clock)) {
+        recordResult('discarded-write-budget');
         const reason = budgetTermination(budget.hardLimitReason(input.clock) ?? 'write');
         return finish('budget-exhausted', null, reason, { kind: 'budget-exhausted', detail: reason });
       }
       replaceState(state, draft);
     }
     invalidSteps = 0;
+    recordResult('admitted');
     trace.push({ kind: 'tool-ok', detail: `tool-ok:${tool.name}` });
     messages.push({
       role: 'assistant',
@@ -419,8 +478,9 @@ export async function runBoundedLoop(input: HarnessLoopInput): Promise<HarnessRe
     });
     messages.push({
       role: 'tool',
-      content: safeToolMessage(outcome.result, input.budget.maxToolResultChars),
+      content: `UNTRUSTED_TOOL_RESULT\n${boundedResult.text}`,
       toolCallId: tool.name,
+      toolResultMetadata: boundedResult.metadata,
     });
     if (input.terminalTools?.has(tool.name)) {
       return finish(

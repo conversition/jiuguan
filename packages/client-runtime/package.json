@@ -26,7 +26,9 @@
     "./revision-client": "./dist/revision-client.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json"
+    "build": "tsc -p tsconfig.json",
+    "test:types": "tsc -p tsconfig.tests.json",
+    "test": "pnpm build && pnpm test:types && node --experimental-strip-types --experimental-transform-types tests/verify.ts && node --experimental-strip-types --experimental-transform-types tests/verify-event-stream.ts && node --experimental-strip-types --experimental-transform-types tests/verify-revision-client.ts && node --experimental-strip-types --experimental-transform-types tests/verify-native-asset-download.ts"
   },
   "dependencies": {
     "@jiuguan/mobile-contracts": "workspace:*"

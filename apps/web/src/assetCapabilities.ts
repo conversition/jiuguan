@@ -5,7 +5,7 @@ import {
   type AssetCapabilityPurpose,
   type PublicAssetDescriptor,
 } from '../../../packages/mobile-contracts/src/index.ts';
-import { resolveGalUrl } from '../../../packages/assets/src/resolve.ts';
+import { craftAssetUrl, resolveGalUrl } from '../../../packages/assets/src/resolve.ts';
 import type { AssetEntry, AssetKind } from '../../../packages/assets/src/asset-types.ts';
 import { assetCapabilityUrl, assetUrl, authClient, authFetch } from './authClient.ts';
 import { assetShapeOf, planResourceRewrite } from './compat/resourceLoader.ts';
@@ -55,13 +55,15 @@ export async function resolveNamedAsset(
       overrides?: Record<string, string>;
     } : {};
     const resolved = resolveGalUrl(kind, name, row.entries ?? [], row.overrides);
-    if (!('url' in resolved)) return { status: 'miss' };
-    return {
-      status: 'ok',
-      url: assetUrl(`/api/assets/img?url=${encodeURIComponent(resolved.url)}`),
-      cached: resolved.cached,
-      constructed: resolved.constructed,
-    };
+    const source = 'url' in resolved ? resolved.url : craftAssetUrl(kind, name);
+    return source
+      ? {
+          status: 'ok',
+          url: assetUrl(`/api/assets/img?url=${encodeURIComponent(source)}`),
+          cached: 'url' in resolved ? resolved.cached : false,
+          constructed: 'url' in resolved ? resolved.constructed : true,
+        }
+      : { status: 'miss' };
   }
   if (state.phase !== 'authenticated') return { status: 'miss' };
   const response = await authFetch(assetUrl('/api/assets/status'));

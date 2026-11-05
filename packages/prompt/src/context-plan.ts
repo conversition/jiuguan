@@ -2,6 +2,33 @@ import { createHash } from 'node:crypto';
 
 export const CONTEXT_BUDGET_PLAN_VERSION = 'context-budget-plan-v1' as const;
 
+/**
+ * **出站硬阻断码**（闭集）。命中任意一个即表示「这一轮无论怎么裁剪都放不进去」：
+ * 受保护块自身超预算、工具 schema 超预算、或必需 elastic 块连最低保留都放不下。
+ * 这类冲突不能再靠丢上下文缓解 —— 继续发送只会让上游按长度失败，
+ * 再被兜底清理孤儿行、回退轮次（用户看到的就是「第二轮过不去」）。
+ *
+ * 调用方必须在**任何 Provider 调用之前**据此拒绝，并把 `planDigest` 一起记进证据。
+ */
+export const CONTEXT_PLAN_BLOCKING_REASON_CODES = Object.freeze([
+    'pinned-core-exceeds-input-budget',
+    'tool-schema-exceeds-budget',
+    'required-elastic-minimum-unmet',
+] as const);
+
+export type ContextPlanBlockingReasonCode = typeof CONTEXT_PLAN_BLOCKING_REASON_CODES[number];
+
+/** 从计划里挑出阻断码（保持码点序，便于 digest 与日志稳定）。 */
+export function contextPlanBlockingReasonCodes(
+    plan: Readonly<{ reasonCodes: readonly string[] }>,
+): readonly ContextPlanBlockingReasonCode[] {
+    const blocking = new Set<string>(CONTEXT_PLAN_BLOCKING_REASON_CODES);
+    return Object.freeze(
+        [...new Set(plan.reasonCodes.filter((code) => blocking.has(code)))].sort(),
+    ) as readonly ContextPlanBlockingReasonCode[];
+}
+
+
 export interface ContextModelProfile {
   readonly modelContextTokens: number;
   readonly outputReserveTokens: number;
@@ -15,6 +42,8 @@ export interface ContextPlanBlock {
   readonly tokens: number;
   readonly priority: number;
   readonly minTokens?: number;
+  /** Optional soft first-pass allocation; unclaimed capacity may be borrowed up to tokens. */
+  readonly preferredTokens?: number;
   /** A required elastic block enters recovery instead of being silently dropped below its minimum. */
   readonly required?: boolean;
 }
@@ -147,6 +176,10 @@ export function planTurnContextBudget(
     const tokens = integer(block.tokens, `blocks[${index}].tokens`);
     const minTokens = integer(block.minTokens ?? 0, `blocks[${index}].minTokens`);
     if (minTokens > tokens) throw new TypeError(`blocks[${index}].minTokens cannot exceed tokens`);
+    const preferredTokens = integer(block.preferredTokens ?? tokens, `blocks[${index}].preferredTokens`);
+    if (preferredTokens < minTokens || preferredTokens > tokens) {
+      throw new TypeError(`blocks[${index}].preferredTokens must be between minTokens and tokens`);
+    }
     if (!Number.isFinite(block.priority)) throw new TypeError(`blocks[${index}].priority must be finite`);
     return {
       index,
@@ -156,6 +189,7 @@ export function planTurnContextBudget(
       tokens,
       priority: block.priority,
       minTokens,
+      preferredTokens,
       required: block.required === true,
     };
   });
@@ -163,16 +197,20 @@ export function planTurnContextBudget(
   const allocated = new Map<string, ContextBudgetDecision>();
   let remaining = elasticBudgetTokens;
   const ordered = [...normalized].sort((a, b) => b.priority - a.priority || a.index - b.index);
+  let requiredMinimum = ordered.reduce((sum, block) => sum + (block.required ? block.minTokens : 0), 0);
   for (const block of ordered) {
+    requiredMinimum -= block.required ? block.minTokens : 0;
+    // A higher-priority optional block cannot consume a later required block's minimum.
+    const available = Math.max(0, remaining - requiredMinimum);
     let targetTokens = 0;
     let action: ContextPlanAction = 'drop';
     let reasonCode = 'elastic-budget-exhausted';
-    if (block.tokens <= remaining) {
-      targetTokens = block.tokens;
-      action = 'keep';
-      reasonCode = 'within-budget';
-    } else if (block.budgetClass === 'elastic' && remaining >= block.minTokens && remaining > 0) {
-      targetTokens = remaining;
+    if (block.tokens <= available) {
+      targetTokens = block.preferredTokens;
+      action = targetTokens === block.tokens ? 'keep' : 'reduce';
+      reasonCode = targetTokens === block.tokens ? 'within-budget' : 'elastic-target-reduced';
+    } else if (block.budgetClass === 'elastic' && available >= block.minTokens && available > 0) {
+      targetTokens = Math.min(available, block.preferredTokens);
       action = 'reduce';
       reasonCode = 'elastic-target-reduced';
     } else if (block.required) {
@@ -195,16 +233,34 @@ export function planTurnContextBudget(
     });
   }
 
+  // Only explicit soft targets participate in borrowing; legacy plans retain their first-pass behavior.
+  for (const block of ordered) {
+    if (block.preferredTokens === block.tokens || remaining === 0) continue;
+    const decision = allocated.get(block.id)!;
+    if (decision.action === 'conflict') continue;
+    const borrowed = Math.min(remaining, block.tokens - decision.targetTokens);
+    if (borrowed === 0) continue;
+    remaining -= borrowed;
+    const targetTokens = decision.targetTokens + borrowed;
+    allocated.set(block.id, {
+      ...decision,
+      targetTokens,
+      action: targetTokens === block.tokens ? 'keep' : 'reduce',
+      reasonCode: targetTokens === block.tokens ? 'within-budget' : 'elastic-target-reduced',
+    });
+  }
+
   const elasticDecisions = normalized.map((block) => allocated.get(block.id)!);
   const decisions = [...pinnedDecisions, ...elasticDecisions];
   const reasonCodes: string[] = [];
-  if (pinnedTokens > inputBudgetTokens) reasonCodes.push('pinned-core-exceeds-input-budget');
-  if (pinnedTokens + toolSchemaTokens > inputBudgetTokens) reasonCodes.push('tool-schema-exceeds-budget');
+  const [PINNED_BLOCKING, TOOL_BLOCKING, REQUIRED_BLOCKING] = CONTEXT_PLAN_BLOCKING_REASON_CODES;
+  if (pinnedTokens > inputBudgetTokens) reasonCodes.push(PINNED_BLOCKING);
+  if (pinnedTokens + toolSchemaTokens > inputBudgetTokens) reasonCodes.push(TOOL_BLOCKING);
   if (elasticDecisions.some((decision) => decision.action !== 'keep')) {
     reasonCodes.push('elastic-context-recovery-required');
   }
   if (elasticDecisions.some((decision) => decision.action === 'conflict')) {
-    reasonCodes.push('required-elastic-minimum-unmet');
+    reasonCodes.push(REQUIRED_BLOCKING);
   }
   const predictedPromptTokens = pinnedTokens + toolSchemaTokens
     + elasticDecisions.reduce((sum, decision) => sum + decision.targetTokens, 0);

@@ -37,6 +37,8 @@ export interface ProviderCallContext {
   signal?: AbortSignal;
   /** 宿主签发的传输尝试硬上限；Provider 适配器不得提高或忽略。 */
   maxTransportAttempts?: number;
+  /** Internal host fence; removed before an adapter receives this context. */
+  beforeAdapterDispatch?: () => void;
 }
 
 /** 直接复用现有 OpenAI-compatible 请求/结果，不建立第二套完成协议。 */

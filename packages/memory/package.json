@@ -15,6 +15,11 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "test": "node --experimental-strip-types --experimental-transform-types tests/verify.ts",
+    "test:up02": "node --experimental-strip-types --experimental-transform-types tests/verify-up02.ts",
+    "test:up03": "node --experimental-strip-types --experimental-transform-types tests/verify-up03.ts",
+    "test:up07": "node --experimental-strip-types --experimental-transform-types tests/verify-up07.ts",
+    "test:nsfw-pg": "node --experimental-strip-types --experimental-transform-types tests/verify-nsfw-pg-candidates.ts",
     "start": "node --experimental-strip-types --experimental-transform-types src/api.ts"
   },
   "dependencies": {

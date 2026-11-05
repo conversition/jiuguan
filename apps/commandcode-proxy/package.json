@@ -5,5 +5,8 @@
   "type": "module",
   "description": "PC-only loopback CommandCode standalone fallback adapter",
   "sideEffects": false,
-  "scripts": {}
+  "scripts": {
+    "test:types": "tsc -p tsconfig.tests.json",
+    "test": "node --experimental-strip-types --experimental-transform-types tests/verify-config.ts && node --experimental-strip-types --experimental-transform-types tests/verify-import.ts && node --experimental-strip-types --experimental-transform-types tests/verify-provider.ts && node --experimental-strip-types --experimental-transform-types tests/verify-http.ts && node --experimental-strip-types --experimental-transform-types tests/verify-lifecycle.ts && pnpm run test:types"
+  }
 }

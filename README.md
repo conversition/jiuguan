@@ -163,22 +163,47 @@ HTTPS endpoint 与签名材料，因此 Release 默认推荐手机浏览器方�
 ```text
 apps/
   web/                 React 对话前端
-  server/              会话 API、认证与 Agent 编排
+  server/              会话 API、认证、Agent 编排与投放治理
   mobile/              Capacitor / Android 容器
   commandcode-proxy/   CommandCode 反代核心
 packages/
-  core/                角色卡、世界书、预设等领域模型
-  prompt/              上下文计划、装配与预算
-  memory/              SQLite / PostgreSQL 记忆层
+  core/                角色卡、世界书、预设等领域模型与资产路径
+  session/             会话状态机、回合提交与上下文装配入口
+  prompt/              上下文计划、装配、预算与 Skill 编译
+  memory/              SQLite / PostgreSQL 记忆层与人物权威记忆
+  skill-hub/           Skill 源码、发布账本与采纳证据
+  agent-policy/        PolicyRouter、Lane rollout 与质量策略
+  harness/             有界 Harness 与工具白名单
+  agent-closure/       Agent 闭环评估合同
   plugin/              插件宿主与运行边界
   proxy/               Provider 抽象
+  variable/ sandbox/   变量桥与沙箱
 plugins/
   commandcode-provider/ 第一方 Provider 源码
 tools/
   cli/                 管理与诊断工具
+  architecture/        跨包边界门禁
+  build/               运行时构建
   release/             发布、APK 与清洁门禁
   windows/             本地/私有启动配置
 ```
+
+## 🔄 本次公开快照更新（2026-11-05）
+
+本次快照基于内部开发线 `5a0aa7d` 重新导出，代码结构较首个公开版有实质变化：
+
+| 方向 | 变化 |
+|---|---|
+| 🧱 会话内核 | ChatSession 迁入独立 `packages/session`，回合提交、上下文装配与状态写入收口到同一入口 |
+| 🧰 Skill 治理 | 新增 `packages/skill-hub` 与 Skill 包生命周期命令：`skill:package-propose / verify / apply / migrate`、`skill:real-preflight`、`skill:real-acceptance`（后者带 `--max-calls` 硬闸） |
+| 🤖 Agent Loop | 生产派发器、准入额度栅栏、完成判定、证据账本与恢复生命周期；仍全部由 `public-safe` profile 关闭 |
+| 📊 闭环评估 | 新增 `packages/agent-closure` 与 `pnpm p16:closure-report`，按域汇总采纳/回滚/质量证据（无正文） |
+| 🧪 写入证据 | 变量补丁应用与回滚写成 INSERT-only 观测记录；报表区分「真的回滚过」与「仅按当前值推断」 |
+| 🔤 兼容修复 | 模型 ID 白名单接受非 ASCII 名称，修复中文模型名导致的恢复会话 500 |
+| 📁 资产路径 | 资产库改为 `JG_ASSET_BASE` 或 `<数据目录>\library`，不再绑定作者机器的目录 |
+
+规范入口：`pnpm p14:report`、`pnpm p14:diagnose`、`pnpm p16:closure-report`、`pnpm check:imports`。
+完整门禁顺序仍是 `pnpm public:verify` → `pnpm typecheck` → `pnpm build`。
 
 ## 📦 版本与下载
 
@@ -197,8 +222,10 @@ pnpm public:verify
 ## ⚠️ v0.1 已知边界
 
 - 这是 Windows-first 公开预览版，不是面向所有系统的一键安装器。
-- 不提供内置角色卡、世界书、预设或 Skill 示例。
-- 私有开发仓库中依赖真实素材的测试未进入公开版。
+- 不提供内置角色卡、世界书、预设或 Skill 示例；文风与流程文本表在公开版中为空，
+  需要用自己的素材导入（`JG_STYLE_SRC` + `pnpm style:import`）。
+- 世界书不再有内置默认选择，新建会话时请自行勾选。
+- 私有开发仓库中依赖真实素材的测试未进入公开版，因此 `package.json` 只保留可离线运行的命令。
 - Agent 编排地基已经存在，但实验 Lane 默认关闭，不宣称开箱即用的全自动多 Agent。
 - Release 不提供通用 APK；APK 必须由使用者为自己的私有 endpoint 构建。
 

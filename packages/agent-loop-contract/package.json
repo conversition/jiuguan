@@ -1,0 +1,14 @@
+{
+  "name": "@jiuguan/agent-loop-contract",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Versioned, domain-neutral contracts for the Jiuguan AgentLoop orchestration layer",
+  "sideEffects": false,
+  "exports": {
+    ".": "./index.ts"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --experimental-transform-types tests/verify.ts && node --experimental-strip-types --experimental-transform-types tests/verify-task-envelope.ts"
+  }
+}

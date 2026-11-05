@@ -20,7 +20,7 @@ import { MemoryDb } from '../../packages/memory/src/db.ts';
 import { parseLoreEntry, parseLoreEntries } from '../../packages/core/src/lore-parse.ts';
 import { createEmbeddingProvider } from '../../packages/memory/src/embedding.ts';
 import { getPgVectorStore } from '../../packages/memory/src/pg-vector.ts';
-import { indexLoreEntries } from './lore-index-task.ts';
+import { indexLoreEntries } from '../../packages/session/src/lore-index-task.ts';
 
 interface Options {
   db?: string;
@@ -108,8 +108,9 @@ async function main(): Promise<void> {
 
   const n = await pg.chunkCount();
   const na = await pg.aliasCount();
-  console.log(`\n[索引] 完成：namespace=${namespace} 写入 ${written} 条 / ${chunked} 窗口，PG 总窗口 ${n}，别名 ${na}（含 "会长→角色乙" 类职位简写）。`);
-  console.log('  注：向量维度需与查询端 bge 一致（默认 512）。');
+  console.log(`\n[索引] 完成：namespace=${namespace} 写入 ${written} 条 / ${chunked} 向量窗口，PG 总窗口 ${n}，别名 ${na}（含 "会长→示例角色A" 类职位简写）。`);
+  console.log(`  向量状态：${result?.vectorStatus ?? 'unavailable'}；数据库维度=${pg.vectorDimensions}`
+    + `${(result?.failedEntries ?? 0) > 0 ? `；失败条目=${result!.failedEntries}` : ''}`);
   await pg.close();
   process.exit(0);
 }

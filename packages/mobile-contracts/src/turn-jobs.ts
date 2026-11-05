@@ -13,6 +13,17 @@ export type TurnJobStatus = (typeof TURN_JOB_STATUSES)[number];
 export const TURN_JOB_ACTIONS = ['turn', 'regenerate'] as const;
 export type TurnJobAction = (typeof TURN_JOB_ACTIONS)[number];
 
+export const TURN_PROGRESS_PHASES = ['planning', 'compiling', 'repairing', 'validating', 'committing'] as const;
+export type TurnProgressPhase = (typeof TURN_PROGRESS_PHASES)[number];
+export interface TurnProgress { readonly runId: string; readonly phase: TurnProgressPhase }
+/** Content-free transient progress; never a commitment or turn outcome. */
+export function isTurnProgress(value: unknown): value is TurnProgress {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const row = value as Record<string, unknown>;
+  return Object.keys(row).sort().join(',') === 'phase,runId' && isSafeOpaqueId(row.runId)
+    && typeof row.phase === 'string' && (TURN_PROGRESS_PHASES as readonly string[]).includes(row.phase);
+}
+
 export interface PublicTurnJobResult {
   assistantMessageId?: number;
   revision?: string;

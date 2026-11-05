@@ -9,7 +9,22 @@ interface SearchHit { code: string; category: string; source: string; score: num
 interface StateRow { entity_type: string; entity_id: string; state_json: string; updated_round: number }
 interface ArcRow { code: string; chapter: string; title: string; summary: string; status: string }
 interface ScanEntry { comment: string; matchType: string; content: string; constant: boolean }
-interface TurnState { bars: Record<string, number>; event_type: string; nsfw_lock: { locked: boolean; round: number }; round: number }
+type TurnBarKey = 'personal' | 'accident' | 'main' | 'erotic';
+interface TurnState {
+  bars: Record<TurnBarKey, number>;
+  bar_progress?: {
+    round: number; before: Record<TurnBarKey, number>; after: Record<TurnBarKey, number>;
+    requested: Record<TurnBarKey, number>; decay?: Record<TurnBarKey, number>;
+    delta: Record<TurnBarKey, number>; saturated: TurnBarKey[];
+  } | null;
+  event_type: string;
+  nsfw_lock: { locked: boolean; round: number };
+  round: number;
+  protagonist?: {
+    entityId: string | null; name: string; asOfRound: number; lastChangedRound: number;
+    sources?: string[]; entries: { field: string; value: string; updatedRound: number }[];
+  } | null;
+}
 interface VarDecl { name: string; type: string; expr: string }
 interface TopFact { value: unknown; status: string; factKind: string; sceneId?: string }
 interface RelationshipRow { relationshipId: string; fromCharacterId: string; toCharacterId: string; type: string; perspective: string; status: string; derived?: boolean }
@@ -98,12 +113,18 @@ const loadMemoryPanelData = async (sessionId: string, signal?: AbortSignal): Pro
  *  · 手动刷新保留为**人工重试**，不是正常工作前提。
  *  全部只读：不调模型、不写记忆、不重建向量（无 setTimeout / reload / srcdoc / 强制重挂载）。
  */
-export function MemoryConsole({ sessionId, sessionReady = true, visible = true }: {
+export function MemoryConsole({
+  sessionId, sessionRunId = '', sessionReady = true, visible = true, refreshKey = 0,
+}: {
   sessionId: string | null;
+  /** 当前会话挂载实例；旧实例迟到事件不得让新面板重读。 */
+  sessionRunId?: string;
   /** 会话是否就绪（宿主注入；缺省视为就绪，兼容旧调用方） */
   sessionReady?: boolean;
   /** 面板是否真实可见（缺省视为可见；App 用 tab 条件渲染时由挂载本身表达可见） */
   visible?: boolean;
+  /** 外部维护提交后的只读重读信号；只刷新数据，不重新生成或写入记忆。 */
+  refreshKey?: string | number;
 }) {
   const [query, setQuery] = useState('');
   const [hits, setHits] = useState<SearchHit[] | null>(null);
@@ -115,7 +136,8 @@ export function MemoryConsole({ sessionId, sessionReady = true, visible = true }
   const [layerStats, setLayerStats] = useState<Record<string, number> | null>(null);
 
   // 会话运行实例：用于过滤"已失效运行实例"的事件（不参与权威写入）
-  const runIdRef = useRef<string>('');
+  const runIdRef = useRef<string>(sessionRunId);
+  runIdRef.current = sessionRunId;
   const sync = useMemo(
     () => new MemoryPanelSync({
       load: (sid, signal) => loadMemoryPanelData(sid, signal),
@@ -124,19 +146,32 @@ export function MemoryConsole({ sessionId, sessionReady = true, visible = true }
     [],
   );
   const state = useSyncExternalStore(sync.subscribe, sync.getSnapshot, sync.getSnapshot);
+  const externalRefreshRef = useRef<{ sessionId: string | null; key: string | number }>({
+    sessionId, key: refreshKey,
+  });
 
   // 可见性/就绪 → 自动读取（挂载即打开；卸载即关闭）
   useEffect(() => {
     void sync.setVisibility({ visible, sessionReady, sessionRunId: runIdRef.current }, sessionId);
     return () => { sync.close(); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, sessionReady, visible]);
+  }, [sessionId, sessionRunId, sessionReady, visible]);
+
+  // AgentStatusPanel and guarded-auto Maintenance commit outside the turn SSE
+  // stream. Re-read through the same read-only path so a successful NPC apply
+  // cannot leave the character table showing the pre-commit projection.
+  useEffect(() => {
+    const previous = externalRefreshRef.current;
+    externalRefreshRef.current = { sessionId, key: refreshKey };
+    if (previous.sessionId !== sessionId || Object.is(previous.key, refreshKey)) return;
+    if (!sessionId || !visible || !sessionReady) return;
+    void sync.refreshManually();
+  }, [refreshKey, sessionId, sessionReady, sync, visible]);
 
   // 真实提交事件 → 同作用域重读（重复/旧通知不重复读取，更不写记忆）
   useEffect(() => subscribePanelEvents((ev) => {
-    if (ev.sessionId && ev.sessionId !== sessionId) return;
-    sync.onCommitted({ sessionId: ev.sessionId, purpose: ev.purpose });
-  }), [sessionId, sync]);
+    sync.handleHostEvent(ev);
+  }), [sync]);
 
   const data = state.data;
   const meta = data?.meta as { plot_round: number; bars: string; stage: string } | null | undefined;
@@ -230,12 +265,16 @@ export function MemoryConsole({ sessionId, sessionReady = true, visible = true }
                 <tr key={c.characterId}>
                   <td>{c.characterId}</td>
                   <td>{c.identity.name}{c.identity.aliases.length > 0 ? `（${c.identity.aliases.join('/')}）` : ''}</td>
-                  <td>v{c.entityVersion}<br /><span className="cell-state">rev{c.head.headRevision} · epoch {c.scope.historyEpoch}</span></td>
+                  <td>存储 v{c.entityVersion}<br /><span className="cell-state">内容 rev{c.head.headRevision} · 回滚代际 {c.scope.historyEpoch}</span></td>
                   <td className="cell-state">
-                    {Object.entries(c.facts).map(([f, v]) => (
-                      <div key={f}>{f}={String(typeof v.value === 'object' ? JSON.stringify(v.value) : v.value)} <em>[{v.status}/{v.factKind}]</em></div>
+                    {Object.entries(c.profile).map(([f, v]) => (
+                      <div key={`profile:${f}`}>档案·{f}={String(typeof v.value === 'object' ? JSON.stringify(v.value) : v.value)} <em>[{v.status}/{v.factKind}]</em></div>
                     ))}
-                    {Object.keys(c.facts).length === 0 && '（无当前字段）'}
+                    {Object.entries(c.facts).map(([f, v]) => (
+                      <div key={`fact:${f}`}>{f}={String(typeof v.value === 'object' ? JSON.stringify(v.value) : v.value)} <em>[{v.status}/{v.factKind}]</em></div>
+                    ))}
+                    {Object.keys(c.facts).length === 0 && Object.keys(c.profile).length === 0
+                      && '（尚无人物当前事实；长期记忆不显示在此列）'}
                     {c.history.length > 0 && (
                       <div className="cell-state">历史(不冒充当前)：{c.history.slice(-2).map((h) => `${h.field}=${String(h.value)}(${h.factKind})`).join('; ')}</div>
                     )}
@@ -346,18 +385,39 @@ export function MemoryConsole({ sessionId, sessionReady = true, visible = true }
       </section>
 
       <section className="console-section">
-        <h3>回合状态（推进槽 / 事件 / NSFW 锁定）</h3>
+        <h3>回合状态（剧情热度槽 / 主角投影 / 事件）</h3>
         {turnState && (
           <div className="turn-state">
             <div className="bars">
-              {Object.entries(turnState.bars).map(([k, v]) => (
-                <div key={k} className="bar-row">
-                  <span className="bar-label">{k}</span>
-                  <div className="bar-track"><div className="bar-fill" style={{ width: `${Math.min(100, v)}%` }} /></div>
-                  <span className="bar-val">{v}/100</span>
-                </div>
-              ))}
+              {(Object.entries(turnState.bars) as [TurnBarKey, number][]).map(([k, v]) => {
+                const progress = turnState.bar_progress?.round === turnState.round ? turnState.bar_progress : null;
+                const requested = progress?.requested[k] ?? 0;
+                const decay = progress?.decay?.[k] ?? 0;
+                const applied = progress?.delta[k] ?? 0;
+                return (
+                  <div key={k} className="bar-row">
+                    <span className="bar-label">{k}</span>
+                    <div className="bar-track"><div className="bar-fill" style={{ width: `${Math.max(0, Math.min(100, v))}%` }} /></div>
+                    <span className="bar-val">{v}/100</span>
+                    {(requested !== 0 || decay !== 0) && (
+                      <span className="bar-delta">请求 {requested > 0 ? '+' : ''}{requested} / 冷却 {decay} / 净 {applied > 0 ? '+' : ''}{applied}</span>
+                    )}
+                  </div>
+                );
+              })}
             </div>
+            {turnState.protagonist && (
+              <div className="protagonist-status">
+                <div className="status-section-title">主角投影：{turnState.protagonist.name} · 核对至 R{turnState.protagonist.asOfRound} · 最近变化 R{turnState.protagonist.lastChangedRound}</div>
+                {turnState.protagonist.entries.length > 0 ? (
+                  <dl className="protagonist-fields">
+                    {turnState.protagonist.entries.map((entry) => (
+                      <div key={`${entry.field}:${entry.updatedRound}`}><dt>{entry.field}</dt><dd>{entry.value} <small>(R{entry.updatedRound})</small></dd></div>
+                    ))}
+                  </dl>
+                ) : <p className="console-none">（尚无已确认的主角状态字段）</p>}
+              </div>
+            )}
             <div className="state-tags">
               <span className="tag">事件: {EVENT_LABEL[turnState.event_type] ?? turnState.event_type}</span>
               <span className={`tag ${turnState.nsfw_lock.locked ? 'tag-locked' : ''}`}>

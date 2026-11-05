@@ -15,10 +15,12 @@
     "./maintenance-jobs": "./dist/maintenance-jobs.js",
     "./auth": "./dist/auth.js",
     "./files": "./dist/files.js",
-    "./platform": "./dist/platform.js"
+    "./platform": "./dist/platform.js",
+    "./agent-skills": "./dist/agent-skills.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json"
+    "build": "tsc -p tsconfig.json",
+    "test": "node --experimental-strip-types --experimental-transform-types tests/verify.ts"
   },
   "dependencies": {}
 }

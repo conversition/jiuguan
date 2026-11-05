@@ -4,7 +4,7 @@
   "maxBodyMiB": 8,
   "maxInflight": 8,
   "keepAliveTimeoutMs": 65000,
-  "deviceProjectDir": "C:\\jiuguan\\commandcode-workspace",
+  "deviceProjectDir": "",
   "cliMode": "agent",
   "cliSessionMode": "interactive",
   "emptySystemPlaceholder": true,
@@ -17,5 +17,5 @@
   "nonStreamIdleTimeoutMs": 90000,
   "proxyConnectTimeoutMs": 15000,
   "maxNdjsonBufferedChars": 8388608,
-  "upstreamProxy": ""
+  "upstreamProxy": "http://127.0.0.1:7890"
 }

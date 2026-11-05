@@ -10,6 +10,7 @@
   "types": "dist/index.d.ts",
   "exports": {
     ".": "./dist/index.js",
+    "./skills": "./dist/skills/index.js",
     "./query-plan": "./dist/query-plan.js",
     "./policy-router": "./dist/policy-router.js",
     "./skill-admission": "./dist/skill-admission.js",
@@ -23,6 +24,10 @@
     "./style-evaluator": "./dist/style-evaluator.js",
     "./arc-projection": "./dist/arc-projection.js",
     "./npc-evidence": "./dist/npc-evidence.js",
+    "./npc-apply-policy": "./dist/npc-apply-policy.js",
+    "./npc-mvu": "./dist/npc-mvu.js",
+    "./nsfw-scene-curator": "./dist/nsfw-scene-curator.js",
+    "./nsfw-agent-generator": "./dist/nsfw-agent-generator.js",
     "./domain-projection-contract": "./dist/domain-projection-contract.js",
     "./director-critic-shadow": "./dist/director-critic-shadow.js",
     "./director-prelude": "./dist/director-prelude.js",
@@ -31,7 +36,12 @@
     "./worldbook-conflict-evidence": "./dist/worldbook-conflict-evidence.js",
     "./worldbook-repair-proposal": "./dist/worldbook-repair-proposal.js"
   },
+  "dependencies": {
+    "@jiuguan/skill-hub": "workspace:*"
+  },
   "scripts": {
-    "build": "tsc -p tsconfig.json"
+    "build": "tsc -p tsconfig.json",
+    "pretest": "node --experimental-strip-types --experimental-transform-types tests/verify-director-prelude.ts && node --experimental-strip-types --experimental-transform-types tests/verify-precommit-critic.ts",
+    "test": "node --experimental-strip-types --experimental-transform-types tests/verify-query-plan.ts && node --experimental-strip-types --experimental-transform-types tests/verify-turn-observation.ts && node --experimental-strip-types --experimental-transform-types tests/verify-branch-preference.ts && node --experimental-strip-types --experimental-transform-types tests/verify-prompt-preference.ts && node --experimental-strip-types --experimental-transform-types tests/verify-direction-consolidation.ts && node --experimental-strip-types --experimental-transform-types tests/verify-style-evidence.ts && node --experimental-strip-types --experimental-transform-types tests/verify-learning-hydration.ts && node --experimental-strip-types --experimental-transform-types tests/verify-style-compiler.ts && node --experimental-strip-types --experimental-transform-types tests/verify-style-evaluator.ts && node --experimental-strip-types --experimental-transform-types tests/verify-arc-projection.ts && node --experimental-strip-types --experimental-transform-types tests/verify-npc-evidence.ts && node --experimental-strip-types --experimental-transform-types tests/verify-npc-apply-policy.ts && node --experimental-strip-types --experimental-transform-types tests/verify-npc-mvu.ts && node --experimental-strip-types --experimental-transform-types tests/verify-nsfw-agent-generator.ts && node --experimental-strip-types --experimental-transform-types tests/verify-nsfw-scene-curator.ts && node --experimental-strip-types --experimental-transform-types tests/verify-domain-projection-contract.ts && node --experimental-strip-types --experimental-transform-types tests/verify-director-critic-shadow.ts && node --experimental-strip-types --experimental-transform-types tests/verify-budget-profile.ts && node --experimental-strip-types --experimental-transform-types tests/verify-worldbook-conflict-evidence.ts && node --experimental-strip-types --experimental-transform-types tests/verify-worldbook-repair-proposal.ts && node --experimental-strip-types --experimental-transform-types tests/verify-policy-router.ts && node --experimental-strip-types --experimental-transform-types tests/verify-skill-admission.ts && node --experimental-strip-types --experimental-transform-types tests/verify-admission.ts && node --experimental-strip-types --experimental-transform-types tests/verify-maintenance-admission.ts && node --experimental-strip-types --experimental-transform-types tests/verify-lane-rollout.ts && node --experimental-strip-types --experimental-transform-types tests/verify-agent-skill-adapters.ts"
   }
 }

@@ -89,7 +89,7 @@ function serverStart(dataDir: string): string {
 function main(): void {
   const argv = process.argv.slice(2);
   const sessionId = option(argv, '--session');
-  if (!sessionId) throw new Error('--session 必填；公开版不绑定任何私人会话');
+  if (!sessionId) throw new Error('缺少 --session：请显式指定要诊断的会话 id');
   if (!/^session-[A-Za-z0-9._-]{1,220}$/u.test(sessionId)) throw new Error('--session 非法');
   const data = resolveOperationalDataDirectory({ explicit: option(argv, '--dir') });
   if (argv.includes('--since-server-start') && option(argv, '--since')) {

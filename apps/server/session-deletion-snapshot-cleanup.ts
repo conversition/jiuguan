@@ -40,9 +40,16 @@ export class SessionDeletionSnapshotCleanupError extends Error {
 export interface SessionDeletionSnapshotCleanupResult {
   readonly sessionId: string;
   readonly removedSnapshotIds: readonly string[];
-  readonly removedPreRestoreFiles: number;
+  readonly removedPreRestoreIds: readonly string[];
   readonly scannedSnapshots: number;
   readonly scannedPreRestoreDirectories: number;
+}
+
+export interface SessionDeletionSnapshotCleanupInput {
+  readonly dataDir: string;
+  readonly sessionId: string;
+  /** @internal Deterministic test seam for proving the apply phase rejects TOCTOU changes. */
+  readonly injectBeforeApply?: () => void;
 }
 
 interface PathIdentity {
@@ -57,11 +64,17 @@ interface PlannedSnapshot {
   readonly identity: PathIdentity;
 }
 
-interface PlannedPreRestoreFile {
-  readonly path: string;
-  readonly parentPath: string;
-  readonly parentIdentity: PathIdentity;
+interface PlannedTreeEntry {
+  readonly relativePath: string;
+  readonly kind: 'directory' | 'file';
   readonly identity: PathIdentity;
+}
+
+interface PlannedPreRestoreDirectory {
+  readonly path: string;
+  readonly restoreId: string;
+  readonly identity: PathIdentity;
+  readonly entries: readonly PlannedTreeEntry[];
 }
 
 function fail(
@@ -163,14 +176,67 @@ function planPublishedSnapshots(
   return { plans, scanned };
 }
 
-function planPreRestoreFiles(
+function inspectPlainTree(
+  root: string,
+  code: SessionDeletionSnapshotCleanupErrorCode,
+): PlannedTreeEntry[] {
+  const entries: PlannedTreeEntry[] = [];
+  const visit = (directory: string, prefix: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })
+      .sort((a, b) => a.name.localeCompare(b.name))) {
+      const path = join(directory, entry.name);
+      assertContained(root, path);
+      const stats = lstatOrNull(path);
+      if (!stats || stats.isSymbolicLink()) throw fail(code);
+      const relativePath = prefix === '' ? entry.name : prefix + '/' + entry.name;
+      if (stats.isDirectory()) {
+        entries.push({ relativePath, kind: 'directory', identity: pathIdentity(stats) });
+        visit(path, relativePath);
+        continue;
+      }
+      if (!stats.isFile()) throw fail(code);
+      entries.push({ relativePath, kind: 'file', identity: pathIdentity(stats) });
+    }
+  };
+  visit(root, '');
+  return entries;
+}
+
+function sameTreeEntry(left: PlannedTreeEntry, right: PlannedTreeEntry): boolean {
+  return left.relativePath === right.relativePath
+    && left.kind === right.kind
+    && left.identity.dev === right.identity.dev
+    && left.identity.ino === right.identity.ino
+    && left.identity.mode === right.identity.mode;
+}
+
+function assertPreRestorePlanCurrent(plan: PlannedPreRestoreDirectory): void {
+  const rootStats = lstatOrNull(plan.path);
+  if (!rootStats || !rootStats.isDirectory() || rootStats.isSymbolicLink()
+    || !sameIdentity(rootStats, plan.identity)) {
+    throw fail('session-privacy-cleanup-pre-restore-invalid');
+  }
+  const currentEntries = inspectPlainTree(
+    plan.path,
+    'session-privacy-cleanup-pre-restore-invalid',
+  );
+  const finalRootStats = lstatOrNull(plan.path);
+  if (!finalRootStats || !finalRootStats.isDirectory() || finalRootStats.isSymbolicLink()
+    || !sameIdentity(finalRootStats, plan.identity)
+    || currentEntries.length !== plan.entries.length
+    || currentEntries.some((entry, index) => !sameTreeEntry(entry, plan.entries[index]!))) {
+    throw fail('session-privacy-cleanup-pre-restore-invalid');
+  }
+}
+
+function planPreRestoreDirectories(
   dataDir: string,
   sessionFile: string,
-): { readonly plans: PlannedPreRestoreFile[]; readonly scanned: number } {
+): { readonly plans: PlannedPreRestoreDirectory[]; readonly scanned: number } {
   const parent = dirname(dataDir);
   const dataName = basename(dataDir);
   const prefix = '.' + dataName + '.pre-restore-';
-  const plans: PlannedPreRestoreFile[] = [];
+  const plans: PlannedPreRestoreDirectory[] = [];
   let scanned = 0;
   for (const entry of readdirSync(parent, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
     if (!entry.name.startsWith(prefix)) continue;
@@ -184,22 +250,28 @@ function planPreRestoreFiles(
       throw fail('session-privacy-cleanup-pre-restore-invalid');
     }
     scanned += 1;
-    const parentIdentity = pathIdentity(directoryStats);
-    for (const suffix of ['', '-wal', '-shm']) {
-      const path = join(preRestoreDir, sessionFile + suffix);
-      assertContained(preRestoreDir, path);
-      const stats = lstatOrNull(path);
-      if (!stats) continue;
-      if (!stats.isFile() || stats.isSymbolicLink()) {
-        throw fail('session-privacy-cleanup-pre-restore-invalid');
-      }
-      plans.push({
-        path,
-        parentPath: preRestoreDir,
-        parentIdentity,
-        identity: pathIdentity(stats),
-      });
+    const sessionPath = join(preRestoreDir, sessionFile);
+    assertContained(preRestoreDir, sessionPath);
+    const sessionStats = lstatOrNull(sessionPath);
+    if (!sessionStats) continue;
+    if (!sessionStats.isFile() || sessionStats.isSymbolicLink()) {
+      throw fail('session-privacy-cleanup-pre-restore-invalid');
     }
+    const entries = inspectPlainTree(
+      preRestoreDir,
+      'session-privacy-cleanup-pre-restore-invalid',
+    );
+    const sessionEntry = entries.find((item) => item.relativePath === sessionFile);
+    if (!sessionEntry || sessionEntry.kind !== 'file'
+      || !sameIdentity(sessionStats, sessionEntry.identity)) {
+      throw fail('session-privacy-cleanup-pre-restore-invalid');
+    }
+    plans.push({
+      path: preRestoreDir,
+      restoreId,
+      identity: pathIdentity(directoryStats),
+      entries: Object.freeze(entries),
+    });
   }
   return { plans, scanned };
 }
@@ -208,14 +280,14 @@ function planPreRestoreFiles(
  * Removes whole signed snapshot envelopes that contain the deleted session.
  *
  * Rewriting one component would invalidate the manifest hashes and plugin envelope,
- * so a proven matching published snapshot is deleted as a unit. Pre-restore trees
- * are not signed envelopes; only their exact session DB/WAL/SHM files are removed.
+ * so a proven matching published snapshot is deleted as a unit. A pre-restore tree
+ * is the complete old dataDir; once its top-level target session DB proves the
+ * binding, the complete verified tree must be deleted to cover derived sidecars.
  * Planning validates every candidate before the first destructive operation.
  */
-export function cleanupDeletedSessionSnapshotArtifacts(input: {
-  readonly dataDir: string;
-  readonly sessionId: string;
-}): SessionDeletionSnapshotCleanupResult {
+export function cleanupDeletedSessionSnapshotArtifacts(
+  input: SessionDeletionSnapshotCleanupInput,
+): SessionDeletionSnapshotCleanupResult {
   if (!input || typeof input.dataDir !== 'string' || input.dataDir.trim() === ''
     || !isSafeOpaqueId(input.sessionId, 160)) {
     throw fail('session-privacy-cleanup-input-invalid');
@@ -231,7 +303,21 @@ export function cleanupDeletedSessionSnapshotArtifacts(input: {
       throw fail('session-privacy-cleanup-input-invalid');
     }
     const snapshots = planPublishedSnapshots(dataDir, sessionFile);
-    const preRestore = planPreRestoreFiles(dataDir, sessionFile);
+    const preRestore = planPreRestoreDirectories(dataDir, sessionFile);
+
+    input.injectBeforeApply?.();
+
+    // Revalidate the complete plan after the deterministic race seam and before
+    // the first destructive operation. Each item is checked again immediately
+    // before removal below, so changed identities never authorize deletion.
+    for (const plan of snapshots.plans) {
+      const current = lstatOrNull(plan.path);
+      if (!current || !current.isDirectory() || current.isSymbolicLink()
+        || !sameIdentity(current, plan.identity)) {
+        throw fail('session-privacy-cleanup-snapshot-invalid');
+      }
+    }
+    for (const plan of preRestore.plans) assertPreRestorePlanCurrent(plan);
 
     const removedSnapshotIds: string[] = [];
     for (const plan of snapshots.plans) {
@@ -244,24 +330,18 @@ export function cleanupDeletedSessionSnapshotArtifacts(input: {
       removedSnapshotIds.push(plan.snapshotId);
     }
 
-    let removedPreRestoreFiles = 0;
+    const removedPreRestoreIds: string[] = [];
     for (const plan of preRestore.plans) {
-      const parentStats = lstatOrNull(plan.parentPath);
-      const current = lstatOrNull(plan.path);
-      if (!current) continue;
-      if (!parentStats || !parentStats.isDirectory() || parentStats.isSymbolicLink()
-        || !sameIdentity(parentStats, plan.parentIdentity)
-        || !current.isFile() || current.isSymbolicLink() || !sameIdentity(current, plan.identity)) {
-        throw fail('session-privacy-cleanup-pre-restore-invalid');
-      }
-      rmSync(plan.path, { force: false });
-      removedPreRestoreFiles += 1;
+      assertPreRestorePlanCurrent(plan);
+      rmSync(plan.path, { recursive: true, force: false });
+      if (existsSync(plan.path)) throw fail('session-privacy-cleanup-pre-restore-invalid');
+      removedPreRestoreIds.push(plan.restoreId);
     }
 
     return Object.freeze({
       sessionId: input.sessionId,
       removedSnapshotIds: Object.freeze(removedSnapshotIds),
-      removedPreRestoreFiles,
+      removedPreRestoreIds: Object.freeze(removedPreRestoreIds),
       scannedSnapshots: snapshots.scanned,
       scannedPreRestoreDirectories: preRestore.scanned,
     });

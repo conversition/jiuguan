@@ -5,18 +5,24 @@
  * - eventId 是**同一 serverInstanceId 进程生命周期内**的单调投递序号，纯进程内存状态；
  *   进程重启后从 1 重新开始，客户端必须以 /api/capabilities 的 serverInstanceId 变化
  *   作为"重新全量同步"信号，而不是拿 eventId 做业务 revision。
- * - 不做 replay：不持久化事件，不消费 Last-Event-ID；REST/SQLite 仍是唯一真值，
- *   事件只触发客户端 refetch。
- * - payload 白名单：data 只允许 { status?: string } 形状的有界失效提示，
+ * - 仅做有界进程内 replay，不持久化事件；REST/SQLite 仍是唯一真值，
+ *   缺口或进程换代后只触发客户端 refetch。
+ * - payload 白名单：普通data仅允许status；显式协商的task v2只增有界原证据引用，
  *   严禁 prompt、正文、思维链、工具结果、凭据或任意自由对象。
  */
 import {
   EVENT_SCHEMA_VERSION,
+  TASK_EVENT_SCHEMA_VERSION,
+  TASK_EVENT_KINDS,
+  TASK_EVENT_REASONS,
   isEventEnvelope,
   type EventEnvelope,
   type EventType,
   type EventResource,
 } from '../../packages/mobile-contracts/src/index.ts';
+import { agentLoopContinuationNotification } from './agent-loop-continuation.ts';
+import type { AgentLoopTaskEventEvidence } from './agent-loop-task-invalidation.ts';
+import { types as nodeTypes } from 'node:util';
 
 /** 失效通知 data 的唯一白名单键。新增键必须先扩展此处并补契约测试。 */
 const DATA_KEYS: ReadonlySet<string> = new Set(['status']);
@@ -36,6 +42,44 @@ export interface PublishInvalidationInput {
   data?: unknown;
 }
 
+/** The existing continuation DTO supplies identity only; neither this helper nor SSE grants read authority. */
+export function publishAgentLoopTaskInvalidation(
+    hub: Pick<InvalidationHub, 'publish'>,
+    input: Readonly<{ taskId: string; taskRevision: number }>,
+    evidence?: AgentLoopTaskEventEvidence,
+): EventEnvelope {
+    const notification = agentLoopContinuationNotification(input);
+    return hub.publish({
+        type: 'task.updated',
+        resource: { kind: 'task', id: notification.taskId, revision: String(notification.taskRevision) },
+        data: {},
+    }, evidence);
+}
+
+export type MaintenanceLifecycleInvalidationPhase = 'evaluated' | 'enqueued' | 'settled';
+
+/**
+ * Maintenance shares the existing session invalidation stream.  The event is
+ * intentionally content-free: consumers re-read the REST control model for
+ * the authoritative job/progress state instead of trusting an SSE payload.
+ */
+export function publishMaintenanceLifecycleInvalidation(
+  hub: Pick<InvalidationHub, 'publish'>,
+  input: Readonly<{
+    phase: MaintenanceLifecycleInvalidationPhase;
+    job: Readonly<{ sessionId: string; runId: string }>;
+  }>,
+): EventEnvelope {
+  return hub.publish({
+    type: 'session.updated',
+    resource: { kind: 'session', id: input.job.sessionId },
+    runId: input.job.runId,
+    data: {
+      status: `maintenance-${input.phase}`,
+    },
+  });
+}
+
 export interface InvalidationHubOptions {
   serverInstanceId: string;
   now?: () => string;
@@ -52,7 +96,7 @@ export type ReplayCursorResult =
   | { kind: 'replay'; envelopes: EventEnvelope[] }
   | {
       kind: 'sync-required';
-      reason: 'unknown-cursor' | 'future-cursor' | 'gap' | 'instance-mismatch' | 'replay-disabled';
+      reason: 'unknown-cursor' | 'future-cursor' | 'gap' | 'instance-missing' | 'instance-mismatch' | 'replay-disabled';
     };
 
 interface HistoryEntry {
@@ -85,6 +129,30 @@ function assertSafeInvalidationData(data: unknown): void {
   }
 }
 
+function assertTaskEvidence(evidence: AgentLoopTaskEventEvidence | undefined): void {
+  if (evidence === undefined) return;
+  if (!evidence || typeof evidence !== 'object' || nodeTypes.isProxy(evidence)
+    || (Object.getPrototypeOf(evidence) !== Object.prototype && Object.getPrototypeOf(evidence) !== null)) {
+    throw new Error('task-event-evidence-invalid');
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(evidence);
+  if (!Object.hasOwn(descriptors, 'eventDigest')
+    || Reflect.ownKeys(descriptors).some(key => typeof key !== 'string'
+      || !['eventDigest', 'acceptedAt', 'currentAttemptIdAtRevision', 'attemptId', 'recordRefs', 'kind', 'reasonCode'].includes(key))
+    || Object.values(descriptors).some(value => !value.enumerable || !Object.hasOwn(value, 'value'))) {
+    throw new Error('task-event-evidence-invalid');
+  }
+  if (evidence.recordRefs !== undefined) {
+    if (!Array.isArray(evidence.recordRefs) || nodeTypes.isProxy(evidence.recordRefs)
+      || evidence.recordRefs.length > 4) throw new Error('task-event-evidence-invalid');
+    for (let index = 0; index < evidence.recordRefs.length; index++) {
+      const descriptor = Object.getOwnPropertyDescriptor(evidence.recordRefs, String(index));
+      if (!descriptor || !Object.hasOwn(descriptor, 'value') || nodeTypes.isProxy(descriptor.value))
+        throw new Error('task-event-evidence-invalid');
+    }
+  }
+}
+
 /**
  * 失效通知分发器。publish 同步扇出到全部订阅者；单个订阅者回调抛错只影响自身，
  * 不阻断其它订阅者，也不回传给事件产生方（任务生命周期不得依赖订阅者存活）。
@@ -97,6 +165,7 @@ export class InvalidationHub {
   readonly #replayLimitBytes: number;
   readonly #subscribers = new Set<InvalidationSubscriber>();
   readonly #history: HistoryEntry[] = [];
+  readonly #taskEventsV2 = new WeakMap<EventEnvelope, EventEnvelope>();
   #historyBytes = 0;
   #seq = 0;
 
@@ -135,8 +204,9 @@ export class InvalidationHub {
    * 发布一条失效通知并返回最终 envelope。eventId 全局（跨订阅者）单调递增；
    * 契约校验失败按 fail-closed 抛错，绝不降级发送畸形事件。
    */
-  publish(input: PublishInvalidationInput): EventEnvelope {
+  publish(input: PublishInvalidationInput, evidence?: AgentLoopTaskEventEvidence): EventEnvelope {
     assertSafeInvalidationData(input.data);
+    assertTaskEvidence(evidence);
     this.#seq += 1;
     const envelope: EventEnvelope = {
       schemaVersion: EVENT_SCHEMA_VERSION,
@@ -154,6 +224,39 @@ export class InvalidationHub {
       this.#seq -= 1;
       throw new Error('失效通知 envelope 未通过契约校验');
     }
+    if (evidence !== undefined) {
+      if (envelope.type !== 'task.updated') { this.#seq -= 1; throw new Error('task-event-evidence-invalid'); }
+      const kind = evidence.kind !== undefined && (TASK_EVENT_KINDS as readonly string[]).includes(evidence.kind)
+        ? evidence.kind : undefined;
+      const reasonCode = evidence.reasonCode !== undefined && (TASK_EVENT_REASONS as readonly string[]).includes(evidence.reasonCode)
+        ? evidence.reasonCode : undefined;
+      const detailed: EventEnvelope = {
+        ...envelope, schemaVersion: TASK_EVENT_SCHEMA_VERSION,
+        resource: Object.freeze({ ...envelope.resource }),
+        data: Object.freeze({ version: 'agent-loop-task-event-v2', eventDigest: evidence.eventDigest,
+          ...(evidence.acceptedAt === undefined ? {} : { acceptedAt: evidence.acceptedAt }),
+          ...(evidence.currentAttemptIdAtRevision === undefined ? {} : { currentAttemptIdAtRevision: evidence.currentAttemptIdAtRevision }),
+          ...(evidence.attemptId === undefined ? {} : { attemptId: evidence.attemptId }),
+          ...(evidence.recordRefs === undefined ? {} : { recordRefs: evidence.recordRefs }),
+          ...(kind === undefined ? {} : { kind }), ...(reasonCode === undefined ? {} : { reasonCode }) }),
+      };
+      if (!isEventEnvelope(detailed)) { this.#seq -= 1; throw new Error('task-event-evidence-invalid'); }
+      if (evidence.recordRefs !== undefined) {
+        const refs = [];
+        for (let i = 0; i < evidence.recordRefs.length; i++) refs.push(Object.freeze({ ...evidence.recordRefs[i]! }));
+        detailed.data = Object.freeze({ ...(detailed.data as object), recordRefs: Object.freeze(refs) });
+      }
+      this.#taskEventsV2.set(envelope, Object.freeze(detailed));
+    }
+        if (envelope.type === 'task.updated') {
+            envelope.resource = Object.freeze({
+                kind: 'task',
+                id: envelope.resource.id!,
+                revision: envelope.resource.revision!,
+            });
+            envelope.data = Object.freeze({});
+            Object.freeze(envelope);
+        }
     this.#remember(envelope, this.#seq);
     for (const subscriber of [...this.#subscribers]) {
       try {
@@ -165,18 +268,28 @@ export class InvalidationHub {
     return envelope;
   }
 
+  /** Opt-in per connection; the stored v1 event and global sequence remain unchanged. */
+  taskEventForClient(envelope: EventEnvelope, version2: boolean): EventEnvelope {
+    if (!version2 || envelope.type !== 'task.updated') return envelope;
+    const evidence = this.#taskEventsV2.get(envelope);
+    if (!evidence) throw new Error('task-event-evidence-unavailable');
+    return evidence;
+  }
+
   /**
    * P7-06：按游标做**有界** replay。缓冲只保留最近 `replayLimitEvents` 条 /
    * `replayLimitBytes` 字节，更早的丢弃且永不恢复——任何取不到的连续区间都返回
    * `sync-required`，由客户端回到 REST 全量查询。REST/SQLite 仍是唯一真值。
    *
-   * `cursorServerInstanceId` 用于证明游标属于当前进程实例；缺失时只做数值范围校验
-   * （纯失效通知不承载业务真值，错实例游标的最坏后果是一次多余 refetch，不产生错误写入）。
+   * `cursorServerInstanceId` 必须证明游标属于当前进程实例；缺失或不同均先同步权威状态，
+   * 不能把重启后碰巧相同的事件序号当作连续游标。
    */
   replayFrom(lastEventId: string, cursorServerInstanceId?: string): ReplayCursorResult {
     if (this.#replayLimitEvents === 0) return { kind: 'sync-required', reason: 'replay-disabled' };
-    if (typeof cursorServerInstanceId === 'string'
-      && cursorServerInstanceId !== this.#serverInstanceId) {
+    if (typeof cursorServerInstanceId !== 'string' || cursorServerInstanceId.length === 0) {
+      return { kind: 'sync-required', reason: 'instance-missing' };
+    }
+    if (cursorServerInstanceId !== this.#serverInstanceId) {
       return { kind: 'sync-required', reason: 'instance-mismatch' };
     }
     const text = typeof lastEventId === 'string' ? lastEventId.trim() : '';
@@ -227,7 +340,8 @@ export class InvalidationHub {
 
   #remember(envelope: EventEnvelope, eventId: number): void {
     if (this.#replayLimitEvents === 0) return;
-    const bytes = JSON.stringify(envelope).length;
+    const detail = this.#taskEventsV2.get(envelope);
+    const bytes = JSON.stringify(envelope).length + (detail ? JSON.stringify(detail).length : 0);
     this.#history.push({ envelope, eventId, bytes });
     this.#historyBytes += bytes;
     while (

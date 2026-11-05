@@ -69,6 +69,46 @@ function publicFailureCode(error: unknown, leaseLost: boolean): string {
     case 'invocation-forced': return 'provider_reloaded';
     case 'invocation-aborted': return 'provider_interrupted';
     case 'skill-context-conflict': return 'skill_context_conflict';
+    case 'context-compiler-failed': return 'context_compiler_failed';
+    case 'context-compiler-provider-request-invalid': return 'context_compiler_provider_request_invalid';
+    case 'schema-repair-reserve-insufficient': return 'schema_repair_reserve_insufficient';
+    case 'game-turn-output-invalid': {
+      // Only the host's closed reason vocabulary may become a public failure.
+      // Never stringify a model-supplied field or preserve the raw error message.
+      let reason: unknown;
+      try { reason = (error as { reason?: unknown }).reason; } catch { /* unknown classification */ }
+      switch (reason) {
+        case 'missing-tool': return 'game_turn_tool_missing';
+        case 'parse-rejected': return 'game_turn_json_invalid';
+        case 'schema-invalid': return 'game_turn_schema_invalid';
+        case 'schema-repair-unavailable': return 'game_turn_schema_repair_unavailable';
+        case 'schema-repair-failed': {
+          const repairCode = (error as { repairCode?: unknown }).repairCode;
+          switch (repairCode) {
+            case 'schema-repair-response-empty': return 'game_turn_repair_empty';
+            case 'schema-repair-response-truncated': return 'game_turn_repair_truncated';
+            case 'schema-repair-response-tool-call': return 'game_turn_repair_tool_call';
+            case 'schema-repair-response-json-invalid': return 'game_turn_repair_json_invalid';
+            case 'schema-repair-response-shape-invalid': return 'game_turn_repair_shape_invalid';
+            case 'schema-repair-model-abstained': return 'game_turn_repair_abstained';
+            case 'schema-repair-issue-invalid': return 'game_turn_repair_issue_invalid';
+            case 'schema-repair-value-invalid': return 'game_turn_repair_value_invalid';
+            case 'schema-repair-schema-invalid': return 'game_turn_repair_schema_invalid';
+            case 'schema-repair-evidence-storage-failed': return 'game_turn_repair_evidence_storage_failed';
+            case 'schema-repair-source-stale': return 'game_turn_repair_source_stale';
+            default: return 'game_turn_schema_repair_failed';
+          }
+        }
+        case 'candidate-storage-failed': return 'game_turn_candidate_storage_failed';
+        case 'normalization-failed': return 'game_turn_normalization_failed';
+        default: return 'game_turn_output_invalid';
+      }
+    }
+    case 'game-turn-budget-exhausted': return 'game_turn_budget_exhausted';
+    case 'style-package-canary-output-invalid': return 'skill_package_output_invalid';
+    case 'style-package-canary-budget-exhausted': return 'skill_package_budget_exhausted';
+    case 'style-package-shadow-output-invalid': return 'skill_package_shadow_output_invalid';
+    case 'style-package-shadow-budget-exhausted': return 'skill_package_shadow_budget_exhausted';
     default: return 'generation_failed';
   }
 }
@@ -206,12 +246,27 @@ export class TurnJobRunner<T = unknown> {
         return { job: latest };
       }
       const cancelled = latest.cancelRequestedAt !== undefined;
+      const failureCode = cancelled ? undefined : publicFailureCode(error, leaseLost());
+      // 观测缺口：publicFailureCode 会把未映射的异常折叠成 generation_failed，
+      // 且本 catch 原先不记录 error 本体，导致「本地 300ms 失败、零 Provider 调用」
+      // 这类问题完全无迹可查。这里只记稳定身份与截断后的 message（不落 prompt/正文），
+      // 走 stderr，不进任何业务库。
+      if (!cancelled && failureCode === 'generation_failed') {
+        const name = error && typeof error === 'object' && 'name' in error
+          ? String((error as { name?: unknown }).name) : typeof error;
+        const message = error instanceof Error ? error.message : String(error ?? '');
+        // `game-turn-output-invalid` collapses every schema rejection into one message; the
+        // structured reason is the only thing that says which area of the reply was rejected.
+        const reason = error && typeof error === 'object' && 'reason' in error
+          ? String((error as { reason?: unknown }).reason).slice(0, 120) : '';
+        console.error('[turn-failure]', runId, name, message.slice(0, 300), reason ? `reason=${reason}` : '');
+      }
       const terminal = this.manager.transition({
         runId,
         expectedVersion: latest.version,
         leaseOwnerInstanceId: this.#ownerInstanceId,
         to: cancelled ? 'cancelled' : 'failed',
-        ...(cancelled ? {} : { publicErrorCode: publicFailureCode(error, leaseLost()) }),
+        ...(failureCode === undefined ? {} : { publicErrorCode: failureCode }),
       });
       return { job: terminal };
     }

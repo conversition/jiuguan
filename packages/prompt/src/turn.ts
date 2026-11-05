@@ -5,6 +5,32 @@
  */
 import { z } from 'zod';
 
+const CONTROL_INSTRUCTION_MARKER = /(?:```|(?:^|[\s"'\u0060])(?:system|developer|assistant|user)\s*:|ignore\s+(?:all\s+)?previous\b|忽略(?:以上|之前|先前|前述).{0,12}(?:指令|规则|内容))/iu;
+const ARC_UNRESOLVED_HOOK_MAX_ITEMS = 8;
+const ARC_UNRESOLVED_HOOK_MAX_CHARS = 160;
+
+/** Optional Arc clues are an index hint, never a reason to reject the foreground turn. */
+export function normalizeUnresolvedHooks(input: unknown): string[] {
+  if (!Array.isArray(input)) return [];
+  const hooks: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of input) {
+    if (typeof raw !== 'string') continue;
+    const normalized = raw.normalize('NFKC').replace(/\s+/gu, ' ').trim();
+    if (!normalized || CONTROL_INSTRUCTION_MARKER.test(normalized)) continue;
+    const hook = [...normalized].slice(0, ARC_UNRESOLVED_HOOK_MAX_CHARS).join('');
+    const key = hook.toLocaleLowerCase();
+    if (!hook || seen.has(key)) continue;
+    seen.add(key);
+    hooks.push(hook);
+    if (hooks.length === ARC_UNRESOLVED_HOOK_MAX_ITEMS) break;
+  }
+  return hooks;
+}
+
+const SoftUnresolvedHooksSchema = z.unknown().optional()
+  .transform((value): string[] => normalizeUnresolvedHooks(value));
+
 // ── plan ──
 export const CharacterFocusSchema = z.object({
   name: z.string(),
@@ -25,14 +51,16 @@ export const RoadmapSchema = z.object({
   current_stage: z.string().default(''),
   next_milestone: z.string().default(''),
   active_foreshadowing: z.array(z.object({ clue: z.string(), status: z.string().default('pending') })).default([]),
+  unresolved_hooks: SoftUnresolvedHooksSchema
+    .describe('仍未解决、且玩家已从本轮或此前正文知晓的伏笔/悬念；供剧情分支索引使用，不写幕后计划或 NPC 私有知识'),
 });
 export type Roadmap = z.infer<typeof RoadmapSchema>;
 
 export const BarsDeltaSchema = z.object({
-  personal: z.number().default(0),
-  accident: z.number().default(0),
-  main: z.number().default(0),
-  erotic: z.number().default(0),
+  personal: z.number().default(0).describe('个人成长/关系推进的整数百分点增量（-100..100）'),
+  accident: z.number().default(0).describe('意外与突发事件张力的整数百分点增量（-100..100）'),
+  main: z.number().default(0).describe('当前主线里程碑推进的整数百分点增量（-100..100）'),
+  erotic: z.number().default(0).describe('亲密/情欲场景张力的整数百分点增量（-100..100）'),
 });
 export type BarsDelta = z.infer<typeof BarsDeltaSchema>;
 
@@ -66,54 +94,69 @@ export const StateChangeSchema = z.object({
    * `npc_<slug>` 与 `char_<slug>` 两个键，池子里成了两行，永远建不出人（AM-07 二轮）。
    */
   entity_id: z.string().describe('实体名；人物必须写可读称呼，禁用 char_001 / npc_xxx / char_xxx 内部键'),
-  field: z.string().optional(),
+  field: z.string().optional().describe('本轮正文已经揭示的状态字段；主角位置、身体、情绪、装备或当前行动发生变化时必须记录'),
   value: z.string().optional(),
   action: z.enum(['upsert', 'delete']),
 });
 export type StateChange = z.infer<typeof StateChangeSchema>;
 
 // ── AM-04：人物候选变更（模型/子 Agent 只产候选，代码决定准入）──
+const CHARACTER_DELTA_MAX_ITEMS = 16;
+const CHARACTER_CHANGE_MAX_ITEMS = 24;
+const CHARACTER_RELATIONSHIP_MAX_ITEMS = 16;
+const CHARACTER_ALIAS_MAX_ITEMS = 16;
+const CHARACTER_UNRESOLVED_MAX_ITEMS = 16;
+const CHARACTER_SOURCE_REF_MAX_ITEMS = 16;
+
 export const FactKindSchema = z.enum(['fact', 'recall', 'plan', 'hypothesis', 'quoted', 'correction'])
   .describe('事实类别：已发生/回忆/计划/假设/转述/明确纠正');
 export const FactStatusSchema = z.enum(['confirmed', 'pending', 'unresolved', 'last-known', 'unknown']);
 export const SourceRefSchema = z.object({
   source: z.enum(['message', 'am', 'lore', 'card', 'user']),
-  recordId: z.string(),
-  recordVersion: z.number().optional(),
-});
+  recordId: z.string().min(1).max(160),
+  recordVersion: z.number().int().nonnegative().optional(),
+}).strict();
 export const CharacterChangeSchema = z.object({
-  field: z.string().describe('字段名（如 outfit / injury / location）'),
+  field: z.string().min(1).max(64).describe('字段名（如 outfit / injury / location）'),
   scope: z.enum(['profile', 'fact']).optional().describe('相对稳定档案 / 当前单局状态'),
   value: z.unknown(),
   factKind: FactKindSchema.optional(),
   status: FactStatusSchema.optional(),
-  sceneId: z.string().optional(),
-  effectiveAt: z.object({ round: z.number().optional(), messageId: z.number().optional(), eventIndex: z.number().optional() }).optional(),
-  sourceRefs: z.array(SourceRefSchema).optional(),
-});
+  sceneId: z.string().max(120).optional(),
+  effectiveAt: z.object({
+    round: z.number().int().nonnegative().optional(),
+    messageId: z.number().int().nonnegative().optional(),
+    eventIndex: z.number().int().nonnegative().optional(),
+  }).strict().optional(),
+  sourceRefs: z.array(SourceRefSchema).max(CHARACTER_SOURCE_REF_MAX_ITEMS).optional(),
+}).strict();
 export const CharacterRelationshipSchema = z.object({
-  relationshipId: z.string().optional(),
-  fromCharacterId: z.string(),
-  toCharacterId: z.string(),
-  type: z.string(),
+  relationshipId: z.string().min(1).max(160).optional(),
+  fromCharacterId: z.string().min(1).max(160),
+  toCharacterId: z.string().min(1).max(160),
+  type: z.string().min(1).max(80),
   perspective: z.enum(['objective', 'subjective']).optional(),
   factKind: FactKindSchema.optional(),
   status: FactStatusSchema.optional(),
-  sceneId: z.string().optional(),
-  effectiveAt: z.object({ round: z.number().optional(), messageId: z.number().optional(), eventIndex: z.number().optional() }).optional(),
-  sourceRefs: z.array(SourceRefSchema).optional(),
-});
+  sceneId: z.string().max(120).optional(),
+  effectiveAt: z.object({
+    round: z.number().int().nonnegative().optional(),
+    messageId: z.number().int().nonnegative().optional(),
+    eventIndex: z.number().int().nonnegative().optional(),
+  }).strict().optional(),
+  sourceRefs: z.array(SourceRefSchema).max(CHARACTER_SOURCE_REF_MAX_ITEMS).optional(),
+}).strict();
 export const CharacterDeltaSchema = z.object({
   /** 已消歧的稳定人物 ID（代码分配）；未知时留空并用 mention/newEntity */
-  characterId: z.string().optional(),
-  mention: z.string().optional().describe('待消歧的称呼；无法唯一确定时不写入具体人物'),
-  name: z.string().optional(),
-  aliases: z.array(z.string()).optional(),
+  characterId: z.string().min(1).max(160).optional(),
+  mention: z.string().min(1).max(160).optional().describe('待消歧的称呼；无法唯一确定时不写入具体人物'),
+  name: z.string().min(1).max(80).optional(),
+  aliases: z.array(z.string().min(1).max(80)).max(CHARACTER_ALIAS_MAX_ITEMS).optional(),
   newEntity: z.boolean().optional().describe('声明为新人物候选（ID 由代码分配）'),
-  changes: z.array(CharacterChangeSchema).default([]),
-  relationships: z.array(CharacterRelationshipSchema).default([]),
-  unresolved: z.array(z.string()).default([]),
-});
+  changes: z.array(CharacterChangeSchema).max(CHARACTER_CHANGE_MAX_ITEMS).default([]),
+  relationships: z.array(CharacterRelationshipSchema).max(CHARACTER_RELATIONSHIP_MAX_ITEMS).default([]),
+  unresolved: z.array(z.string().min(1).max(240)).max(CHARACTER_UNRESOLVED_MAX_ITEMS).default([]),
+}).strict();
 export type CharacterDelta = z.infer<typeof CharacterDeltaSchema>;
 
 export const MemoryDeltaSchema = z.object({
@@ -126,7 +169,7 @@ export const MemoryDeltaSchema = z.object({
    *  - 无法唯一确定时留空并写进 unresolved（不静默写到最近出现的人物上）
    *  - factKind 区分事实/回忆/计划/假设/转述/纠正；非既成事实只进历史
    */
-  character_deltas: z.array(CharacterDeltaSchema).default([]),
+  character_deltas: z.array(CharacterDeltaSchema).max(CHARACTER_DELTA_MAX_ITEMS).default([]),
 });
 export type MemoryDelta = z.infer<typeof MemoryDeltaSchema>;
 
@@ -170,7 +213,6 @@ export const StoryIndexSeedSchema = z.object({
 });
 export type StoryIndexSeed = z.infer<typeof StoryIndexSeedSchema>;
 
-const STORY_INDEX_CONTROL_MARKER = /(?:```|(?:^|[\s"'\u0060])(?:system|developer|assistant|user)\s*:|ignore\s+(?:all\s+)?previous\b|忽略(?:以上|之前|先前|前述).{0,12}(?:指令|规则|内容))/iu;
 const STORY_INDEX_OUTCOME_MARKER = /(?:(?:并|且|从而|然后|随后)\s*(?:成功|失败)(?:地)?|(?:^|[，,；;。.!?！？])\s*最终|^(?:成功|失败)(?:地)?|(?:and\s+)?successfully\b|\bfinally\b)/iu;
 
 /** 确定性安全边界：任一分支含控制指令或明显结果式措辞时，整组 seed 不可消费。 */
@@ -178,7 +220,7 @@ export function isSafeStoryIndexSeed(input: unknown): input is StoryIndexSeed {
   const parsed = StoryIndexSeedSchema.safeParse(input);
   if (!parsed.success) return false;
   return parsed.data.branches.every(({ action }) => (
-    !STORY_INDEX_CONTROL_MARKER.test(action)
+    !CONTROL_INSTRUCTION_MARKER.test(action)
     && !STORY_INDEX_OUTCOME_MARKER.test(action)
   ));
 }
@@ -305,6 +347,15 @@ export function safeParseTurn(args: string): GameTurn | null {
       if (repaired && typeof repaired === 'object'
         && 'plan' in (repaired as object) && 'memory_delta' in (repaired as object) && 'prose' in (repaired as object)) {
         const sanitized = { ...(repaired as Record<string, unknown>) };
+        const plan = sanitized.plan;
+        if (plan && typeof plan === 'object' && !Array.isArray(plan)) {
+          const roadmap = (plan as Record<string, unknown>).roadmap;
+          if (roadmap && typeof roadmap === 'object' && !Array.isArray(roadmap)) {
+            (roadmap as Record<string, unknown>).unresolved_hooks = normalizeUnresolvedHooks(
+              (roadmap as Record<string, unknown>).unresolved_hooks,
+            );
+          }
+        }
         const seed = parseStoryIndexSeed(sanitized.story_index_seed);
         if (seed) sanitized.story_index_seed = seed;
         else delete sanitized.story_index_seed;
@@ -357,6 +408,14 @@ function repairNestedJson(obj: unknown): unknown {
 export function normalizeTurn(turn: GameTurn): { turn: GameTurn; warnings: string[] } {
   const warnings: string[] = [];
   const t = structuredClone(turn);
+  if (t.plan?.roadmap && typeof t.plan.roadmap === 'object' && !Array.isArray(t.plan.roadmap)) {
+    const rawHooks = (t.plan.roadmap as unknown as Record<string, unknown>).unresolved_hooks;
+    const hooks = normalizeUnresolvedHooks(rawHooks);
+    if (JSON.stringify(rawHooks ?? []) !== JSON.stringify(hooks)) {
+      warnings.push('plan.roadmap.unresolved_hooks 含越界或不安全项，已软过滤；正文与记忆增量不受影响');
+    }
+    t.plan.roadmap.unresolved_hooks = hooks;
+  }
   if ('story_index_seed' in (t as object)) {
     const seed = parseStoryIndexSeed(t.story_index_seed);
     if (seed) t.story_index_seed = seed;
@@ -391,11 +450,14 @@ export function normalizeTurn(turn: GameTurn): { turn: GameTurn; warnings: strin
       p.countdown_min = 30;
     }
   }
-  // bars_delta 收敛到 [-100, 100]
+  // bars_delta 的持久化单位是整数百分点：限制范围，并把非零小数保留为至少 ±1，
+  // 避免 0.4 被 UI 当成 0.4% 后肉眼近似“不更新”。
   for (const [k, v] of Object.entries(t.plan?.bars_delta ?? {})) {
-    if (typeof v === 'number' && (v > 100 || v < -100)) {
-      warnings.push(`bars_delta.${k} ${v} 超限，收敛至 ${Math.max(-100, Math.min(100, v))}`);
-      (t.plan.bars_delta as Record<string, number>)[k] = Math.max(-100, Math.min(100, v));
+    if (typeof v === 'number' && Number.isFinite(v)) {
+      const clamped = Math.max(-100, Math.min(100, v));
+      const rounded = clamped !== 0 && Math.round(clamped) === 0 ? Math.sign(clamped) : Math.round(clamped);
+      if (rounded !== v) warnings.push(`bars_delta.${k} ${v} 按整数百分点归一化 → ${rounded}`);
+      (t.plan.bars_delta as Record<string, number>)[k] = rounded;
     }
   }
   return { turn: t, warnings };
@@ -435,7 +497,8 @@ export function gameTurnTool(): Record<string, unknown> {
       name: 'game_turn',
       description:
         '生成本轮完整回合：剧情编排（plan）+ 记忆增量内容（memory_delta）+ 玩家可执行分支种子（story_index_seed）+ 正文（prose）。' +
-        '平台负责检索、写库与校验，本工具只负责涌现内容（规划/正文/风格）。',
+        '平台负责检索、写库与校验，本工具只负责涌现内容（规划/正文/风格）。' +
+        '工具参数必须是完整且合法的 JSON 对象；数组内对象的字段全部写在对象花括号内，元素之间只用逗号分隔，不在对象结束后追加冒号或值。',
       parameters: {
         type: 'object',
         properties: {
@@ -450,27 +513,39 @@ export function gameTurnTool(): Record<string, unknown> {
                   current_arc: { type: 'string' },
                   current_stage: { type: 'string' },
                   next_milestone: { type: 'string' },
-                  active_foreshadowing: { type: 'array', items: { type: 'object', properties: { clue: { type: 'string' }, status: { type: 'string' } } } },
+                  active_foreshadowing: { type: 'array', items: { type: 'object', properties: { clue: { type: 'string' }, status: { type: 'string' } }, required: ['clue'] } },
+                  unresolved_hooks: { type: 'array', maxItems: 8, description: '玩家已知且尚未解决的伏笔/悬念，供剧情分支索引使用；不得包含幕后计划或 NPC 私有知识', items: { type: 'string', minLength: 1, maxLength: 160 } },
                 },
               },
               key_events: {
                 type: 'array',
+                minItems: 1,
                 items: {
                   type: 'object',
                   properties: {
                     description: { type: 'string' },
                     character_focus: {
                       type: 'array',
-                      items: { type: 'object', properties: { name: { type: 'string' }, knows: { type: 'array', items: { type: 'string' } }, unknowns: { type: 'array', items: { type: 'string' } } } },
+                      items: { type: 'object', properties: { name: { type: 'string' }, knows: { type: 'array', items: { type: 'string' } }, unknowns: { type: 'array', items: { type: 'string' } } }, required: ['name'] },
                     },
                     reference_source: { type: 'array', items: { type: 'string' } },
                   },
+                  required: ['description'],
                 },
               },
-              bars_delta: { type: 'object', properties: { personal: { type: 'number' }, accident: { type: 'number' }, main: { type: 'number' }, erotic: { type: 'number' } } },
+              bars_delta: {
+                type: 'object',
+                description: '四个累计推进槽的本轮整数百分点增量（不是主角属性值；范围 -100..100）',
+                properties: {
+                  personal: { type: 'integer', minimum: -100, maximum: 100, description: '个人成长/关系推进' },
+                  accident: { type: 'integer', minimum: -100, maximum: 100, description: '意外与突发事件张力' },
+                  main: { type: 'integer', minimum: -100, maximum: 100, description: '当前主线里程碑推进' },
+                  erotic: { type: 'integer', minimum: -100, maximum: 100, description: '亲密/情欲场景张力' },
+                },
+              },
               parallel: {
                 type: 'array',
-                items: { type: 'object', properties: { kind: { type: 'string', enum: ['antagonist', 'normal'] }, actor: { type: 'string' }, location: { type: 'string' }, action: { type: 'string' }, countdown_min: { type: 'number', minimum: 1, maximum: 180 } } },
+                items: { type: 'object', properties: { kind: { type: 'string', enum: ['antagonist', 'normal'] }, actor: { type: 'string' }, location: { type: 'string' }, action: { type: 'string' }, countdown_min: { type: 'number', minimum: 1, maximum: 180 } }, required: ['kind', 'actor', 'action', 'countdown_min'] },
               },
               next_plan: { type: 'string' },
               event_type: { type: 'string', enum: ['normal', 'fused', 'shadow', 'nsfw'] },
@@ -489,9 +564,107 @@ export function gameTurnTool(): Record<string, unknown> {
               },
               state_changes: {
                 type: 'array',
-                items: { type: 'object', properties: { entity_type: { type: 'string', enum: ['time', 'protagonist', 'npc', 'skill', 'item', 'quest'] }, entity_id: { type: 'string', description: '实体名。人物必须写**可读称呼**（故事里怎么称呼这个人就怎么写，如「某某会长」）；禁止 char_001 / npc_xxx / char_xxx 这类内部键 —— 它们不是人名，且同一人物换写法会被当成不同实体各自计数' }, field: { type: 'string' }, value: { type: 'string' }, action: { type: 'string', enum: ['upsert', 'delete'] } } },
+                description: '只记录最终正文已揭示的变化；主角位置、身体、情绪、装备或当前行动变化时必须包含 protagonist 项，未变化字段不要重复',
+                items: { type: 'object', properties: { entity_type: { type: 'string', enum: ['time', 'protagonist', 'npc', 'skill', 'item', 'quest'] }, entity_id: { type: 'string', description: '实体名。人物必须写**可读称呼**（故事里怎么称呼这个人就怎么写，如「某某会长」）；禁止 char_001 / npc_xxx / char_xxx 这类内部键 —— 它们不是人名，且同一人物换写法会被当成不同实体各自计数' }, field: { type: 'string', description: '本轮正文已揭示的状态字段；主角位置/身体/情绪/装备/行动有变化时必须记录' }, value: { type: 'string' }, action: { type: 'string', enum: ['upsert', 'delete'] } }, required: ['entity_type', 'entity_id', 'action'] },
               },
-              new_events: { type: 'array', items: { type: 'object', properties: { description: { type: 'string' }, characters: { type: 'string' } } } },
+              new_events: { type: 'array', items: { type: 'object', properties: { description: { type: 'string' }, characters: { type: 'string' } }, required: ['description'] } },
+              character_deltas: {
+                type: 'array',
+                maxItems: CHARACTER_DELTA_MAX_ITEMS,
+                description: '人物级候选变更；只提供模型已有证据，稳定 ID、准入与落库由平台决定',
+                items: {
+                  type: 'object',
+                  additionalProperties: false,
+                  properties: {
+                    characterId: { type: 'string', minLength: 1, maxLength: 160 },
+                    mention: { type: 'string', minLength: 1, maxLength: 160 },
+                    name: { type: 'string', minLength: 1, maxLength: 80 },
+                    aliases: {
+                      type: 'array', maxItems: CHARACTER_ALIAS_MAX_ITEMS,
+                      items: { type: 'string', minLength: 1, maxLength: 80 },
+                    },
+                    newEntity: { type: 'boolean', description: '是否声明为全新人物候选；必须使用 JSON 布尔值 true/false，不写 0/1 或字符串。已有或未确定人物可省略，稳定 ID 由平台分配。' },
+                    changes: {
+                      type: 'array', maxItems: CHARACTER_CHANGE_MAX_ITEMS,
+                      items: {
+                        type: 'object',
+                        additionalProperties: false,
+                        properties: {
+                          field: { type: 'string', minLength: 1, maxLength: 64 },
+                          scope: { type: 'string', enum: ['profile', 'fact'] },
+                          value: {},
+                          factKind: { type: 'string', enum: ['fact', 'recall', 'plan', 'hypothesis', 'quoted', 'correction'] },
+                          status: { type: 'string', enum: ['confirmed', 'pending', 'unresolved', 'last-known', 'unknown'] },
+                          sceneId: { type: 'string', maxLength: 120 },
+                          effectiveAt: {
+                            type: 'object', additionalProperties: false,
+                            properties: {
+                              round: { type: 'integer', minimum: 0 },
+                              messageId: { type: 'integer', minimum: 0 },
+                              eventIndex: { type: 'integer', minimum: 0 },
+                            },
+                          },
+                          sourceRefs: {
+                            type: 'array', maxItems: CHARACTER_SOURCE_REF_MAX_ITEMS,
+                            items: {
+                              type: 'object', additionalProperties: false,
+                              properties: {
+                                source: { type: 'string', enum: ['message', 'am', 'lore', 'card', 'user'] },
+                                recordId: { type: 'string', minLength: 1, maxLength: 160 },
+                                recordVersion: { type: 'integer', minimum: 0 },
+                              },
+                              required: ['source', 'recordId'],
+                            },
+                          },
+                        },
+                        required: ['field', 'value'],
+                      },
+                    },
+                    relationships: {
+                      type: 'array', maxItems: CHARACTER_RELATIONSHIP_MAX_ITEMS,
+                      items: {
+                        type: 'object',
+                        additionalProperties: false,
+                        properties: {
+                          relationshipId: { type: 'string', minLength: 1, maxLength: 160 },
+                          fromCharacterId: { type: 'string', minLength: 1, maxLength: 160 },
+                          toCharacterId: { type: 'string', minLength: 1, maxLength: 160 },
+                          type: { type: 'string', minLength: 1, maxLength: 80 },
+                          perspective: { type: 'string', enum: ['objective', 'subjective'] },
+                          factKind: { type: 'string', enum: ['fact', 'recall', 'plan', 'hypothesis', 'quoted', 'correction'] },
+                          status: { type: 'string', enum: ['confirmed', 'pending', 'unresolved', 'last-known', 'unknown'] },
+                          sceneId: { type: 'string', maxLength: 120 },
+                          effectiveAt: {
+                            type: 'object', additionalProperties: false,
+                            properties: {
+                              round: { type: 'integer', minimum: 0 },
+                              messageId: { type: 'integer', minimum: 0 },
+                              eventIndex: { type: 'integer', minimum: 0 },
+                            },
+                          },
+                          sourceRefs: {
+                            type: 'array', maxItems: CHARACTER_SOURCE_REF_MAX_ITEMS,
+                            items: {
+                              type: 'object', additionalProperties: false,
+                              properties: {
+                                source: { type: 'string', enum: ['message', 'am', 'lore', 'card', 'user'] },
+                                recordId: { type: 'string', minLength: 1, maxLength: 160 },
+                                recordVersion: { type: 'integer', minimum: 0 },
+                              },
+                              required: ['source', 'recordId'],
+                            },
+                          },
+                        },
+                        required: ['fromCharacterId', 'toCharacterId', 'type'],
+                      },
+                    },
+                    unresolved: {
+                      type: 'array', maxItems: CHARACTER_UNRESOLVED_MAX_ITEMS,
+                      items: { type: 'string', minLength: 1, maxLength: 240 },
+                    },
+                  },
+                },
+              },
             },
             required: ['delta_summary'],
           },

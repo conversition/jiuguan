@@ -35,6 +35,17 @@ export interface EventStreamCursor {
   serverInstanceId: string;
 }
 
+export interface TaskInvalidation {
+    readonly taskId: string;
+    readonly taskRevision: number;
+}
+
+/** Decode the read hint only. Callers must re-read under their existing task authorization. */
+export function parseTaskInvalidation(value: unknown): TaskInvalidation | null {
+    if (!isEventEnvelope(value) || value.type !== 'task.updated') return null;
+    return Object.freeze({ taskId: value.resource.id!, taskRevision: Number(value.resource.revision) });
+}
+
 export type SyncRequiredReason = 'sync-required' | 'instance-mismatch' | 'gap';
 
 export type EventStreamStopReason =
@@ -65,6 +76,8 @@ export interface EventStreamClientOptions {
   connectDeadlineMs?: number;
   connectMaxAttempts?: number;
   maxBufferedChars?: number;
+  /** Opt in to metadata-only v2 task events; all other events retain v1. */
+  taskEventVersion?: 2;
 }
 
 export interface EventStreamSubscription {
@@ -161,9 +174,14 @@ export class EventStreamClient {
   readonly #connectDeadlineMs: number;
   readonly #connectMaxAttempts: number;
   readonly #maxBufferedChars: number;
+  readonly #taskEventVersion: 2 | undefined;
 
   constructor(options: EventStreamClientOptions) {
     this.#scheduler = options.scheduler;
+    if (options.taskEventVersion !== undefined && options.taskEventVersion !== 2) {
+      throw new ClientRuntimeError('transport_violation', { details: { reason: 'invalid-task-event-version' } });
+    }
+    this.#taskEventVersion = options.taskEventVersion;
     const path = options.path ?? DEFAULT_EVENT_STREAM_PATH;
     if (path.includes('?') || path.includes('#')) {
       throw new ClientRuntimeError('transport_violation', {
@@ -239,6 +257,7 @@ export class EventStreamClient {
       while (!stopRequested) {
         activeController = new AbortController();
         const headers = new Headers({ accept: 'text/event-stream' });
+        if (this.#taskEventVersion === 2) headers.set('x-jg-task-event-version', '2');
         if (cursor) {
           headers.set('last-event-id', cursor.lastEventId);
           headers.set('x-jg-last-server-instance', cursor.serverInstanceId);
@@ -456,14 +475,28 @@ export class EventStreamClient {
   ): Promise<boolean> {
     const frame = parseSseBlock(block);
     if (!frame?.data) return false;
+    if (frame.event === 'task-event.error') {
+      throw new ClientRuntimeError('transport_violation', {
+        details: { reason: 'task-event-evidence-unavailable' },
+      });
+    }
     let parsed: unknown;
     try {
       parsed = JSON.parse(frame.data);
     } catch {
       return false;
     }
-    if (!isEventEnvelope(parsed)) return false;
+    if (!isEventEnvelope(parsed)) {
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        && (parsed as { schemaVersion?: unknown }).schemaVersion === 2) {
+        throw new ClientRuntimeError('transport_violation', { details: { reason: 'invalid-task-event-v2' } });
+      }
+      return false;
+    }
     const envelope = parsed;
+    if (envelope.schemaVersion === 2 && this.#taskEventVersion !== 2) {
+      throw new ClientRuntimeError('transport_violation', { details: { reason: 'unnegotiated-task-event-version' } });
+    }
     if (!EVENT_ID_RE.test(envelope.eventId)
       || (envelope.eventId === '0' && envelope.type !== 'sync.required')
       || !isSafeOpaqueId(envelope.serverInstanceId)

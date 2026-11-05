@@ -10,7 +10,8 @@
     "./mvu": "./dist/mvu-sandbox.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json"
+    "build": "tsc -p tsconfig.json",
+    "test": "node --experimental-strip-types --experimental-transform-types tests/verify.ts"
   },
   "dependencies": {}
 }

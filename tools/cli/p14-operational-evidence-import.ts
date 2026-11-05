@@ -23,6 +23,7 @@ if (args.includes('--help')) {
     `       --ack ${P14_OPERATIONAL_EVIDENCE_IMPORT_ACK} [--data-dir <dir>]`,
     '',
     'Recomputes and immutably preserves one operational lane evidence set.',
+    'Maintenance additionally requires binding.json to match the exact session, suite, and accounting digests.',
     'It records only the evaluation binding and never activates a lane or enables writes.',
   ].join('\n'));
   process.exit(0);

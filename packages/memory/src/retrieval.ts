@@ -20,6 +20,11 @@ import {
   DAY_MS,
 } from './schema.ts';
 
+// Public specialised retrieval surface. Keeping this re-export on the existing
+// retrieval entrypoint avoids forcing consumers through package-private files.
+export { retrieveNsfwPgCandidates } from './nsfw-pg-candidates.ts';
+export type { NsfwPgCandidateResult, NsfwPgCandidateRef } from './nsfw-pg-candidates.ts';
+
 /** 记忆衰减/访问提升 运行时默认值（env 可覆盖；RecallQuery 三字段可再覆盖） */
 const DECAY_ENABLED = !['0', 'false', 'off'].includes((process.env.JG_MEMORY_DECAY ?? '').toLowerCase());
 const ENV_DECAY_LAMBDA = Number(process.env.JG_MEMORY_DECAY_LAMBDA ?? DECAY_LAMBDA_DEFAULT);

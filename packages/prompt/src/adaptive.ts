@@ -25,7 +25,7 @@ export interface RrfWeights {
 export interface AliasAddition {
   /** 用户常用称谓（如「会长」） */
   alias: string;
-  /** 实体规范名（如「角色乙」） */
+  /** 实体规范名（如「示例角色A」） */
   entityName: string;
   /** 简短说明/来源（如「环比重试率 3/5 高」） */
   note?: string;

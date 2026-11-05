@@ -5,7 +5,10 @@ export const MODEL_RUNTIME_PROFILE_VERSION = 'model-runtime-profile-v1' as const
 export const DEFAULT_CONSERVATIVE_CONTEXT_TOKENS = 32_768;
 const MIN_OUTPUT_RESERVE_TOKENS = 4_096;
 const MAX_PROFILE_JSON_CHARS = 65_536;
-const ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,239}$/u;
+// 模型/提供方 ID 白名单：Unicode 字母或数字开头，随后允许字母、数字与受限标点。
+// 必须接受非 ASCII 模型名（如中转站的 `build-抗截断-gemini-4-argon`），
+// 同时保持 fail-closed：拒绝空白、控制字符与其它符号。
+const ID_RE = /^[\p{L}\p{N}][\p{L}\p{N}._:/@-]{0,239}$/u;
 
 export interface ModelRuntimeProfile {
   readonly version: typeof MODEL_RUNTIME_PROFILE_VERSION;

@@ -16,6 +16,7 @@ async function main(): Promise<void> {
     console.log(JSON.stringify({
       ready: true,
       role: 'derived-semantic-index',
+      vectorDimensions: pg.vectorDimensions,
       chunks,
       aliases,
       authoritativeStore: 'sqlite',

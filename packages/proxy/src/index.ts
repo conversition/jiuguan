@@ -18,6 +18,15 @@ export type {
 export { loadProviderConfig, assertProviderReady } from './config.ts';
 export type { ProviderConfig as ProviderConfigType } from './config.ts';
 export {
+  CREDENTIAL_LOCKDOWN_ENV,
+  DSH_CREDENTIAL_NAMES,
+  NON_LOOPBACK_FETCH_ERROR,
+  credentialLockdownActive,
+  installLoopbackNetworkGuard,
+  isLoopbackTarget,
+} from './credential-lockdown.ts';
+export type { LoopbackGuardOptions } from './credential-lockdown.ts';
+export {
   PROVIDER_PROTOCOL_VERSION,
 } from './provider-types.ts';
 export type {

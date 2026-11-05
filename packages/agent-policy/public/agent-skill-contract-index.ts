@@ -1,0 +1,61 @@
+/**
+ * Narrow source-level facade for the read-only Agent contract index.
+ *
+ * Runtime package consumers use `@jiuguan/agent-policy/skills`; source-mode server tests and
+ * composition code use this file so they do not add a private `packages/agent-policy/src/**` edge.
+ */
+export {
+  AGENT_CONTRACT_ADAPTER_REGISTRATIONS,
+  AGENT_CONTRACT_BOUNDARY_DESCRIPTOR_VERSION,
+  AGENT_CONTRACT_BOUNDARY_INDEX_VERSION,
+  AGENT_CONTRACT_BOUNDARY_SLOT_ACCESSES,
+  AGENT_CONTRACT_BOUNDARY_SLOT_APPLICABILITIES,
+  AGENT_CONTRACT_COMPONENT_COVERAGES,
+  AGENT_CONTRACT_COMPONENT_STATES,
+  AGENT_CONTRACT_DESCRIPTOR_VERSION,
+  AGENT_CONTRACT_DIRECT_CAPABILITIES,
+  AGENT_CONTRACT_IDENTITY_KINDS,
+  AGENT_CONTRACT_INDEX_VERSION,
+  AGENT_CONTRACT_ISOLATION_LEVELS,
+  AGENT_CONTRACT_LIFETIME_KINDS,
+  AGENT_CONTRACT_PARENT_TURN_CONTINUATIONS,
+  AGENT_CONTRACT_TASK_REGISTRATIONS,
+  AGENT_SKILL_CONSUMER_PROFILES,
+  AGENT_SKILL_CONSUMER_PROFILE_BY_ID,
+  AGENT_SKILL_CONSUMER_PROFILE_VERSION,
+  createAgentContractBoundaryIndex,
+  createAgentContractIndex,
+  normalizeAgentContractBoundaryDescriptor,
+  normalizeAgentContractBoundaryIndex,
+  normalizeAgentContractBoundarySlot,
+  normalizeAgentContractComponentRef,
+  normalizeAgentContractDescriptor,
+  type AgentContractAdapterRegistration,
+  type AgentContractBoundaryDescriptorV1,
+  type AgentContractBoundaryEnvironmentV1,
+  type AgentContractBoundaryIndexV1,
+  type AgentContractBoundaryLifetimeV1,
+  type AgentContractBoundarySlotAccess,
+  type AgentContractBoundarySlotApplicability,
+  type AgentContractBoundarySlotV1,
+  type AgentContractBoundaryWorkspaceV1,
+  type AgentContractComponentCoverage,
+  type AgentContractComponentRefV1,
+  type AgentContractComponentState,
+  type AgentContractDescriptorV1,
+  type AgentContractDirectCapability,
+  type AgentContractIdentityKind,
+  type AgentContractIndexV1,
+  type AgentContractIsolationLevel,
+  type AgentContractLifetimeKind,
+  type AgentContractParentTurnContinuation,
+  type AgentContractPendingComponentRefV1,
+  type AgentContractTaskRegistration,
+  type AgentSkillConsumerProfileV1,
+} from '../src/skills/index.ts';
+
+export {
+  ADMISSION_TICKET_VERSION,
+  AGENT_TASK_KINDS,
+  type AgentTaskKind,
+} from '../src/admission.ts';

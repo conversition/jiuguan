@@ -1,5 +1,5 @@
 /**
- * 前端日志模块（v0.1.0）
+ * 前端日志模块（v0.6.1）
  * 能力：
  *  - 分级日志（debug/info/warn/error）+ 分类标签（turn/sse/session/render/sys）+ 时间戳
  *  - 全局捕获 window.onerror / unhandledrejection → error 级日志（带 stack）

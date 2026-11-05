@@ -8,7 +8,8 @@ import { resolveSafePromptInputBudget } from '../../packages/prompt/src/assembly
 import type { ModelRuntimeProfile } from '../../packages/prompt/src/model-runtime-profile.ts';
 
 type CalibratedTaskKind = Extract<AgentTaskKind,
-  'interactive_prelude' | 'critic_revision' | 'preference_extract' | 'style_compile' | 'aql_replan'>;
+  'interactive_prelude' | 'critic_revision' | 'preference_extract' | 'style_compile' | 'skill_compile'
+  | 'skill_evaluate' | 'skill_sample' | 'skill_quality' | 'aql_replan'>;
 
 function optionalPositiveRate(value: string | undefined, name: string): number | undefined {
   if (value === undefined || value.trim() === '') return undefined;
@@ -76,7 +77,9 @@ const TASK_SPEC: Readonly<Record<CalibratedTaskKind, Readonly<{
 }>>> = Object.freeze({
   interactive_prelude: Object.freeze({
     lane: 'interactive', inputTokens: 28_000, outputTokens: 4_000,
-    maxModelCalls: 3, maxSteps: 6, maxWallMs: 120_000, floorCostMicrousd: 1_500_000,
+    // The shared turn budget reserves two calls for final generation/repair,
+    // leaving two calls for evidence acquisition and an optional Director plan.
+    maxModelCalls: 4, maxSteps: 6, maxWallMs: 120_000, floorCostMicrousd: 1_500_000,
   }),
   critic_revision: Object.freeze({
     lane: 'critic', inputTokens: 24_000, outputTokens: 6_000,
@@ -90,11 +93,32 @@ const TASK_SPEC: Readonly<Record<CalibratedTaskKind, Readonly<{
     lane: 'style', inputTokens: 24_000, outputTokens: 6_000,
     maxModelCalls: 1, maxSteps: 1, maxWallMs: 60_000, floorCostMicrousd: 800_000,
   }),
+  skill_compile: Object.freeze({
+    lane: 'style', inputTokens: 4_000, outputTokens: 2_000,
+    maxModelCalls: 1, maxSteps: 1, maxWallMs: 30_000, floorCostMicrousd: 300_000,
+  }),
+  skill_evaluate: Object.freeze({
+    lane: 'style', inputTokens: 8_000, outputTokens: 1_200,
+    maxModelCalls: 1, maxSteps: 1, maxWallMs: 30_000, floorCostMicrousd: 300_000,
+  }),
+  skill_sample: Object.freeze({
+    lane: 'style', inputTokens: 6_000, outputTokens: 4_800,
+    maxModelCalls: 2, maxSteps: 2, maxWallMs: 45_000, floorCostMicrousd: 600_000,
+  }),
+  skill_quality: Object.freeze({
+    lane: 'style', inputTokens: 8_000, outputTokens: 1_600,
+    maxModelCalls: 1, maxSteps: 1, maxWallMs: 30_000, floorCostMicrousd: 400_000,
+  }),
   aql_replan: Object.freeze({
     lane: 'interactive', inputTokens: 4_000, outputTokens: 300,
     maxModelCalls: 1, maxSteps: 1, maxWallMs: 30_000, floorCostMicrousd: 300_000,
   }),
 });
+
+/** Request-only work can reuse task ceilings without inheriting final prose reserves. */
+export function agentTaskRequestCeilings(taskKind: CalibratedTaskKind) {
+  return TASK_SPEC[taskKind];
+}
 
 /** Explicit per-task ceilings; optional Agent work can no longer inherit another task's budget. */
 export function agentTaskBudgetProfile(

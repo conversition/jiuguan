@@ -1,12 +1,23 @@
 import { createHash } from 'node:crypto';
 
-export const MAINTENANCE_ADMISSION_POLICY_VERSION = 'p14-maintenance-admission-v2' as const;
+export const MAINTENANCE_ADMISSION_POLICY_VERSION = 'p14-maintenance-admission-v3' as const;
 export const MAINTENANCE_ADMISSION_POLICY_VERSIONS = Object.freeze([
-  'p14-maintenance-admission-v1', MAINTENANCE_ADMISSION_POLICY_VERSION,
+  'p14-maintenance-admission-v1', 'p14-maintenance-admission-v2', MAINTENANCE_ADMISSION_POLICY_VERSION,
 ] as const);
 export type MaintenanceAdmissionPolicyVersion = (typeof MAINTENANCE_ADMISSION_POLICY_VERSIONS)[number];
-export const MAINTENANCE_ADMISSION_TASKS = Object.freeze([
+/**
+ * The exact persisted batch shape before worldbook_repair joined the scheduler.
+ * This is intentionally kept separate from MAINTENANCE_ADMISSION_TASKS: callers
+ * may use it to verify historical audit rows, but must never use it to create a
+ * new, incomplete admission batch.
+ */
+export const LEGACY_MAINTENANCE_ADMISSION_TASKS = Object.freeze([
   'memory_consolidation', 'branch_index', 'rolling_summary', 'npc_state',
+] as const);
+export const MAINTENANCE_ADMISSION_TASKS = Object.freeze([
+  // 顺序即轮转优先级；worldbook_repair 放在最后 —— 世界书修正不是每回合都需要，
+  // 只在其它维护任务都不 eligible 时才轮到它。
+  'memory_consolidation', 'branch_index', 'rolling_summary', 'npc_state', 'worldbook_repair',
 ] as const);
 export type MaintenanceAdmissionTask = (typeof MAINTENANCE_ADMISSION_TASKS)[number];
 export type MaintenancePriorState = 'none' | 'queued' | 'running' | 'succeeded' | 'terminal';
@@ -133,7 +144,10 @@ function preliminary(
         : facts.sampleCount > 0
       : facts.taskKind === 'rolling_summary'
         ? facts.sampleCount >= 4
-        : facts.entitySignalCount > 0;
+        // 世界书冲突通常由剧情推进暴露：有新的已提交事件才值得复核设定是否互相矛盾。
+        : facts.taskKind === 'worldbook_repair'
+          ? facts.newEventCount > 0
+          : facts.entitySignalCount > 0;
   if (facts.newEventCount > 0) reasons.push('new-events-present');
   const sampleThreshold = facts.taskKind === 'rolling_summary'
     ? 4 : policyVersion === 'p14-maintenance-admission-v1' ? 2 : 1;
@@ -167,6 +181,52 @@ export function evaluateMaintenanceAdmissionBatch(
   }
   const rotation = (round - 1) % MAINTENANCE_ADMISSION_TASKS.length;
   const priority = [...MAINTENANCE_ADMISSION_TASKS.slice(rotation), ...MAINTENANCE_ADMISSION_TASKS.slice(0, rotation)];
+  const evaluated = new Map(normalized.map((facts) => [facts.taskKind, preliminary(facts, policyVersion)]));
+  const admittedTask = priority.find((task) => evaluated.get(task)!.eligible);
+  return Object.freeze(normalized.map((facts) => {
+    const result = evaluated.get(facts.taskKind)!;
+    const admitted = result.eligible && facts.taskKind === admittedTask;
+    const reasonCodes = [...result.reasons];
+    if (result.eligible && !admitted) reasonCodes.push('lower-priority-this-turn');
+    return Object.freeze({
+      policyVersion,
+      taskKind: facts.taskKind,
+      verdict: admitted ? 'would-admit' as const : 'would-deny' as const,
+      reasonCodes: Object.freeze(reasonCodes),
+      factsDigest: maintenanceAdmissionFactsDigest(facts),
+    });
+  }));
+}
+
+/**
+ * Read-only verifier for four-task batches that were durably written before
+ * worldbook_repair existed. It replays the original four-way rotation instead
+ * of inventing a fifth decision, so historical evidence remains attributable.
+ */
+export function evaluateLegacyMaintenanceAdmissionBatch(
+  round: number,
+  inputs: readonly MaintenanceAdmissionFacts[],
+  policyVersion: MaintenanceAdmissionPolicyVersion,
+): readonly MaintenanceAdmissionDecision[] {
+  if (!Number.isSafeInteger(round) || round < 1) throw new TypeError('round must be a positive safe integer');
+  if (!MAINTENANCE_ADMISSION_POLICY_VERSIONS.includes(policyVersion)
+    || policyVersion === MAINTENANCE_ADMISSION_POLICY_VERSION) {
+    throw new TypeError('legacy maintenance policyVersion must be v1 or v2');
+  }
+  if (!Array.isArray(inputs) || inputs.length !== LEGACY_MAINTENANCE_ADMISSION_TASKS.length) {
+    throw new TypeError('legacy maintenance batch must contain the four historical tasks exactly once');
+  }
+  const normalized = inputs.map(normalizeMaintenanceAdmissionFacts);
+  const taskSet = new Set(normalized.map((facts) => facts.taskKind));
+  if (taskSet.size !== LEGACY_MAINTENANCE_ADMISSION_TASKS.length
+    || LEGACY_MAINTENANCE_ADMISSION_TASKS.some((task) => !taskSet.has(task))) {
+    throw new TypeError('legacy maintenance batch must contain the four historical tasks exactly once');
+  }
+  const rotation = (round - 1) % LEGACY_MAINTENANCE_ADMISSION_TASKS.length;
+  const priority = [
+    ...LEGACY_MAINTENANCE_ADMISSION_TASKS.slice(rotation),
+    ...LEGACY_MAINTENANCE_ADMISSION_TASKS.slice(0, rotation),
+  ];
   const evaluated = new Map(normalized.map((facts) => [facts.taskKind, preliminary(facts, policyVersion)]));
   const admittedTask = priority.find((task) => evaluated.get(task)!.eligible);
   return Object.freeze(normalized.map((facts) => {

@@ -7,13 +7,24 @@ import {
   type AgentBudgetProfileV2,
 } from '../../packages/agent-policy/src/budget-profile.ts';
 import { interactiveBudgetProfileForAutonomy } from './interactive-runtime-config.ts';
+import { contextCompilerCanaryMatches, contextCompilerCanaryScope, type ContextCompilerCanaryScope } from './context-compiler-canary.ts';
 import type { ModelRuntimeProfile } from '../../packages/prompt/src/model-runtime-profile.ts';
+import {
+  parseRuntimeSessionScope,
+  runtimeSessionScopeAllows,
+  type RuntimeSessionScope,
+} from './managed-local-session-scope.ts';
+
+/** A shadow ticket is never eligible for the active Skill claim purpose. */
+export const CONTEXT_COMPILER_SHADOW_POLICY_VERSION = `${CONTEXT_COMPILER_POLICY_VERSION}-shadow` as const;
 
 export interface ContextCompilerRuntimeConfig {
-  readonly mode: 'off' | 'test-session';
+  readonly mode: 'off' | 'test-session' | 'shadow' | 'canary';
   readonly enabled: boolean;
   readonly sessionAllowlist: ReadonlySet<string>;
+  readonly sessionScope: RuntimeSessionScope;
   readonly budgetProfile?: AgentBudgetProfileV2;
+  readonly canaryScope?: ContextCompilerCanaryScope;
 }
 
 /**
@@ -105,28 +116,38 @@ export function parseContextCompilerRuntimeConfig(
     throw new Error('JG_CONTEXT_COMPILER_KILL_SWITCH 只允许 0 或 1');
   }
   if (killSwitch === '1') return Object.freeze({
-    mode: 'off', enabled: false, sessionAllowlist: new Set<string>(),
+    mode: 'off', enabled: false, sessionAllowlist: new Set<string>(), sessionScope: 'exact',
   });
   const mode = (env.JG_CONTEXT_COMPILER ?? 'off').trim().toLowerCase();
   if (mode === 'off') return Object.freeze({
-    mode: 'off', enabled: false, sessionAllowlist: new Set<string>(),
+    mode: 'off', enabled: false, sessionAllowlist: new Set<string>(), sessionScope: 'exact',
   });
-  if (mode !== 'test-session') {
-    throw new Error('JG_CONTEXT_COMPILER 只允许 off 或 test-session');
+  if (mode !== 'test-session' && mode !== 'shadow' && mode !== 'canary') {
+    throw new Error('JG_CONTEXT_COMPILER 只允许 off、test-session、shadow 或 canary');
   }
   if (env.JG_CONTEXT_COMPILER_ACK !== CONTEXT_COMPILER_POLICY_VERSION) {
     throw new Error(
-      `JG_CONTEXT_COMPILER=test-session 需要 JG_CONTEXT_COMPILER_ACK=${CONTEXT_COMPILER_POLICY_VERSION}`,
+      `JG_CONTEXT_COMPILER=${mode} 需要 JG_CONTEXT_COMPILER_ACK=${CONTEXT_COMPILER_POLICY_VERSION}`,
     );
   }
   const sessionAllowlist = exactSessionAllowlist(env.JG_CONTEXT_COMPILER_SESSION_IDS);
-  if (sessionAllowlist.size === 0) {
-    throw new Error('test-session 需要非空 JG_CONTEXT_COMPILER_SESSION_IDS');
+  const sessionScope = parseRuntimeSessionScope(env);
+  if (mode === 'canary' && (sessionScope !== 'exact' || sessionAllowlist.size !== 1)) {
+    throw new Error('context-canary-exact-session-required');
+  }
+  if (sessionAllowlist.size === 0 && sessionScope === 'exact') {
+    throw new Error('test-session 需要非空 JG_CONTEXT_COMPILER_SESSION_IDS 或显式 managed-local scope');
   }
   return Object.freeze({
-    mode: 'test-session',
+    mode,
     enabled: true,
     sessionAllowlist,
+    sessionScope,
+    ...(mode === 'canary' ? { canaryScope: contextCompilerCanaryScope({
+      sessionId: [...sessionAllowlist][0]!, providerId: env.JG_CONTEXT_COMPILER_CANARY_PROVIDER ?? '',
+      model: env.JG_CONTEXT_COMPILER_CANARY_MODEL ?? '', profileDigest: env.JG_CONTEXT_COMPILER_CANARY_PROFILE ?? '',
+      minSamples: Number(env.JG_CONTEXT_COMPILER_CANARY_MIN_SAMPLES),
+    }) } : {}),
     budgetProfile: contextCompilerBudgetProfile(env, runtimeProfile),
   });
 }
@@ -134,6 +155,16 @@ export function parseContextCompilerRuntimeConfig(
 export function contextCompilerAllowsSession(
   config: ContextCompilerRuntimeConfig,
   sessionId: string,
+  binding?: Omit<ContextCompilerCanaryScope, 'minSamples' | 'sessionId'>,
 ): boolean {
-  return config.enabled && config.sessionAllowlist.has(sessionId);
+  if (!config.enabled || !runtimeSessionScopeAllows(config.sessionScope, config.sessionAllowlist, sessionId)) return false;
+  if (config.mode === 'test-session') return true;
+  return config.mode === 'canary' && Boolean(config.canaryScope && binding
+    && contextCompilerCanaryMatches(config.canaryScope, { sessionId, ...binding }));
+}
+
+/** Shadow never grants the active compiler path. */
+export function contextCompilerAllowsShadowSession(config: ContextCompilerRuntimeConfig, sessionId: string): boolean {
+  return config.mode === 'shadow' && config.enabled
+    && runtimeSessionScopeAllows(config.sessionScope, config.sessionAllowlist, sessionId);
 }

@@ -12,6 +12,16 @@ import {
   type AgentTaskKind,
 } from '../../packages/agent-policy/src/admission.ts';
 
+/** Server-local public name for the opaque lease type minted by this broker. */
+export type AgentAdmissionLease = AdmissionLease;
+
+/** Closed server purposes; never derive these values from transport or model output. */
+export const AGENT_ADMISSION_LEASE_CLAIM_PURPOSES = Object.freeze([
+  'server-agent-skill-profile-admission-v1',
+] as const);
+export type AgentAdmissionLeaseClaimPurpose =
+  typeof AGENT_ADMISSION_LEASE_CLAIM_PURPOSES[number];
+
 export type AdmissionTicketErrorCode =
   | 'ticket-id-invalid'
   | 'ticket-id-collision'
@@ -53,6 +63,8 @@ export interface BeginAdmissionRequest {
 
 interface StoredTicket {
   readonly ticket: AdmissionTicket;
+  /** Server-only capabilities granted by current control policy; never sourced from the request. */
+  readonly allowedLeaseClaimPurposes: readonly AgentAdmissionLeaseClaimPurpose[];
   consumed: boolean;
 }
 
@@ -65,8 +77,11 @@ export interface AdmissionTicketBrokerOptions {
     /** May only narrow the signed request after durable reservation. */
     readonly maxModelCalls?: number;
     readonly quotaReservationDigest?: string;
+    readonly quotaWindowSequence?: number;
     /** Only a reservation created by this issue attempt may be released if issue fails. */
     readonly reservationCreated?: boolean;
+    /** Closed server-only downstream capabilities. Omission grants none. */
+    readonly allowedLeaseClaimPurposes?: readonly AgentAdmissionLeaseClaimPurpose[];
   }>;
   /** Re-reads runtime/capability authority after bindings validate and immediately before start. */
   readonly authorizeBegin?: (ticket: AdmissionTicket) => boolean;
@@ -88,12 +103,14 @@ function freezeTicket(
   requestDigest: string,
   issuedAtMs: number,
   quotaReservationDigest?: string,
+  quotaWindowSequence?: number,
 ): AdmissionTicket {
   return Object.freeze({
     version: ADMISSION_TICKET_VERSION,
     ticketId,
     requestDigest,
     ...(quotaReservationDigest ? { quotaReservationDigest } : {}),
+    ...(quotaWindowSequence !== undefined ? { quotaWindowSequence } : {}),
     ...request,
     issuedAtMs,
     expiresAtMs: request.deadlineMs,
@@ -134,6 +151,25 @@ function requestedLimits(value: Partial<AdmissionLimits> | undefined, signed: Ad
   return Object.freeze(merged);
 }
 
+function allowedLeaseClaimPurposes(
+  value: readonly AgentAdmissionLeaseClaimPurpose[] | undefined,
+): readonly AgentAdmissionLeaseClaimPurpose[] {
+  if (value === undefined) return Object.freeze([]);
+  if (!Array.isArray(value) || value.length > AGENT_ADMISSION_LEASE_CLAIM_PURPOSES.length) {
+    throw new AdmissionTicketError('ticket-binding-mismatch');
+  }
+  const normalized = value.map((purpose) => {
+    if (!AGENT_ADMISSION_LEASE_CLAIM_PURPOSES.includes(purpose)) {
+      throw new AdmissionTicketError('ticket-binding-mismatch');
+    }
+    return purpose;
+  }).sort();
+  if (new Set(normalized).size !== normalized.length) {
+    throw new AdmissionTicketError('ticket-binding-mismatch');
+  }
+  return Object.freeze(normalized);
+}
+
 /**
  * Process-local, non-persistent, one-shot authority broker. It deliberately has no Provider,
  * HTTP, plugin, or storage dependency. A successful lookup burns the ticket before any binding
@@ -148,6 +184,11 @@ export class AdmissionTicketBroker {
   readonly #releaseReservation: AdmissionTicketBrokerOptions['releaseReservation'];
   readonly #tickets = new Map<string, StoredTicket>();
   readonly #idempotency = new Map<string, { requestDigest: string; ticketId: string }>();
+  readonly #ownedLeases = new WeakSet<object>();
+  readonly #leaseClaims = new WeakMap<object, Readonly<{
+    allowed: ReadonlySet<AgentAdmissionLeaseClaimPurpose>;
+    claimed: Set<AgentAdmissionLeaseClaimPurpose>;
+  }>>();
 
   constructor(options: AdmissionTicketBrokerOptions = {}) {
     this.#nowMs = options.nowMs ?? Date.now;
@@ -181,12 +222,23 @@ export class AdmissionTicketBroker {
       throw new AdmissionTicketError('ticket-lane-disabled');
     }
     let quotaReservationDigest: string | undefined;
+    let quotaWindowSequence: number | undefined;
     let reservationCreated = false;
+    let allowedClaimPurposes: readonly AgentAdmissionLeaseClaimPurpose[] = Object.freeze([]);
     if (typeof authorization === 'object') {
       quotaReservationDigest = authorization.quotaReservationDigest;
+      quotaWindowSequence = authorization.quotaWindowSequence;
       reservationCreated = authorization.reservationCreated === true;
+      allowedClaimPurposes = allowedLeaseClaimPurposes(
+        authorization.allowedLeaseClaimPurposes,
+      );
       if (quotaReservationDigest !== undefined
         && !/^sha256:[a-f0-9]{64}$/u.test(quotaReservationDigest)) {
+        throw new AdmissionTicketError('ticket-budget-escalation');
+      }
+      if ((quotaReservationDigest === undefined) !== (quotaWindowSequence === undefined)
+        || (quotaWindowSequence !== undefined
+          && (!Number.isSafeInteger(quotaWindowSequence) || quotaWindowSequence < 1))) {
         throw new AdmissionTicketError('ticket-budget-escalation');
       }
       if (authorization.maxModelCalls !== undefined) {
@@ -206,7 +258,14 @@ export class AdmissionTicketBroker {
       const prior = this.#idempotency.get(request.idempotencyKey);
       if (prior) {
         if (prior.requestDigest !== requestDigest) throw new AdmissionTicketError('ticket-idempotency-conflict');
-        return this.#tickets.get(prior.ticketId)!.ticket;
+        const stored = this.#tickets.get(prior.ticketId)!;
+        if (stored.allowedLeaseClaimPurposes.length !== allowedClaimPurposes.length
+          || stored.allowedLeaseClaimPurposes.some((purpose, index) => (
+            purpose !== allowedClaimPurposes[index]
+          ))) {
+          throw new AdmissionTicketError('ticket-idempotency-conflict');
+        }
+        return stored.ticket;
       }
       let ticketId = '';
       for (let attempt = 0; attempt < 8; attempt++) {
@@ -215,8 +274,14 @@ export class AdmissionTicketBroker {
         if (!this.#tickets.has(candidate)) { ticketId = candidate; break; }
       }
       if (!ticketId) throw new AdmissionTicketError('ticket-id-collision');
-      const ticket = freezeTicket(ticketId, request, requestDigest, now, quotaReservationDigest);
-      this.#tickets.set(ticketId, { ticket, consumed: false });
+      const ticket = freezeTicket(
+        ticketId, request, requestDigest, now, quotaReservationDigest, quotaWindowSequence,
+      );
+      this.#tickets.set(ticketId, {
+        ticket,
+        allowedLeaseClaimPurposes: allowedClaimPurposes,
+        consumed: false,
+      });
       this.#idempotency.set(request.idempotencyKey, { requestDigest, ticketId });
       return ticket;
     } catch (error) {
@@ -269,36 +334,93 @@ export class AdmissionTicketBroker {
       if (ticket.quotaReservationDigest) {
         this.#markReservationStarted?.(ticket.quotaReservationDigest);
       }
-      return Object.freeze({
-      version: ADMISSION_TICKET_VERSION,
-      ticketId: ticket.ticketId,
-      requestDigest: ticket.requestDigest,
-      ...(ticket.quotaReservationDigest
-        ? { quotaReservationDigest: ticket.quotaReservationDigest }
-        : {}),
-      runId: ticket.runId,
-      parentRunId: ticket.parentRunId,
-      sessionId: ticket.sessionId,
-      sourceRevision: ticket.sourceRevision,
-      lane: ticket.lane,
-      taskKind: ticket.taskKind,
-      policyVersion: ticket.policyVersion,
-      modelId: ticket.modelId,
-      budgetProfileDigest: ticket.budgetProfileDigest,
-      toolSetDigest: ticket.toolSetDigest,
-      mode: ticket.mode,
-      reasonCodes: ticket.reasonCodes,
-      evidenceDigests: ticket.evidenceDigests,
-      limits,
-      allowedTools,
-      fullSkillSnapshots: ticket.fullSkillSnapshots,
-      consumedAtMs: now,
-      expiresAtMs: ticket.expiresAtMs,
+      const lease: AdmissionLease = Object.freeze({
+        version: ADMISSION_TICKET_VERSION,
+        ticketId: ticket.ticketId,
+        requestDigest: ticket.requestDigest,
+        ...(ticket.quotaReservationDigest
+          ? { quotaReservationDigest: ticket.quotaReservationDigest }
+          : {}),
+        ...(ticket.quotaWindowSequence !== undefined
+          ? { quotaWindowSequence: ticket.quotaWindowSequence }
+          : {}),
+        runId: ticket.runId,
+        parentRunId: ticket.parentRunId,
+        sessionId: ticket.sessionId,
+        sourceRevision: ticket.sourceRevision,
+        lane: ticket.lane,
+        taskKind: ticket.taskKind,
+        policyVersion: ticket.policyVersion,
+        modelId: ticket.modelId,
+        budgetProfileDigest: ticket.budgetProfileDigest,
+        toolSetDigest: ticket.toolSetDigest,
+        mode: ticket.mode,
+        reasonCodes: ticket.reasonCodes,
+        evidenceDigests: ticket.evidenceDigests,
+        limits,
+        allowedTools,
+        fullSkillSnapshots: ticket.fullSkillSnapshots,
+        consumedAtMs: now,
+        expiresAtMs: ticket.expiresAtMs,
       });
+      this.#ownedLeases.add(lease);
+      this.#leaseClaims.set(lease, Object.freeze({
+        allowed: new Set(stored.allowedLeaseClaimPurposes),
+        claimed: new Set<AgentAdmissionLeaseClaimPurpose>(),
+      }));
+      return lease;
     } catch (error) {
       this.#release(ticket);
       throw error;
     }
+  }
+
+  /**
+   * Process-local identity proof for leases minted by this broker. Structural copies, parsed JSON,
+   * and leases minted by another broker never acquire authority through shape equivalence.
+   */
+  ownsLease(candidate: unknown): candidate is AdmissionLease {
+    return typeof candidate === 'object'
+      && candidate !== null
+      && this.#ownedLeases.has(candidate);
+  }
+
+  /** Recheck base authority after optional asynchronous preparation; never issues/reserves again. */
+  mayDispatchLease(candidate: unknown): candidate is AdmissionLease {
+    if (!this.ownsLease(candidate) || this.#nowMs() >= candidate.expiresAtMs) return false;
+    const stored = this.#tickets.get(candidate.ticketId);
+    if (!stored?.consumed) return false;
+    try { return this.#authorizeBegin?.(stored.ticket) !== false; }
+    catch { return false; }
+  }
+
+  /** Whether current server policy explicitly granted this downstream purpose to the exact Lease. */
+  allowsLeaseClaim(
+    candidate: unknown,
+    purpose: AgentAdmissionLeaseClaimPurpose,
+  ): candidate is AdmissionLease {
+    if (!this.ownsLease(candidate) || !AGENT_ADMISSION_LEASE_CLAIM_PURPOSES.includes(purpose)) {
+      return false;
+    }
+    return this.#leaseClaims.get(candidate)?.allowed.has(purpose) === true;
+  }
+
+  /**
+   * Atomically claims one server-defined purpose on an owned Lease. Claims are purpose-scoped
+   * because one invocation may cross several internal boundaries, but one purpose cannot replay.
+   */
+  claimLease(
+    candidate: unknown,
+    purpose: AgentAdmissionLeaseClaimPurpose,
+  ): candidate is AdmissionLease {
+    if (!this.allowsLeaseClaim(candidate, purpose)) {
+      return false;
+    }
+    const state = this.#leaseClaims.get(candidate);
+    if (!state || state.claimed.has(purpose)) return false;
+    // Synchronous and before any consumer await: concurrent attempts cannot both succeed.
+    state.claimed.add(purpose);
+    return true;
   }
 
   get size(): number { return this.#tickets.size; }

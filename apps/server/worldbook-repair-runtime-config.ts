@@ -1,9 +1,16 @@
+import {
+  parseRuntimeSessionScope,
+  runtimeSessionScopeAllows,
+  type RuntimeSessionScope,
+} from './managed-local-session-scope.ts';
+
 export const WORLDBOOK_REPAIR_RUNTIME_ACK = 'p14-worldbook-repair-test-session-v1' as const;
 
 export interface WorldbookRepairRuntimeConfig {
   readonly mode: 'off' | 'test-session';
   readonly enabled: boolean;
   readonly sessionAllowlist: ReadonlySet<string>;
+  readonly sessionScope: RuntimeSessionScope;
 }
 
 const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:@-]{0,239}$/u;
@@ -31,11 +38,11 @@ export function parseWorldbookRepairRuntimeConfig(
     throw new Error('JG_WORLDBOOK_REPAIR_KILL_SWITCH 只允许 0 或 1');
   }
   if (killSwitch === '1') return Object.freeze({
-    mode: 'off', enabled: false, sessionAllowlist: new Set<string>(),
+    mode: 'off', enabled: false, sessionAllowlist: new Set<string>(), sessionScope: 'exact',
   });
   const mode = (env.JG_WORLDBOOK_REPAIR ?? 'off').trim().toLowerCase();
   if (mode === 'off') return Object.freeze({
-    mode: 'off', enabled: false, sessionAllowlist: new Set<string>(),
+    mode: 'off', enabled: false, sessionAllowlist: new Set<string>(), sessionScope: 'exact',
   });
   if (mode !== 'test-session') {
     throw new Error('JG_WORLDBOOK_REPAIR 只允许 off 或 test-session');
@@ -46,10 +53,11 @@ export function parseWorldbookRepairRuntimeConfig(
     );
   }
   const sessionAllowlist = exactSessionAllowlist(env.JG_WORLDBOOK_REPAIR_SESSION_IDS);
-  if (sessionAllowlist.size === 0) {
-    throw new Error('test-session 需要非空 JG_WORLDBOOK_REPAIR_SESSION_IDS');
+  const sessionScope = parseRuntimeSessionScope(env);
+  if (sessionAllowlist.size === 0 && sessionScope === 'exact') {
+    throw new Error('test-session 需要非空 JG_WORLDBOOK_REPAIR_SESSION_IDS 或显式 managed-local scope');
   }
-  return Object.freeze({ mode: 'test-session', enabled: true, sessionAllowlist });
+  return Object.freeze({ mode: 'test-session', enabled: true, sessionAllowlist, sessionScope });
 }
 
 /** Used only by create/approve/apply; reject/revert remain recovery-capable. */
@@ -57,5 +65,6 @@ export function worldbookRepairForwardAllowsSession(
   config: WorldbookRepairRuntimeConfig,
   sessionId: string,
 ): boolean {
-  return config.enabled && config.sessionAllowlist.has(sessionId);
+  return config.enabled
+    && runtimeSessionScopeAllows(config.sessionScope, config.sessionAllowlist, sessionId);
 }

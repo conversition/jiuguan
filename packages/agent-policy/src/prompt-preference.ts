@@ -1,4 +1,5 @@
 export const PROMPT_PREFERENCE_EXTRACTOR_VERSION = 'prompt-preference-v1';
+export const TYPED_PREFERENCE_OUTPUT_VERSION = 'typed-preference-v1' as const;
 export const PROMPT_PREFERENCE_DIMENSIONS = Object.freeze([
   'pace', 'tone', 'interaction', 'viewpoint', 'relationship', 'action',
 ] as const);
@@ -110,7 +111,7 @@ const ALLOWED_TAG_TOKENS = new Set(PROMPT_PREFERENCE_DIMENSIONS.flatMap((dimensi
 export const PROMPT_PREFERENCE_ALLOWED_TOKENS = Object.freeze([...ALLOWED_TAG_TOKENS].sort());
 
 export interface TypedPreferenceExtraction {
-  readonly version: 'typed-preference-v1';
+  readonly version: typeof TYPED_PREFERENCE_OUTPUT_VERSION;
   readonly confidence: 'inferred-low';
   readonly tags: readonly PromptPreferenceTag[];
 }
@@ -120,7 +121,7 @@ export function normalizeTypedPreferenceExtraction(value: unknown): TypedPrefere
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const row = value as Record<string, unknown>;
   if (Object.keys(row).some((key) => !['version', 'confidence', 'tags'].includes(key))
-    || row.version !== 'typed-preference-v1' || row.confidence !== 'inferred-low'
+    || row.version !== TYPED_PREFERENCE_OUTPUT_VERSION || row.confidence !== 'inferred-low'
     || !Array.isArray(row.tags) || row.tags.length > MAX_TAGS) return null;
   const tags: PromptPreferenceTag[] = [];
   for (const item of row.tags) {
@@ -140,7 +141,7 @@ export function normalizeTypedPreferenceExtraction(value: unknown): TypedPrefere
   const unique = [...new Map(tags.map((tag) => [tag.token, tag])).values()]
     .sort((left, right) => left.token.localeCompare(right.token));
   return Object.freeze({
-    version: 'typed-preference-v1',
+    version: TYPED_PREFERENCE_OUTPUT_VERSION,
     confidence: 'inferred-low',
     tags: Object.freeze(unique),
   });
@@ -200,10 +201,11 @@ function evidenceTags(row: PromptPreferenceEvidence): string[] | null {
     || !Array.isArray(row.features.explicitPreferenceTags)
     || (row.features.inferredPreferenceTags !== undefined
       && !Array.isArray(row.features.inferredPreferenceTags))) return null;
-  const tags = [
-    ...row.features.explicitPreferenceTags,
-    ...((row.features.inferredPreferenceTags as unknown[] | undefined) ?? []),
-  ];
+  // P16 W1（用户裁定 2026-10-08）：**猜的只做记录、不进画像**。
+  // `inferredPreferenceTags`（模型低置信推断，confidence 固定 inferred-low）只留在事件
+  // features 里作遥测；画像（tagCounts → 注入 prompt 的方向引导）只由用户**明确说出**的
+  // 标签驱动。宁可慢而准，不要快而被猜歪。
+  const tags = [...row.features.explicitPreferenceTags];
   if (tags.length > MAX_TAGS || !tags.every((tag) => (
     typeof tag === 'string' && TAG_TOKEN.test(tag) && ALLOWED_TAG_TOKENS.has(tag)
   ))) return null;
@@ -293,13 +295,20 @@ function finish(profile: MutableProfile): PromptPreferenceProfile {
 /** 从脱敏 session_start_prompt 事件重建；无标签会话不伪造偏好样本。 */
 export function rebuildPromptPreferenceProfiles(evidence: readonly PromptPreferenceEvidence[]): PromptPreferenceProfiles {
   const currentEpochs = latestPreferenceEpochs(evidence);
-  const invalidatedRevisions = new Set(evidence.filter((row) => (
-    row.eventKind === 'delete' && typeof row.sourceRevision === 'string' && OPAQUE_TOKEN.test(row.sourceRevision)
-  )).map((row) => `${row.sessionId}\0${row.sourceRevision}`));
+  const invalidatedRevisions = new Map<string, { any: boolean; epochs: Set<number> }>();
+  const invalidate = (sessionId: string, revision: string, epoch: unknown) => {
+    const key = `${sessionId}\0${revision}`;
+    const value = invalidatedRevisions.get(key) ?? { any: false, epochs: new Set<number>() };
+    if (typeof epoch === 'number' && Number.isSafeInteger(epoch) && epoch >= 0) value.epochs.add(epoch);
+    else value.any = true;
+    invalidatedRevisions.set(key, value);
+  };
   for (const row of evidence) {
+    if (row.eventKind === 'delete' && typeof row.sourceRevision === 'string' && OPAQUE_TOKEN.test(row.sourceRevision))
+      invalidate(row.sessionId, row.sourceRevision, row.features.removedSourceHistoryEpoch);
     const replaced = row.features.replacedSourceRevision;
     if (row.eventKind === 'regenerate' && typeof replaced === 'string' && OPAQUE_TOKEN.test(replaced)) {
-      invalidatedRevisions.add(`${row.sessionId}\0${replaced}`);
+      invalidate(row.sessionId, replaced, row.features.replacedSourceHistoryEpoch);
     }
   }
   const session = new Map<string, MutableProfile>();
@@ -309,8 +318,12 @@ export function rebuildPromptPreferenceProfiles(evidence: readonly PromptPrefere
     if (!tags || tags.length === 0) continue;
     const preferenceEpoch = positivePreferenceEpoch(row);
     if (preferenceEpoch === null || preferenceEpoch !== (currentEpochs.get(exactIdentityKey(row)) ?? 0)) continue;
-    if (typeof row.sourceRevision === 'string'
-      && invalidatedRevisions.has(`${row.sessionId}\0${row.sourceRevision}`)) continue;
+    if (typeof row.sourceRevision === 'string') {
+      const invalidation = invalidatedRevisions.get(`${row.sessionId}\0${row.sourceRevision}`);
+      const epoch = row.features.historyEpoch;
+      if (invalidation && (invalidation.any || typeof epoch !== 'number' || !Number.isSafeInteger(epoch) || epoch < 0
+        || invalidation.epochs.has(epoch))) continue;
+    }
     const groups: Array<[Map<string, MutableProfile>, string, 'session' | 'card']> = [
       [session, `${row.sessionId}\0${row.cardId}\0${row.contentMode}`, 'session'],
       [card, `${row.cardId}\0${row.contentMode}`, 'card'],

@@ -9,6 +9,7 @@ import { SessionSetup } from './SessionSetup.tsx';
 import { EditorPanel } from './EditorPanel.tsx';
 import { responseJson, revisionHeaders } from './revisionApi.ts';
 import { SkillsPanel } from './SkillsPanel.tsx';
+import { PromotionPanel } from './PromotionPanel.tsx';
 import { QualityPanel } from './QualityPanel.tsx';
 import { MarkdownMessage, StreamText } from './MarkdownMessage.tsx';
 import { HtmlMessage, splitGalSegments } from './HtmlMessage.tsx';
@@ -58,6 +59,7 @@ import { ErrorBoundary } from './components/ErrorBoundary.tsx';
 import { WEB_CLIENT_PROFILE } from './clientProfile.ts';
 import { logger } from './lib/logger.ts';
 import { DirectorModal } from './DirectorModal.tsx';
+import { CreativeDirectorModal } from './CreativeDirectorModal.tsx';
 import { useTextSelectionDirector } from './hooks/useTextSelectionDirector.ts';
 import type { TextSelection } from './hooks/useTextSelectionDirector.ts';
 import {
@@ -71,6 +73,7 @@ import { useMobileDrawer } from './hooks/useMobileDrawer.ts';
 import { useOnlineStatus } from './hooks/useOnlineStatus.ts';
 import { setGenerationActivity, touchGenerationActivity } from './generationActivity.ts';
 import { clearComposerDraft, readComposerDraft, writeComposerDraft } from './draftRecovery.ts';
+import { isTurnProgress, readTurnProgressEvent, turnProgressLabel, type TurnProgress } from './turnProgress.ts';
 import { fetchWithInactivityTimeout, NetworkInactivityTimeoutError } from './activityTimeout.ts';
 import { AgentStatusPanel } from './AgentStatusPanel.tsx';
 
@@ -133,11 +136,29 @@ interface PendingImage {
   dataUrl: string;
 }
 /** 推进槽 / 轮次状态（/api/session/:id/turn-state，侧栏常驻） */
+type TurnBarKey = 'personal' | 'accident' | 'main' | 'erotic';
 interface TurnState {
-  bars: Record<string, number>;
+  bars: Record<TurnBarKey, number>;
+  bar_progress?: {
+    round: number;
+    before: Record<TurnBarKey, number>;
+    after: Record<TurnBarKey, number>;
+    requested: Record<TurnBarKey, number>;
+    /** 本轮自然冷却（≤0）；旧胶囊可能没有该字段。 */
+    decay?: Record<TurnBarKey, number>;
+    delta: Record<TurnBarKey, number>;
+    saturated: TurnBarKey[];
+  } | null;
   event_type: string;
   nsfw_lock: { locked: boolean; round: number };
   round: number;
+  protagonist?: {
+    entityId: string | null;
+    name: string;
+    asOfRound: number;
+    lastChangedRound: number;
+    entries: { field: string; value: string; updatedRound: number }[];
+  } | null;
 }
 interface GenerationState {
   active: boolean;
@@ -148,6 +169,7 @@ interface GenerationState {
 interface TurnStatePayload {
   state: TurnState | null;
   generation?: GenerationState;
+  progress?: TurnProgress;
 }
 
 /**
@@ -175,11 +197,57 @@ function sseFailureMessage(event: Record<string, unknown>, fallback: string): st
     case 'provider_interrupted': return '模型服务调用被中断，请重试';
     case 'execution_lease_lost': return '生成任务执行权已失效，请重试';
     case 'skill_context_conflict': return '完整 Skill 与必需上下文超出模型容量，请调整上下文配置';
+    case 'context_compiler_failed': return '上下文整理失败，尚未开始生成正文，请重试；若持续失败，请检查辅助模型设置';
+    case 'context_compiler_provider_request_invalid': return '辅助模型服务拒绝了上下文整理请求，正文尚未开始生成。请检查辅助模型名称、访问权限及请求参数后再试';
+    case 'schema_repair_reserve_insufficient': return '回合预算未预留足够的结构修复和内容修稿次数，正文尚未开始生成，请调整回合预算';
+    case 'game_turn_tool_missing': return '模型已返回，但未提供所需的完整回合结构，本轮未保存';
+    case 'game_turn_json_invalid': return '模型已返回，但回合数据不是合法 JSON，本轮未保存';
+    case 'game_turn_schema_invalid': return '模型已返回，但回合字段结构未通过校验，本轮未保存';
+    case 'game_turn_schema_repair_unavailable': return '模型已返回，但结构修复所需的回合预算尚未配置；本轮未提交，可查看已保存的候选正文';
+    case 'game_turn_schema_repair_failed': return '模型已返回，但结构修复未通过，本轮未提交，可查看已保存的候选正文';
+    case 'game_turn_repair_empty': return '结构修复返回空内容，本轮未提交，可查看已保存的候选正文';
+    case 'game_turn_repair_truncated': return '结构修复响应未完整结束，本轮未提交，可查看已保存的候选正文';
+    case 'game_turn_repair_tool_call': return '结构修复返回了意外工具调用，本轮未提交，可查看已保存的候选正文';
+    case 'game_turn_repair_json_invalid': return '结构修复响应不是合法 JSON，本轮未提交，可查看已保存的候选正文';
+    case 'game_turn_repair_shape_invalid': return '结构修复响应格式不正确，本轮未提交，可查看已保存的候选正文';
+    case 'game_turn_repair_abstained': return 'Agent 无法确定字段含义，已保留候选正文，本轮未提交';
+    case 'game_turn_repair_issue_invalid': return '结构修复返回的问题编号不匹配，本轮未提交，可查看已保存的候选正文';
+    case 'game_turn_repair_value_invalid': return '结构修复返回的字段值不符合要求，本轮未提交，可查看已保存的候选正文';
+    case 'game_turn_repair_schema_invalid': return '修复后的回合结构仍未通过校验，本轮未提交，可查看已保存的候选正文';
+    case 'game_turn_repair_source_stale': return '修复期间会话来源发生变化，本轮未提交，可查看已保存的候选正文';
+    case 'game_turn_repair_evidence_storage_failed': return '无法保存结构修复的诊断记录，本轮未提交，可查看已保存的候选正文';
+    case 'game_turn_candidate_storage_failed': return '无法保存生成候选，本轮未提交，请检查本地存储';
+    case 'game_turn_normalization_failed': return '模型已返回，但回合数据整理失败，本轮未保存';
+    case 'game_turn_output_invalid': return '模型已返回，但回合内容未通过校验，本轮未保存';
+    case 'game_turn_budget_exhausted': return '回合执行额度已用尽，本轮未保存';
     default: return typeof event.message === 'string' && event.message.trim().length > 0
       ? event.message
       : fallback;
   }
 }
+interface DetachedTurnJob {
+  runId: string;
+  sessionId: string;
+  action: string;
+  status: string;
+  round?: number;
+  result?: { assistantMessageId?: number };
+  error?: { code?: string };
+}
+
+/** Inactive is not committed: require this job's exact persisted assistant artifact. */
+function hasRecoveredTurnCommit(
+  job: DetachedTurnJob | null,
+  sid: string,
+  runId: string,
+  history: readonly Pick<Message, 'id' | 'round' | 'role'>[] | null,
+): boolean {
+  return Boolean(job && job.sessionId === sid && job.runId === runId && job.status === 'succeeded'
+    && Number.isSafeInteger(job.round) && Number.isSafeInteger(job.result?.assistantMessageId)
+    && history?.some(message => message.id === job.result?.assistantMessageId
+      && message.round === job.round && message.role === 'assistant'));
+}
+
 interface AbortTurnResult {
   ok: boolean;
   aborted: boolean;
@@ -372,7 +440,7 @@ const MessageRow = React.memo(function MessageRow({
     return () => unrecordMessageView(anchorKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [viewPlan.reason, anchorKey, streaming, m.serverId, stateInfo?.exists, stateInfo?.stateVersion]);
-  // 锚点 ref 记忆化（v0.1.0）：registerAnchor(key) 每次调用都返回新函数，
+  // 锚点 ref 记忆化（v0.6.1）：registerAnchor(key) 每次调用都返回新函数，
   // 直接内联会导致非流式行每渲染触发 ref 解绑/重绑、锚点 Map 反复增删（抖动）。
   // 按 anchorKey 记住同一引用，key 不变则 ref 引用稳定。
   const anchorRefCache = useRef<{ key: string; fn: ((el: HTMLDivElement | null) => void) | null }>({ key: '', fn: null });
@@ -394,7 +462,7 @@ const MessageRow = React.memo(function MessageRow({
         ) : mountState === 'static-preview' ? (
           // 降级为静态预览：保留内容与锚点，但不挂载可执行页面（不启动脚本、不读状态）
           <div className="bubble read" data-mount-state="static-preview">
-            <MarkdownMessage text={shown} />
+            <MarkdownMessage text={shown} displayEscapedNewlines={m.role === 'assistant' && !showRaw} />
             <div className="history-preview-note">
               <button className="op-btn" onClick={() => onExpandHistory?.(anchorKey)}>展开页面</button>
               <span>静态预览（未挂载可执行视图）</span>
@@ -414,12 +482,14 @@ const MessageRow = React.memo(function MessageRow({
                 />
                 : seg.renderer === 'card-html'
                   ? <HtmlMessage key={i} text={seg.content} target={{ sessionId: sessionId ?? '', sessionRunId, messageKey: anchorKey, messageId: m.serverId, floor: m.round }} />
-                  : <div key={i} className="bubble read"><MarkdownMessage text={seg.content} /></div>
+                  : <div key={i} className="bubble read"><MarkdownMessage text={seg.content} displayEscapedNewlines={!showRaw} /></div>
             )}
           </div>
         ) : m.role === 'assistant' ? (
           <div className={`bubble read${streaming ? ' streaming' : ''}`}>
-            {streaming ? <StreamText text={shown} /> : <MarkdownMessage text={shown} />}
+            {streaming
+              ? <StreamText text={shown} displayEscapedNewlines={!showRaw} />
+              : <MarkdownMessage text={shown} displayEscapedNewlines={!showRaw} />}
           </div>
         ) : (
           <div className="bubble">{shown}</div>
@@ -464,19 +534,43 @@ export function App({ storageNamespace }: { storageNamespace: ClientStorageNames
   const [pendingImages, setPendingImages] = useState<PendingImage[]>([]);
   const [dragImageOver, setDragImageOver] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [turnProgress, setTurnProgress] = useState<TurnProgress | null>(null);
   const [resumeLoading, setResumeLoading] = useState(false);
   const [resumingSessionId, setResumingSessionId] = useState<string | null>(null);
   const [recoveryNotice, setRecoveryNotice] = useState('');
+  const [failedCandidate, setFailedCandidate] = useState<{ sessionId: string; prose: string } | null>(null);
+  const loadFailedCandidate = async (sid: string, runId: string) => {
+    try {
+      const result = await api<{ sessionId: string; runId: string; prose: string }>(
+        `/api/turn-jobs/${encodeURIComponent(runId)}/candidate`, undefined, CONTROL_REQUEST_TIMEOUT_MS);
+      if (result.sessionId !== sid || result.runId !== runId || activeSessionRef.current !== sid) return;
+      localStorage.setItem(`jiuguan:failed-candidate:${sid}`, runId);
+      setFailedCandidate({ sessionId: sid, prose: result.prose });
+    } catch { /* No recoverable prose for this failed run. */ }
+  };
+  useEffect(() => {
+    setFailedCandidate(null);
+    if (!sessionId) return;
+    const runId = localStorage.getItem(`jiuguan:failed-candidate:${sessionId}`);
+    if (runId) void loadFailedCandidate(sessionId, runId);
+  }, [sessionId]);
   const online = useOnlineStatus();
   const loadedDraftSessionRef = useRef<string | null>(null);
   const submittedDraftSessionRef = useRef<string | null>(null);
+  // Only this page's exact send can authorize clearing a submitted composer draft.
+  // Older persisted drafts have no run identity; restore them conservatively.
+  const submittedDraftAttemptRef = useRef<{
+    sessionId: string; runId: string; text: string; updatedAt: number;
+  } | null>(null);
   const skipDraftPersistRef = useRef(false);
   // v0.6.0：一次 AI 回复生成完成信号（供"生成完成智能定位"触发跳转；每次开新生成前清 false）
   const [streamCompleted, setStreamCompleted] = useState(false);
   const [initStage, setInitStage] = useState('');
   const [contentMode, setContentMode] = useState<'nsfw' | 'nsf'>('nsfw');
-  const [tab, setTab] = useState<'setup' | 'chat' | 'memory' | 'provider' | 'assets' | 'editor' | 'plugins' | 'skills' | 'quality'>('setup');
+  const [tab, setTab] = useState<'setup' | 'chat' | 'memory' | 'provider' | 'assets' | 'editor' | 'plugins' | 'skills' | 'quality' | 'promotion'>('setup');
   const [error, setError] = useState('');
+  /** Maintenance writes happen outside turn SSE; advance to refresh read-only memory projections. */
+  const [maintenanceTruthRefreshKey, setMaintenanceTruthRefreshKey] = useState(0);
   // AQL：重规划建议卡（override 建议方向；不进对话，仅在重发 ≥replanK 后本会话内展示，可手动关闭）
   const [replanSuggestion, setReplanSuggestion] = useState('');
   const [adultOk, setAdultOk] = useState<boolean>(
@@ -541,6 +635,7 @@ export function App({ storageNamespace }: { storageNamespace: ClientStorageNames
   useEffect(() => () => setGenerationActivity(false), []);
   useEffect(() => {
     skipDraftPersistRef.current = true;
+    submittedDraftAttemptRef.current = null;
     if (!sessionId) {
       loadedDraftSessionRef.current = null;
       submittedDraftSessionRef.current = null;
@@ -590,6 +685,7 @@ export function App({ storageNamespace }: { storageNamespace: ClientStorageNames
     if (!force && submittedDraftSessionRef.current !== sid) return;
     clearComposerDraft(localStorage, storageNamespace.draftKey(sid, 'composer'));
     if (submittedDraftSessionRef.current === sid) submittedDraftSessionRef.current = null;
+    if (submittedDraftAttemptRef.current?.sessionId === sid) submittedDraftAttemptRef.current = null;
   };
   const selectMobileTab = (next: typeof tab) => {
     setTab(next);
@@ -620,6 +716,7 @@ export function App({ storageNamespace }: { storageNamespace: ClientStorageNames
   const generationGate = generationGateRef.current;
   const activateSession = (sid: string | null) => {
     if (activeSessionRef.current !== sid) {
+      setTurnProgress(null);
       closeMobileStory();
       setStoryIndex('');
       setStoryBranches([]);
@@ -712,7 +809,7 @@ export function App({ storageNamespace }: { storageNamespace: ClientStorageNames
         ? { ...x, content: x.content + chunk }
         : x
     )));
-    // 生成期底部跟随（v0.1.0：事件驱动，仅确有 delta 时执行，取代原 60fps 追随循环）
+    // 生成期底部跟随（v0.6.1：事件驱动，仅确有 delta 时执行，取代原 60fps 追随循环）
     // 未上滚读旧文 → 钉住底部让新内容持续可见；已上滚 → 不动，等用户回到底部后恢复
     if (userScrolledUpRef.current) return;
     const container = scrollRef.current;
@@ -785,11 +882,17 @@ export function App({ storageNamespace }: { storageNamespace: ClientStorageNames
     if (op === 'message' && (value as { event?: string }).event === 'MESSAGE_RECEIVED') {
       recordEffect('agent-business', 'assistant-message');
     }
+    const targetSessionId = typeof target?.sessionId === 'string' ? target.sessionId : (sessionId ?? '');
+    const targetSessionRunId = typeof target?.sessionRunId === 'string' ? target.sessionRunId : sessionRunId;
+    const headVersion = typeof value.headVersion === 'number' && Number.isSafeInteger(value.headVersion)
+      ? value.headVersion
+      : undefined;
     const decisions = dispatchPanelEvent({
       purpose,
       target: target as never,
-      sessionId: sessionId ?? '',
-      sessionRunId,
+      sessionId: targetSessionId,
+      sessionRunId: targetSessionRunId,
+      ...(headVersion === undefined ? {} : { headVersion }),
     });
     if (decisions.length > 0) {
       logger.info('ui', `面板事件派发 ${purpose}`, decisions);
@@ -860,7 +963,9 @@ export function App({ storageNamespace }: { storageNamespace: ClientStorageNames
       const d = await loadTurnState(sid);
       if (activeSessionRef.current !== sid || activationEpochRef.current !== activation) return;
       setTurnState(d.state ?? null);
-      if (d.state && d.state.round > 0) void fetchStoryIndex(sid, d.state.round);
+      // 回合结束后索引可能滞后于正文（懒生成/后置维护改变 preset 投影）：
+      // 这里带 2 次退避重试，让面板自动收敛到本轮，不要求用户手动点 ↻。
+      if (d.state && d.state.round > 0) void fetchStoryIndex(sid, d.state.round, false, { retries: 2 });
     } catch { /* 侧栏状态拉取失败不影响使用 */ }
   };
 
@@ -873,12 +978,18 @@ export function App({ storageNamespace }: { storageNamespace: ClientStorageNames
   };
 
   /** 拉取 AI 剧情分支索引（后端按轮缓存，重复请求零成本；force=true 跳过缓存强制重建） */
-  const fetchStoryIndex = async (sid: string, round: number, force = false) => {
+  const fetchStoryIndex = async (
+    sid: string,
+    round: number,
+    force = false,
+    opts: { retries?: number } = {},
+  ) => {
     if (!sid || round < 1) return;
     const request = ++storyRequestRef.current;
     const activation = activationEpochRef.current;
     setStoryLoading(true);
     setStoryError('');
+    let needsRetry = false;
     try {
       const d = await api<{
         content: string; branches: string[]; branchIds?: string[]; round: number; fromCache: boolean;
@@ -902,6 +1013,17 @@ export function App({ storageNamespace }: { storageNamespace: ClientStorageNames
       setStoryStaleSourceRound(d.stale === true && Number.isSafeInteger(d.sourceRound)
         ? Number(d.sourceRound)
         : null);
+      if (d.failureCode && d.stale !== true) {
+        const retryHint = Number.isSafeInteger(d.retryAfterSeconds) && Number(d.retryAfterSeconds) > 0
+          ? `；可在 ${Number(d.retryAfterSeconds)} 秒后重试`
+          : '';
+        setStoryError(`刷新失败，继续使用本轮已有索引${retryHint}。`);
+        needsRetry = true;
+      }
+      // 后端可能在本轮索引尚未产出时只返回历史参考轮（round 落后于请求轮）——
+      // 这不算错误，但应当在自动刷新路径下再试一次，让界面收敛到本轮。
+      // stale=true 表示后端已明确回退到历史只读参考，此时不再重试（尊重其"暂不可用"判断）。
+      if (d.stale !== true && Number.isSafeInteger(d.round) && d.round < round) needsRetry = true;
       if (d.stale === true || pendingBranchSelectionRef.current?.round !== d.round) {
         pendingBranchSelectionRef.current = null;
       }
@@ -912,6 +1034,7 @@ export function App({ storageNamespace }: { storageNamespace: ClientStorageNames
         && activationEpochRef.current === activation
       ) {
         setStoryError((e as Error).message || '剧情索引读取失败');
+        needsRetry = true;
         if (isLegacyGenericStoryFallback(storyBranches)) {
           setStoryIndex('');
           setStoryBranches([]);
@@ -922,6 +1045,20 @@ export function App({ storageNamespace }: { storageNamespace: ClientStorageNames
     }
     finally {
       if (request === storyRequestRef.current) setStoryLoading(false);
+    }
+    // 自动刷新路径的有限退避重试：只在本请求仍是最新、会话与激活轮次都未变时才重排，
+    // 用户切会话 / 发新回合 / 手动 ↻ 都会让 request 失配从而自动放弃。
+    const remainingRetries = opts.retries ?? 0;
+    if (needsRetry && !force && remainingRetries > 0
+      && request === storyRequestRef.current
+      && activeSessionRef.current === sid
+      && activationEpochRef.current === activation) {
+      setTimeout(() => {
+        if (request !== storyRequestRef.current
+          || activeSessionRef.current !== sid
+          || activationEpochRef.current !== activation) return;
+        void fetchStoryIndex(sid, round, false, { retries: remainingRetries - 1 });
+      }, 1500);
     }
   };
 
@@ -1181,6 +1318,7 @@ export function App({ storageNamespace }: { storageNamespace: ClientStorageNames
     stopGenTimer();
     setStreamCompleted(true);
     setBusy(false);
+    setTurnProgress(null);
     return true;
   };
 
@@ -1261,6 +1399,7 @@ export function App({ storageNamespace }: { storageNamespace: ClientStorageNames
   /** 页面重挂载后没有原 SSE reader：轮询稳定 runId，完成/停止后自动读回，不要求刷新页面。 */
   const monitorDetachedGeneration = async (sid: string, runId: string, lease: GenerationLease) => {
     const monitor = ++generationMonitorSeqRef.current;
+    const draftAttempt = submittedDraftAttemptRef.current;
     let currentRunId = runId;
     let lastReachableAt = Date.now();
     while (
@@ -1272,10 +1411,12 @@ export function App({ storageNamespace }: { storageNamespace: ClientStorageNames
       await new Promise((resolve) => setTimeout(resolve, 500));
       let d: TurnStatePayload;
       try { d = await loadTurnState(sid); } catch { continue; }
+      if (monitor !== generationMonitorSeqRef.current || activeSessionRef.current !== sid || !generationGate.owns(lease)) return;
       lastReachableAt = Date.now();
       startGenTimeout();
       if (!d.generation?.active) break;
       if (d.generation.runId && d.generation.runId !== currentRunId && d.generation.startedAt != null) {
+        setTurnProgress(null);
         currentRunId = d.generation.runId;
         lease.runId = currentRunId;
         generationTargetRef.current = {
@@ -1290,6 +1431,7 @@ export function App({ storageNamespace }: { storageNamespace: ClientStorageNames
         startGenTimer(d.generation.startedAt);
         startGenTimeout(d.generation.startedAt);
       }
+      if (isTurnProgress(d.progress) && d.progress.runId === currentRunId) setTurnProgress(d.progress);
       syncGenTimer();
     }
     if (monitor !== generationMonitorSeqRef.current || activeSessionRef.current !== sid) return;
@@ -1307,11 +1449,39 @@ export function App({ storageNamespace }: { storageNamespace: ClientStorageNames
       finishGenerationUi(lease);
       return;
     }
-    try { await fetchHistory(sid); } catch { /* 保留现有消息，稍后手动刷新仍可恢复 */ }
+    const [history, jobPayload] = await Promise.all([
+      loadHistory(sid).catch(() => null),
+      api<{ job: DetachedTurnJob }>(`/api/turn-jobs/${encodeURIComponent(runId)}`,
+        undefined, CONTROL_REQUEST_TIMEOUT_MS).catch(() => null),
+    ]);
+    if (monitor !== generationMonitorSeqRef.current || activeSessionRef.current !== sid
+      || !generationGate.owns(lease) || generationTargetRef.current?.runId !== currentRunId) return;
+    if (history) setMessages(prev => mergeHistory(prev, history.messages));
     void fetchTurnState(sid);
     void refreshSessions();
-    clearSubmittedDraft(sid);
-    setRecoveryNotice('后台生成任务已恢复并同步最新结果。');
+    const job = jobPayload?.job ?? null;
+    const committed = hasRecoveredTurnCommit(job, sid, runId, history?.messages ?? null);
+    const draft = readComposerDraft(localStorage, storageNamespace.draftKey(sid, 'composer'));
+    if (draft?.state === 'submitted') {
+      if (committed && job?.action === 'turn' && draftAttempt?.sessionId === sid
+        && draftAttempt.runId === runId && draftAttempt.text === draft.text
+        && draftAttempt.updatedAt === draft.updatedAt) {
+        clearSubmittedDraft(sid);
+        setRecoveryNotice('已确认本轮生成并同步最新结果。');
+      } else {
+        writeComposerDraft(localStorage, storageNamespace.draftKey(sid, 'composer'), draft.text, 'editing');
+        submittedDraftSessionRef.current = null;
+        submittedDraftAttemptRef.current = null;
+        setInput(current => current.trim().length > 0 ? current : draft.text);
+        setRecoveryNotice('未能确认这份草稿已完成生成，已恢复为可编辑草稿。');
+      }
+    } else {
+      setRecoveryNotice(committed ? '后台生成任务已恢复并同步最新结果。' : '后台任务已结束，请核对最新会话记录。');
+    }
+    if (job?.sessionId === sid && job.runId === runId && job.status === 'failed') {
+      setError(sseFailureMessage({ code: job.error?.code }, '本轮生成失败，请重试。'));
+      void loadFailedCandidate(sid, runId);
+    }
     finishGenerationUi(lease);
   };
 
@@ -1351,7 +1521,7 @@ export function App({ storageNamespace }: { storageNamespace: ClientStorageNames
       activateSession(sid);
       setMessages(mergeHistory([], history.messages));
       setTurnState(turn.state ?? null);
-      if (turn.state && turn.state.round > 0) void fetchStoryIndex(sid, turn.state.round);
+      if (turn.state && turn.state.round > 0) void fetchStoryIndex(sid, turn.state.round, false, { retries: 1 });
       const running = turn.generation;
       if (running?.active && running.runId && running.startedAt != null) {
         const lease = generationGate.claim(sid, running.runId);
@@ -1363,6 +1533,7 @@ export function App({ storageNamespace }: { storageNamespace: ClientStorageNames
           startedAt: running.startedAt,
         };
         setBusy(true);
+        setTurnProgress(isTurnProgress(turn.progress) && turn.progress.runId === running.runId ? turn.progress : null);
         startGenTimer(running.startedAt);
         startGenTimeout(running.startedAt);
         setRecoveryNotice('已接续电脑端正在运行的生成任务，可继续等待结果。');
@@ -1372,16 +1543,13 @@ export function App({ storageNamespace }: { storageNamespace: ClientStorageNames
         setBusy(false);
         const draft = readComposerDraft(localStorage, storageNamespace.draftKey(sid, 'composer'));
         if (draft?.state === 'submitted') {
-          const committed = history.messages.some((message) => message.role === 'user' && message.content.includes(draft.text));
-          if (committed) {
-            clearSubmittedDraft(sid, true);
-            setRecoveryNotice('已确认上次发送内容并同步会话历史。');
-          } else {
-            writeComposerDraft(localStorage, storageNamespace.draftKey(sid, 'composer'), draft.text, 'editing');
-            submittedDraftSessionRef.current = null;
-            setInput(draft.text);
-            setRecoveryNotice('上次发送未被电脑端确认，已恢复为可编辑草稿。');
-          }
+          // A repeated user sentence (or an orphan user row) cannot prove this send committed.
+          // Persisted v1 drafts have no run identity, so keep the text until the user reviews it.
+          writeComposerDraft(localStorage, storageNamespace.draftKey(sid, 'composer'), draft.text, 'editing');
+          submittedDraftSessionRef.current = null;
+          submittedDraftAttemptRef.current = null;
+          setInput(draft.text);
+          setRecoveryNotice('未能确认上次生成，已恢复为可编辑草稿，请核对会话记录。');
         }
       }
     } catch (e) {
@@ -1462,6 +1630,12 @@ export function App({ storageNamespace }: { storageNamespace: ClientStorageNames
     const runId = createClientRunId(startedAt);
     const lease = generationGate.claim(sid, runId);
     if (!lease) return;
+    const submittedDraft = readComposerDraft(localStorage, storageNamespace.draftKey(sid, 'composer'));
+    if (submittedDraftSessionRef.current === sid && submittedDraft?.state === 'submitted'
+      && submittedDraft.text === raw) {
+      submittedDraftAttemptRef.current = { sessionId: sid, runId, text: submittedDraft.text,
+        updatedAt: submittedDraft.updatedAt };
+    }
     // 开场白是 round 0；正式发送必须从下一轮开始。若仍写 0，会与开场卡面共用
     // round+role 身份，历史读回时让临时回复夺走开场 iframe 的 React key。
     const optimisticRound = nextOptimisticRound(messagesRef.current, turnState?.round);
@@ -1472,6 +1646,7 @@ export function App({ storageNamespace }: { storageNamespace: ClientStorageNames
     generationTargetRef.current = { sessionId: sid, round: optimisticRound, runId, startedAt };
     logger.info('turn', '发送消息', { session: sid, content_mode: contentMode, via: 'gla', images: attachments.length });
     setBusy(true);
+    setTurnProgress(null);
     setStreamCompleted(false);
     setError('');
     startGenTimer(startedAt);
@@ -1507,6 +1682,8 @@ export function App({ storageNamespace }: { storageNamespace: ClientStorageNames
             // P7：客户端预生成的 runId 只作兼容幂等键；首个 status 后切换为
             // 服务端权威 runId，后续 cancel/轮询都不得继续使用临时身份。
             if (typeof ev.runId === 'string' && ev.runId.length > 0 && target.runId !== ev.runId) {
+              const attempt = submittedDraftAttemptRef.current;
+              if (attempt?.sessionId === sid && attempt.runId === target.runId) attempt.runId = ev.runId;
               target.runId = ev.runId;
               lease.runId = ev.runId;
             }
@@ -1527,6 +1704,9 @@ export function App({ storageNamespace }: { storageNamespace: ClientStorageNames
             }
           }
         }
+        const progress = readTurnProgressEvent(ev);
+        if (progress && generationTargetRef.current?.sessionId === sid
+          && generationTargetRef.current.runId === progress.runId) setTurnProgress(progress);
         if (ev.type === 'delta' && typeof ev.text === 'string') {
           // 真流式：rAF 批合并逐帧追加（StreamText 渐进渲染，不做全量 re-parse）
           deltaCount++;
@@ -1554,6 +1734,11 @@ export function App({ storageNamespace }: { storageNamespace: ClientStorageNames
         if (ev.type === 'memory') {
           // AM-05：真实**记忆提交**（人物投影）的通知 —— 与"正文流结束"分开。
           // 面板据此在同作用域内重读并按 headVersion 拒绝旧响应；重复通知不额外触发业务写入。
+          if (ev.turnState && typeof ev.turnState === 'object'
+            && typeof (ev.turnState as { round?: unknown }).round === 'number') {
+            // 当前 generation lease 已在回调入口校验；旧会话/旧 run 的迟到帧不能覆盖当前 UI。
+            setTurnState(ev.turnState as TurnState);
+          }
           notifyHostEvent(
             'session-state',
             {
@@ -1567,6 +1752,7 @@ export function App({ storageNamespace }: { storageNamespace: ClientStorageNames
         }
         if (ev.type === 'error') {
           terminalFailure = sseFailureMessage(ev, '回合失败');
+          void loadFailedCandidate(sid, generationTargetRef.current?.runId ?? runId);
           logger.error('turn', '回合 SSE error', { message: terminalFailure });
           setError(`生成失败，本轮未写入：${terminalFailure}。发送内容已恢复，可直接重试。`);
         }
@@ -1651,6 +1837,7 @@ export function App({ storageNamespace }: { storageNamespace: ClientStorageNames
     logger.info('turn', '重新生成回复', { session: sid, round: msg.round });
     setReplanSuggestion('');
     setBusy(true);
+    setTurnProgress(null);
     setStreamCompleted(false);
     setError('');
     startGenTimer(startedAt);
@@ -1677,6 +1864,9 @@ export function App({ storageNamespace }: { storageNamespace: ClientStorageNames
             }
           }
         }
+        const progress = readTurnProgressEvent(ev);
+        if (progress && generationTargetRef.current?.sessionId === sid
+          && generationTargetRef.current.runId === progress.runId) setTurnProgress(progress);
         if (ev.type === 'delta' && typeof ev.text === 'string') {
           deltaCount++;
           deltaLen += ev.text.length;
@@ -1693,6 +1883,7 @@ export function App({ storageNamespace }: { storageNamespace: ClientStorageNames
         }
         if (ev.type === 'error') {
           terminalFailure = sseFailureMessage(ev, '重新生成失败');
+          void loadFailedCandidate(sid, generationTargetRef.current?.runId ?? runId);
           logger.error('turn', '重新生成 SSE error', { message: terminalFailure });
           setError(terminalFailure);
         }
@@ -2473,6 +2664,7 @@ export function App({ storageNamespace }: { storageNamespace: ClientStorageNames
   // 导演模式：文本选区浮动按钮（启用条件=已有会话）+ 探窗目标（点击 🎬 时快照选区传入弹窗）
   const { sel: directorSel, dismiss: dismissDirector } = useTextSelectionDirector(Boolean(sessionId));
   const [directorTarget, setDirectorTarget] = useState<TextSelection | null>(null);
+  const [creativeDirectorTarget, setCreativeDirectorTarget] = useState<TextSelection | null>(null);
 
   return (
     <div className="layout">
@@ -2664,15 +2856,50 @@ export function App({ storageNamespace }: { storageNamespace: ClientStorageNames
               <span className="status-event">{turnState.event_type}</span>
               {turnState.nsfw_lock.locked && <span className="tag tag-locked">NSFW 锁定 · R{turnState.nsfw_lock.round}</span>}
             </div>
+            <div className="status-section-title" title="剧情热度指标：每回合自然冷却，实质推进才抬升；不是主角生命/能力数值">剧情推进（热度槽）</div>
             <div className="bars bars-compact">
-              {(['personal', 'accident', 'main', 'erotic'] as const).map((k) => (
-                <div key={k} className="bar-row">
-                  <span className="bar-label">{k === 'personal' ? '个人' : k === 'accident' ? '意外' : k === 'main' ? '主线' : '情欲'}</span>
-                  <div className="bar-track"><div className="bar-fill" style={{ width: `${(turnState.bars[k] ?? 0)}%` }} /></div>
-                  <span className="bar-val">{turnState.bars[k] ?? 0}</span>
-                </div>
-              ))}
+              {(['personal', 'accident', 'main', 'erotic'] as const).map((k) => {
+                const value = Math.max(0, Math.min(100, Number(turnState.bars[k] ?? 0)));
+                const progress = turnState.bar_progress?.round === turnState.round ? turnState.bar_progress : null;
+                const requested = progress?.requested[k] ?? 0;
+                const decay = progress?.decay?.[k] ?? 0;
+                const applied = progress?.delta[k] ?? 0;
+                const clamped = progress?.saturated.includes(k) === true;
+                return (
+                  <div key={k} className="bar-row">
+                    <span className="bar-label">{k === 'personal' ? '个人' : k === 'accident' ? '意外' : k === 'main' ? '主线' : '情欲'}</span>
+                    <div className="bar-track"><div className="bar-fill" style={{ width: `${value}%` }} /></div>
+                    <span className="bar-val">{value}</span>
+                    {(requested !== 0 || decay !== 0) && (
+                      <span
+                        className={`bar-delta ${applied < 0 ? 'bar-delta--down' : ''}`}
+                        title={`请求 ${requested > 0 ? '+' : ''}${requested}｜自然冷却 ${decay}｜净 ${applied > 0 ? '+' : ''}${applied}`}
+                      >
+                        {applied > 0 ? '+' : ''}{applied}{decay !== 0 && requested !== 0 ? `（冷却${decay}）` : ''}{clamped ? '（受限）' : ''}
+                      </span>
+                    )}
+                    {value >= 100 && <span className="bar-full">已满</span>}
+                  </div>
+                );
+              })}
             </div>
+            {turnState.protagonist && (
+              <div className="protagonist-status">
+                <div className="status-section-title">
+                  主角状态 · {turnState.protagonist.name}
+                  <span className="status-asof">核对至 R{turnState.protagonist.asOfRound} · 最近变化 R{turnState.protagonist.lastChangedRound}</span>
+                </div>
+                {turnState.protagonist.entries.length > 0 ? (
+                  <dl className="protagonist-fields">
+                    {turnState.protagonist.entries.slice(0, 6).map((entry) => (
+                      <div key={`${entry.field}:${entry.updatedRound}`}>
+                        <dt>{entry.field}</dt><dd>{entry.value}</dd>
+                      </div>
+                    ))}
+                  </dl>
+                ) : <div className="status-empty">尚无已确认的主角状态字段</div>}
+              </div>
+            )}
           </div>
         )}
         {storyAvailable && (
@@ -2689,9 +2916,12 @@ export function App({ storageNamespace }: { storageNamespace: ClientStorageNames
             onSelect={applyBranch}
           />
         )}
+        {/* busy changes at turn start/end; round also catches committed turn transitions. */}
         <AgentStatusPanel
           sessionId={sessionId}
+          contentMode={contentMode}
           refreshKey={`${turnState?.round ?? 0}:${busy ? 'busy' : 'idle'}`}
+          onMaintenanceTruthChanged={() => setMaintenanceTruthRefreshKey((value) => value + 1)}
         />
         <h2>角色卡</h2>
         <ul>
@@ -2734,6 +2964,7 @@ export function App({ storageNamespace }: { storageNamespace: ClientStorageNames
           <button className={tab === 'skills' ? 'tab-active' : ''} onClick={() => selectMobileTab('skills')}>技能</button>
           <button className={tab === 'plugins' ? 'tab-active' : ''} onClick={() => selectMobileTab('plugins')}>插件</button>
           <button className={tab === 'quality' ? 'tab-active' : ''} onClick={() => selectMobileTab('quality')}>质量</button>
+          <button className={tab === 'promotion' ? 'tab-active' : ''} onClick={() => selectMobileTab('promotion')}>发布</button>
         </div>
         {error && <p className="error">{error}</p>}
       </aside>
@@ -2745,6 +2976,13 @@ export function App({ storageNamespace }: { storageNamespace: ClientStorageNames
         title="拖动调整侧栏宽度"
       />
       <main ref={mobileMainRef} className="chat">
+        {failedCandidate?.sessionId === sessionId && (
+          <details className="connection-recovery">
+            <summary>查看未提交的候选正文</summary>
+            <p>本正文未写入会话、记忆或角色状态，可选择文字复制。</p>
+            <textarea readOnly value={failedCandidate.prose} aria-label="未提交的候选正文" rows={10} style={{ width: '100%' }} />
+          </details>
+        )}
         {(!online || recoveryNotice) && (
           <div className={`connection-recovery${online ? '' : ' connection-recovery--offline'}`} role="status" aria-live="polite">
             {!online ? '手机当前离线；草稿保留在本设备，联网后可继续。' : recoveryNotice}
@@ -2757,8 +2995,10 @@ export function App({ storageNamespace }: { storageNamespace: ClientStorageNames
           // 挂载即"打开"、卸载即"关闭"（关闭时面板自行取消在途读取与订阅）
           <MemoryConsole
             sessionId={sessionId}
+            sessionRunId={sessionRunId}
             sessionReady={!!sessionId}
             visible={tab === 'memory'}
+            refreshKey={maintenanceTruthRefreshKey}
           />
         ) : tab === 'provider' ? (
           <ProviderPanel />
@@ -2772,12 +3012,14 @@ export function App({ storageNamespace }: { storageNamespace: ClientStorageNames
           <PluginsPanel />
         ) : tab === 'quality' ? (
           <QualityPanel sessionId={sessionId} />
+        ) : tab === 'promotion' ? (
+          <PromotionPanel sessionId={sessionId ?? undefined} />
         ) : (
           <>
             <div className="messages" ref={scrollRef}>
               {busy && (
                 <div className="gen-timer" title="从点击发送开始计时">
-                  <span className="gen-timer-spin" /> 正在生成… <b>{genSeconds.toFixed(1)}s</b>
+                  <span className="gen-timer-spin" /> {turnProgress ? turnProgressLabel(turnProgress.phase) : '正在生成'}… <b>{genSeconds.toFixed(1)}s</b>
                 </div>
               )}
               <ErrorBoundary scope="render" onReset={() => { if (sessionId) void fetchHistory(sessionId); }}>
@@ -2920,13 +3162,17 @@ export function App({ storageNamespace }: { storageNamespace: ClientStorageNames
       </main>
 
       {directorSel && !busy && (
-        <button
+        <><button
           className="director-float"
           style={{ left: directorSel.x, top: directorSel.y }}
           onClick={() => { setDirectorTarget(directorSel); dismissDirector(); }}
           title="🎬 导演模式：基于该片段 + 剧情上下文生成分镜"
-        >🎬</button>
+        >🎬</button><button className="director-float" style={{ left: directorSel.x + 48, top: directorSel.y }}
+          onClick={() => { setCreativeDirectorTarget(directorSel); dismissDirector(); }} title="改编创作">改编</button></>
       )}
+
+      {creativeDirectorTarget && sessionId && <CreativeDirectorModal sessionId={sessionId} selection={creativeDirectorTarget}
+        onClose={() => setCreativeDirectorTarget(null)} />}
 
       <DirectorModal
         open={Boolean(directorTarget && sessionId)}

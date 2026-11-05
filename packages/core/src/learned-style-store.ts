@@ -48,10 +48,42 @@ export interface StyleProposal {
 
 export interface ResolvedLearnedStyle {
   readonly proposalId: string;
+  /** Exact activation generation; changes even when the same version is re-enabled. */
+  readonly proposalRevision: string;
   readonly version: number;
   readonly name: string;
   readonly body: string;
   readonly bodyDigest: string;
+}
+
+export const LEARNED_STYLE_READBACK_VERSION = 'learned-style-readback-v1' as const;
+
+/**
+ * P16 C2.3 · Style 写后回读回执。
+ *
+ * 权威真值是 **proposal 记录**（见 `resolveActive`：派生 SKILL.md 是用户可管理的副本，
+ * 从不用于绑定）。因此回读**重新从磁盘读取 `proposal.json`**，并额外核对派生 Skill 是否
+ * 仍与提案绑定（`source` / `styleId` / `sourceHash` 三者同时一致）。副本不一致只降级为
+ * `skillBound: false`，**不**改写真值、不修 Skill。
+ *
+ * 回执**内容无关**：只有标识、版本边界、绑定状态与摘要；Skill 正文与名称一律不出结构。
+ */
+export interface LearnedStyleReadbackReceipt {
+  readonly version: typeof LEARNED_STYLE_READBACK_VERSION;
+  readonly proposalId: string;
+  readonly activeVersion: number;
+  readonly status: 'enabled' | 'disabled';
+  readonly proposalRevision: string;
+  readonly skillBound: boolean;
+  readonly sourceHash: string | null;
+  readonly readbackDigest: string;
+}
+
+function readbackDigest(value: Omit<LearnedStyleReadbackReceipt, 'readbackDigest'>): string {
+  return `sha256:${createHash('sha256').update(JSON.stringify([
+    value.version, value.proposalId, value.activeVersion, value.status,
+    value.proposalRevision, value.skillBound, value.sourceHash,
+  ]), 'utf8').digest('hex')}`;
 }
 
 export interface LearnedStyleSessionDeleteResult {
@@ -330,26 +362,70 @@ export class LearnedStyleProposalStore {
    */
   resolveActive(scopeValue: LearnedStyleProposalScope): ResolvedLearnedStyle | null {
     const scope = normalizeScope(scopeValue);
-    const candidates = this.listForScope(scope)
-      .filter((proposal) => proposal.status === 'enabled' && proposal.activeVersion !== null)
-      .sort((left, right) => right.revision.localeCompare(left.revision) || right.id.localeCompare(left.id));
-    for (const proposal of candidates) {
-      const selected = proposal.versions.find((version) => version.version === proposal.activeVersion);
-      if (!selected) continue;
-      const normalized = normalizeDraft(selected.draft);
-      if (!normalized || normalized.bodyDigest !== selected.draft.bodyDigest) continue;
-      try {
-        if (!assertStyleProposalEvaluation(selected.evaluation, normalized.bodyDigest).passed) continue;
-      } catch { continue; }
-      return Object.freeze({
-        proposalId: proposal.id,
-        version: selected.version,
-        name: normalized.name,
-        body: normalized.body,
-        bodyDigest: normalized.bodyDigest,
-      });
+    const proposals = this.listForScope(scope);
+    if (proposals.some((proposal) => proposal.status !== 'enabled' && proposal.status !== 'disabled')) {
+      throw new Error('style-proposal-active-status-invalid');
     }
-    return null;
+    const candidates = proposals
+      .filter((candidate) => candidate.status === 'enabled')
+      .sort((left, right) => right.revision.localeCompare(left.revision) || right.id.localeCompare(left.id));
+    const active = candidates[0];
+    if (!active) return null;
+    // Select exactly once. A broken active version must not silently revive an older sibling.
+    if (typeof active.activeVersion !== 'number' || !Number.isSafeInteger(active.activeVersion)
+      || active.activeVersion < 1) {
+      throw new Error('style-proposal-active-version-invalid');
+    }
+    const selectedVersions = active.versions.filter((version) => version?.version === active.activeVersion);
+    if (selectedVersions.length !== 1) throw new Error('style-proposal-active-version-invalid');
+    const selected = selectedVersions[0]!;
+    const normalized = normalizeDraft(selected.draft);
+    if (!normalized || normalized.bodyDigest !== selected.draft.bodyDigest) {
+      throw new Error('style-proposal-active-draft-invalid');
+    }
+    let evaluation: StyleProposalEvaluation;
+    try { evaluation = assertStyleProposalEvaluation(selected.evaluation, normalized.bodyDigest); }
+    catch { throw new Error('style-proposal-active-evaluation-invalid'); }
+    if (!evaluation.passed) throw new Error('style-proposal-active-evaluation-invalid');
+    return Object.freeze({
+      proposalId: active.id,
+      proposalRevision: active.revision,
+      version: selected.version,
+      name: normalized.name,
+      body: normalized.body,
+      bodyDigest: normalized.bodyDigest,
+    });
+  }
+
+  /**
+   * 提交**之后**重新读回权威提案记录，并核对派生 Skill 的绑定。
+   *
+   * 只读：不写盘、不改 revision、不修 Skill，也不触发任何 Provider 调用。
+   * 尚未激活（`activeVersion === null`）时抛 `learned-style-readback-not-active`；
+   * 调用方据此判定"本次转换不产生读回证据"，绝不合成一个。
+   */
+  readback(id: string): LearnedStyleReadbackReceipt {
+    const current = this.read(id); // 重新从磁盘读 proposal.json，不复用调用方手里的对象
+    if (current.activeVersion === null) throw new Error('learned-style-readback-not-active');
+    const selected = current.versions.find((entry) => entry.version === current.activeVersion);
+    if (!selected) throw new Error('learned-style-readback-version-missing');
+    // 副本只是"绑定核对"，不是真值来源：找不到或不匹配都只降级 skillBound。
+    let installed: ReturnType<typeof findSkill> = null;
+    try { installed = findSkill(selected.draft.name, this.skillsDir); } catch { installed = null; }
+    const bound = installed !== null
+      && installed.source === `learned-style:${current.id}`
+      && installed.styleId === current.id
+      && installed.sourceHash === selected.draft.bodyDigest;
+    const base = Object.freeze({
+      version: LEARNED_STYLE_READBACK_VERSION,
+      proposalId: current.id,
+      activeVersion: current.activeVersion,
+      status: current.status,
+      proposalRevision: current.revision,
+      skillBound: bound,
+      sourceHash: installed?.sourceHash ?? null,
+    });
+    return Object.freeze({ ...base, readbackDigest: readbackDigest(base) });
   }
 
   /**

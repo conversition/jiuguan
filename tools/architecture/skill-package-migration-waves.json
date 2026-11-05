@@ -1,0 +1,99 @@
+{
+  "waveVersion": "skill-package-migration-waves-v1",
+  "plannedSizes": [
+    1,
+    5,
+    15,
+    27
+  ],
+  "waves": [
+    {
+      "size": 1,
+      "directories": [
+        "文风控制"
+      ],
+      "compilerRevision": "agent-skill-compiler-v1.1.0",
+      "primitiveRegistryDigest": "sha256:45c479c5669f69cf817c00945b81452cb9f4330b54340a144b3dc1d3b1860fa7",
+      "validation": "exact-source-body-static-render-replay",
+      "environment": "offline-fixture",
+      "release": "draft"
+    },
+    {
+      "size": 5,
+      "directories": [
+        "分镜-导演读本",
+        "分镜-逐镜分镜",
+        "分镜-串联序列",
+        "分镜-人类化改写",
+        "分镜-视频提示词"
+      ],
+      "compilerRevision": "agent-skill-compiler-v1.2.0",
+      "primitiveRegistryDigest": "sha256:ede5e1c8c966ea1b73cf8caf000238fe9fa84bef6a001be3050e2ca652686bea",
+      "validation": "exact-source-body-static-render-replay",
+      "environment": "offline-fixture",
+      "release": "draft"
+    },
+    {
+      "size": 15,
+      "directories": [
+        "文风-底座-轻小说",
+        "文风-极简现实主义对话小说-契诃夫",
+        "文风-存在主义哲理文学-加缪",
+        "文风-表现主义荒诞寓言-卡夫卡",
+        "文风-古典闲趣雅致散文-沈复",
+        "文风-古典审美随笔散文-清少纳言",
+        "文风-新传统主义诗意散文-阿索林",
+        "文风-京派抒情散文小说-沈从文",
+        "文风-批判现实主义讽刺小说-欧-亨利",
+        "文风-新古典主义武侠史诗-金庸",
+        "文风-中世纪奇幻史诗-乔治-R-R-马丁",
+        "文风-哥特式悬疑恐怖小说-爱伦-坡",
+        "文风-意识流心理散文-伍尔夫",
+        "文风-海派工笔都市小说-王安忆",
+        "文风-无赖派自白体私小说-太宰治"
+      ],
+      "compilerRevision": "agent-skill-compiler-v1.3.0",
+      "primitiveRegistryDigest": "sha256:d127375f5853a7690a67137668bbb2d127ef4409e5561873e55f70e39e75acae",
+      "validation": "exact-source-body-static-render-replay",
+      "environment": "offline-fixture",
+      "release": "draft"
+    },
+    {
+      "size": 27,
+      "directories": [
+        "二次元分镜导演",
+        "催眠",
+        "文风-NSFW",
+        "文风-古典世情写实小说-兰陵笑笑生",
+        "文风-后现代主义女性文学-陈雪",
+        "文风-后现代主义戏仿轻小说-西尾维新",
+        "文风-后现代主义讽刺杂文-王小波",
+        "文风-后现代主义都市小说-村上春树",
+        "文风-女性主义心理推理小说-斜線堂有紀",
+        "文风-女性主义日常私小说-青山七惠",
+        "文风-存在主义酷儿文学-邱妙津",
+        "文风-形式主义唯美小说-纳博科夫",
+        "文风-心理现实主义同性文学-詹姆斯-鲍德温",
+        "文风-心理现实主义抒情小说-D-H-劳伦斯",
+        "文风-新古典主义唯美小说-谷崎润一郎",
+        "文风-新感觉主义抒情小说-川端康成",
+        "文风-日式脱力系喜剧-三木聪",
+        "文风-本格派变格推理小说-江户川乱步",
+        "文风-美式都市浪漫喜剧-诺拉-艾芙隆",
+        "文风-英式浪漫轻喜剧-理查德-柯蒂斯",
+        "文风-词条-23780d96a4",
+        "文风-词条-6fd2fe58f5",
+        "文风-词条-b2b7d5419c",
+        "文风-词条-d7c86ed06d",
+        "文风-象征主义公路文学-杰克-凯鲁亚克",
+        "文风-青春暧昧日常轻小说-入間人間",
+        "文风-颓废派唯美主义文学-奥斯卡-王尔德"
+      ],
+      "compilerRevision": "agent-skill-compiler-v1.4.0",
+      "primitiveRegistryDigest": "sha256:4098de540fdd01c341a7090efecb65227642b211c07adf12c225da1addc0eeb7",
+      "validation": "exact-source-body-static-render-replay",
+      "environment": "offline-fixture",
+      "release": "draft"
+    }
+  ]
+}

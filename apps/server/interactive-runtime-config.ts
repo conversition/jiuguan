@@ -39,7 +39,9 @@ export function interactiveBudgetProfileForAutonomy(
     autonomyProfile,
     lane: 'interactive',
     maxSteps: quality ? 6 : INTERACTIVE_POLICY.maxSteps,
-    maxModelCalls: quality ? 3 : INTERACTIVE_POLICY.maxModelCalls,
+    // Two bounded Prelude calls (evidence + optional Director plan) plus the
+    // first final game_turn and its single contract-repair retry.
+    maxModelCalls: quality ? 4 : INTERACTIVE_POLICY.maxModelCalls,
     maxToolCalls: quality ? 12 : INTERACTIVE_POLICY.maxToolCalls,
     maxWrites: INTERACTIVE_POLICY.maxWrites,
     // The legacy pair sums to the former 16K shared ledger, preserving P13-C requests.

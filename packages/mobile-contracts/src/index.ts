@@ -12,12 +12,14 @@ export type {
   ServerFeatureDescriptor,
   ServerMeta,
 } from './meta.ts';
-export { EVENT_SCHEMA_VERSION, isEventEnvelope } from './events.ts';
+export { EVENT_SCHEMA_VERSION, TASK_EVENT_SCHEMA_VERSION, TASK_EVENT_KINDS, TASK_EVENT_REASONS, isEventEnvelope } from './events.ts';
 export type {
   EventEnvelope,
   EventResource,
   EventResourceKind,
   EventType,
+  TaskEventEvidenceV2,
+  TaskEventRecordRefV2,
 } from './events.ts';
 export {
   REQUEST_ID_HEADER,
@@ -40,6 +42,8 @@ export type {
 export {
   TURN_JOB_ACTIONS,
   TURN_JOB_STATUSES,
+  TURN_PROGRESS_PHASES,
+  isTurnProgress,
   isPublicTurnJob,
   isTurnJobAction,
   isTurnJobStatus,
@@ -50,6 +54,8 @@ export type {
   PublicTurnJobResult,
   TurnJobAction,
   TurnJobStatus,
+  TurnProgress,
+  TurnProgressPhase,
 } from './turn-jobs.ts';
 export {
   MAINTENANCE_MODES,
@@ -158,12 +164,42 @@ export type {
 export {
   AGENT_CONTROL_READ_MODEL_VERSION,
   AGENT_LANE_RECOVERY_ACK,
+  AGENT_LANE_OPERATOR_OVERRIDE_ACK,
   AGENT_SUBCAPABILITY_IDS,
   EFFECTIVE_LEARNING_READ_MODEL_VERSION,
+  PUBLIC_MAINTENANCE_REVIEW_DETAIL_MAX_CODE_POINTS,
+  PUBLIC_MAINTENANCE_REVIEW_TITLE_MAX_CODE_POINTS,
   PUBLIC_BRANCH_ACTION_TAGS,
   PUBLIC_PROMPT_PREFERENCE_TOKENS,
+  PUBLIC_STYLE_EVALUATION_CHECKS,
   isPublicAgentControlReadModel,
+  sanitizePublicMaintenanceReviewText,
 } from './agent-control.ts';
+export {
+  AGENT_SKILL_CATALOG_VERSION,
+  PUBLIC_AGENT_SKILL_KINDS,
+  PUBLIC_AGENT_SKILL_OWNERS,
+  PUBLIC_AGENT_SKILL_LIFECYCLES,
+  PUBLIC_AGENT_SKILL_PHASES,
+  PUBLIC_AGENT_SKILL_RISKS,
+  PUBLIC_AGENT_SKILL_SOURCES,
+  isPublicAgentSkillCatalog,
+  isPublicAgentSkillSummary,
+} from './agent-skills.ts';
+export type {
+  PublicAgentSkillCatalog,
+  PublicAgentSkillCatalogStats,
+  PublicAgentSkillConsumerSummary,
+  PublicAgentSkillContentMode,
+  PublicAgentSkillKind,
+  PublicAgentSkillLifecycle,
+  PublicAgentSkillOwner,
+  PublicAgentSkillPhase,
+  PublicAgentSkillRisk,
+  PublicAgentSkillScopeLevel,
+  PublicAgentSkillSource,
+  PublicAgentSkillSummary,
+} from './agent-skills.ts';
 export type {
   AgentControlAllowedActions,
   AgentSubcapabilityId,
@@ -175,15 +211,19 @@ export type {
   PublicEffectiveLearningSummary,
   PublicEffectivePromptPreference,
   PublicLearningProfileScope,
+  PublicMaintenanceProposalReviewItem,
   PublicPreferenceProfileControl,
   PublicPromptPreferenceCount,
   PublicPromptPreferenceToken,
   PublicPreferenceSyncState,
   PublicAgentRolloutLane,
   PublicStyleProposalControl,
+  PublicStyleProposalVersionReview,
+  PublicStyleEvaluationCheck,
   PublicWorldbookRepairControl,
   PublicAgentRolloutState,
   PublicAgentSubcapability,
+  PublicAgentVerificationProgress,
   StyleProposalControlMutation,
   WorldbookRepairControlMutation,
   WorldbookRepairControlOperation,

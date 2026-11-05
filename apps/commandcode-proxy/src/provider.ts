@@ -11,6 +11,7 @@ import {
   usageToken,
   type ChatRequest as CommandCodeChatRequest,
   type CommandCodeResponseState,
+  type CommandCodeUsage,
 } from '../../../packages/commandcode-core/src/index.ts';
 import {
   CommandCodeAbortError,
@@ -29,6 +30,9 @@ import type {
 
 const ERROR_BODY_LIMIT_BYTES = 64 * 1_024;
 const MAX_RETRY_AFTER_SECONDS = 300;
+const DEFAULT_TRANSPORT_ATTEMPTS = 3;
+const MAX_TRANSPORT_ATTEMPTS = 3;
+const RETRYABLE_UPSTREAM_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
 const API_KEY_PATTERN = /^user_[A-Za-z0-9_-]{1,507}$/;
 const PROMPT_CACHE_KEY_PATTERN = /^[\x21-\x7e]{8,256}$/;
 const SESSION_ID_PATTERN = /^[\x21-\x7e]{8,256}$/;
@@ -53,6 +57,8 @@ export class CommandCodeProviderError extends Error {
     readonly code: CommandCodeProviderErrorCode,
     readonly status?: number,
     readonly retryAfterSeconds?: number,
+    /** Content-free category derived from a bounded, exact upstream error shape. */
+    readonly diagnosticCode?: 'provider-rate-limited',
   ) {
     super({
       COMMANDCODE_PROVIDER_NOT_CONFIGURED: 'CommandCode credential is not configured',
@@ -79,6 +85,44 @@ function boundedRetryAfterSeconds(value: unknown): number | undefined {
 function responseRetryAfterSeconds(response: Response): number | undefined {
   try { return boundedRetryAfterSeconds(response.headers.get('retry-after') ?? undefined); }
   catch { return undefined; }
+}
+
+function transportAttemptLimit(value: number | undefined): number {
+  if (value === undefined) return DEFAULT_TRANSPORT_ATTEMPTS;
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new CommandCodeProviderError('COMMANDCODE_PROVIDER_REQUEST_INVALID');
+  }
+  return Math.min(value, MAX_TRANSPORT_ATTEMPTS);
+}
+
+function retryableTransportFailure(error: CommandCodeProviderError): boolean {
+  if (error.code === 'COMMANDCODE_PROVIDER_UPSTREAM_FAILED'
+    || error.code === 'COMMANDCODE_PROVIDER_STREAM_FAILED'
+    || error.code === 'COMMANDCODE_PROVIDER_STREAM_INCOMPLETE') return true;
+  return error.code === 'COMMANDCODE_PROVIDER_UPSTREAM_REJECTED'
+    && error.status !== undefined
+    && RETRYABLE_UPSTREAM_STATUSES.has(error.status);
+}
+
+async function waitForTransportRetry(
+  attempt: number,
+  retryAfterSeconds: number | undefined,
+  signal: AbortSignal,
+): Promise<void> {
+  if (signal.aborted) throw new CommandCodeProviderAbortError();
+  const delayMs = Math.max(600 * (attempt + 1), (retryAfterSeconds ?? 0) * 1_000);
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, delayMs);
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+      reject(new CommandCodeProviderAbortError());
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 export class CommandCodeProviderAbortError extends Error {
@@ -269,6 +313,33 @@ export async function readCommandCodeErrorText(
   return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString('utf8');
 }
 
+/**
+ * CommandCode reports an exhausted credit balance as HTTP 400/BAD_REQUEST.
+ * Recognize only that exact structured shape and expose a fixed category; the
+ * upstream message itself never leaves this adapter.
+ */
+function commandCodeRejectionDiagnostic(
+  status: number,
+  text: string,
+): 'provider-rate-limited' | undefined {
+  if (status !== 400 || !text) return undefined;
+  let payload: unknown;
+  try { payload = JSON.parse(text); } catch { return undefined; }
+  if (!isRecord(payload)) return undefined;
+  const error = ownValue(payload, 'error');
+  if (!isRecord(error)) return undefined;
+  const code = ownValue(error, 'code');
+  if (code !== 'BAD_REQUEST' && code !== 'premium_credits_exhausted') return undefined;
+  const nestedStatus = ownValue(error, 'status');
+  if (nestedStatus !== undefined && nestedStatus !== 400) return undefined;
+  const message = ownValue(error, 'message');
+  return code === 'premium_credits_exhausted'
+    || (typeof message === 'string'
+      && /\binsufficient credits\b|\bpremium[ _-]credits[ _-]exhausted\b/iu.test(message))
+    ? 'provider-rate-limited'
+    : undefined;
+}
+
 function usageResult(state: CommandCodeResponseState): ProviderCompletionResult['usage'] {
   if (!state.usage) return null;
   const promptTokens = usageToken(state.usage, 'inputTokens') ?? 0;
@@ -281,6 +352,54 @@ function usageResult(state: CommandCodeResponseState): ProviderCompletionResult[
     total_tokens: promptTokens + completionTokens,
     ...(cachedInputTokens === undefined ? {} : { cached_input_tokens: cachedInputTokens }),
     ...(cacheWriteTokens === undefined ? {} : { cache_write_tokens: cacheWriteTokens }),
+  };
+}
+
+function sumUsageValue(left: number | undefined, right: number | undefined): number | undefined {
+  if (left === undefined && right === undefined) return undefined;
+  const total = (left ?? 0) + (right ?? 0);
+  return Number.isFinite(total) && total >= 0 ? total : undefined;
+}
+
+/** Preserve reported physical-attempt usage when a logical call is retried. */
+function mergeUsage(
+  left: CommandCodeUsage | null,
+  right: CommandCodeUsage | null,
+): CommandCodeUsage | null {
+  if (!left) return right;
+  if (!right) return left;
+  const inputTokens = sumUsageValue(
+    usageToken(left, 'inputTokens'), usageToken(right, 'inputTokens'),
+  );
+  const outputTokens = sumUsageValue(
+    usageToken(left, 'outputTokens'), usageToken(right, 'outputTokens'),
+  );
+  const cachedInputTokens = sumUsageValue(
+    usageToken(left, 'cachedInputTokens'), usageToken(right, 'cachedInputTokens'),
+  );
+  const noCacheTokens = sumUsageValue(
+    usageDetailToken(left, 'noCacheTokens'), usageDetailToken(right, 'noCacheTokens'),
+  );
+  const cacheReadTokens = sumUsageValue(
+    usageDetailToken(left, 'cacheReadTokens'), usageDetailToken(right, 'cacheReadTokens'),
+  );
+  const cacheWriteTokens = sumUsageValue(
+    usageDetailToken(left, 'cacheWriteTokens'), usageDetailToken(right, 'cacheWriteTokens'),
+  );
+  const hasDetails = noCacheTokens !== undefined
+    || cacheReadTokens !== undefined
+    || cacheWriteTokens !== undefined;
+  return {
+    ...(inputTokens === undefined ? {} : { inputTokens }),
+    ...(outputTokens === undefined ? {} : { outputTokens }),
+    ...(cachedInputTokens === undefined ? {} : { cachedInputTokens }),
+    ...(hasDetails ? {
+      inputTokenDetails: {
+        ...(noCacheTokens === undefined ? {} : { noCacheTokens }),
+        ...(cacheReadTokens === undefined ? {} : { cacheReadTokens }),
+        ...(cacheWriteTokens === undefined ? {} : { cacheWriteTokens }),
+      },
+    } : {}),
   };
 }
 
@@ -344,7 +463,11 @@ async function requireApiKey(resolveApiKey: () => Promise<string | null>): Promi
 }
 
 function throwTerminalError(state: CommandCodeResponseState): void {
-  const decision = classifyCommandCodeCompletion(state, 'usage');
+  // A successful Provider result must contain observable model output. Some
+  // upstream rejections have been observed as a terminal usage event without
+  // text, reasoning, or tool calls; trusting outputTokens alone turns those
+  // failures into empty 200 responses for Agent lanes.
+  const decision = classifyCommandCodeCompletion(state, 'content');
   if (decision.kind === 'success') return;
   const retryAfterSeconds = boundedRetryAfterSeconds(
     decision.error.retry_after ?? decision.error.body.retry_after,
@@ -384,80 +507,120 @@ export function createCommandCodeProviderAdapter(
     );
     const linked = linkedController(ctx.signal, providerController.signal);
     try {
-      const upstream = await runtime.generate({
-        apiKey,
-        wireBody,
-        ...(promptCacheKey ? { promptCacheKey } : {}),
-        ...(ctx.runId && SESSION_ID_PATTERN.test(ctx.runId) ? { sessionId: ctx.runId } : {}),
-        signal: linked.controller.signal,
-      });
-      if (!upstream.ok) {
+      const maxAttempts = transportAttemptLimit(ctx.maxTransportAttempts);
+      let lastError: CommandCodeProviderError | null = null;
+      let priorAttemptUsage: CommandCodeUsage | null = null;
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        // A streamed retry is safe only before any visible delta reaches the caller.
+        // Once output was emitted, replaying the request would duplicate prose/tool arguments.
+        let emitted = 0;
+        // Body idle timeouts must cancel only this physical request. Cancelling the
+        // outer call controller would poison every later retry in the same logical call.
+        const attemptLinked = linkedController(linked.controller.signal, providerController.signal);
+        let accumulator: CommandCodeResponseAccumulator | undefined;
         try {
-          await readCommandCodeErrorText(
-            upstream, runtimeConfig.nonStreamIdleTimeoutMs, linked.controller,
+          const upstream = await runtime.generate({
+            apiKey,
+            wireBody,
+            ...(promptCacheKey ? { promptCacheKey } : {}),
+            ...(ctx.runId && SESSION_ID_PATTERN.test(ctx.runId) ? { sessionId: ctx.runId } : {}),
+            signal: attemptLinked.controller.signal,
+          });
+          if (!upstream.ok) {
+            let errorText = '';
+            try {
+              errorText = await readCommandCodeErrorText(
+                upstream, runtimeConfig.nonStreamIdleTimeoutMs, attemptLinked.controller,
+              );
+            } catch {
+              if (ctx.signal?.aborted || providerController.signal.aborted) {
+                throw new CommandCodeProviderAbortError();
+              }
+              throw new CommandCodeProviderError('COMMANDCODE_PROVIDER_STREAM_FAILED');
+            }
+            throw new CommandCodeProviderError(
+              'COMMANDCODE_PROVIDER_UPSTREAM_REJECTED', upstream.status,
+              responseRetryAfterSeconds(upstream),
+              commandCodeRejectionDiagnostic(upstream.status, errorText),
+            );
+          }
+          const responseAccumulator = new CommandCodeResponseAccumulator({
+            usagePolicy: 'total-only',
+            newToolCallId: () => `call_${safeUuid(uuid)}`,
+          });
+          accumulator = responseAccumulator;
+          let toolIndex = 0;
+          await consumeCommandCodeNdjson(
+            upstream,
+            runtimeConfig.maxNdjsonBufferedChars,
+            sink ? runtimeConfig.streamIdleTimeoutMs : runtimeConfig.nonStreamIdleTimeoutMs,
+            attemptLinked.controller,
+            (rawEvent) => {
+              let event = rawEvent;
+              const type = ownValue(event, 'type');
+              if (type === 'tool-call' && !ownValue(event, 'toolCallId')) {
+                event = { ...event, toolCallId: `call_${safeUuid(uuid)}` };
+              }
+              responseAccumulator.pushEvent(event);
+              if (!sink) return;
+              if (type === 'text-delta') {
+                const text = stringValue(ownValue(event, 'text') || '');
+                if (text) {
+                  emitted++;
+                  sink.onTextDelta(text);
+                }
+              } else if (type === 'tool-call') {
+                const id = stringValue(ownValue(event, 'toolCallId'));
+                const name = stringValue(ownValue(event, 'toolName') || '');
+                emitted++;
+                sink.onToolCallDelta({
+                  index: toolIndex++,
+                  ...(id ? { id } : {}),
+                  ...(name ? { nameDelta: name } : {}),
+                  argumentsDelta: toolInputText(ownValue(event, 'input')),
+                });
+              }
+            },
           );
-        } catch {
-          if (ctx.signal?.aborted || providerController.signal.aborted) {
+          const state = responseAccumulator.snapshot();
+          throwTerminalError(state);
+          return completionResult({
+            ...state,
+            usage: mergeUsage(priorAttemptUsage, state.usage),
+          }, wireBody.params.model, now, uuid);
+        } catch (error) {
+          if (
+            ctx.signal?.aborted
+            || linked.controller.signal.aborted
+            || error instanceof CommandCodeAbortError
+            || error instanceof CommandCodeProviderAbortError
+          ) {
             throw new CommandCodeProviderAbortError();
           }
-          throw new CommandCodeProviderError('COMMANDCODE_PROVIDER_STREAM_FAILED');
+          const normalized = error instanceof CommandCodeProviderError
+            ? error
+            : new CommandCodeProviderError(
+              error instanceof CommandCodeStreamIdleTimeoutError
+                || error instanceof CommandCodeUpstreamBodyError
+                ? 'COMMANDCODE_PROVIDER_STREAM_FAILED'
+                : 'COMMANDCODE_PROVIDER_UPSTREAM_FAILED',
+            );
+          lastError = normalized;
+          if (emitted > 0 || !retryableTransportFailure(normalized) || attempt === maxAttempts - 1) {
+            throw normalized;
+          }
+          priorAttemptUsage = mergeUsage(
+            priorAttemptUsage,
+            accumulator?.snapshot().usage ?? null,
+          );
+        } finally {
+          attemptLinked.cleanup();
         }
-        throw new CommandCodeProviderError(
-          'COMMANDCODE_PROVIDER_UPSTREAM_REJECTED', upstream.status,
-          responseRetryAfterSeconds(upstream),
+        await waitForTransportRetry(
+          attempt, lastError.retryAfterSeconds, linked.controller.signal,
         );
       }
-      const accumulator = new CommandCodeResponseAccumulator({
-        usagePolicy: 'total-only',
-        newToolCallId: () => `call_${safeUuid(uuid)}`,
-      });
-      let toolIndex = 0;
-      await consumeCommandCodeNdjson(
-        upstream,
-        runtimeConfig.maxNdjsonBufferedChars,
-        sink ? runtimeConfig.streamIdleTimeoutMs : runtimeConfig.nonStreamIdleTimeoutMs,
-        linked.controller,
-        (rawEvent) => {
-          let event = rawEvent;
-          const type = ownValue(event, 'type');
-          if (type === 'tool-call' && !ownValue(event, 'toolCallId')) {
-            event = { ...event, toolCallId: `call_${safeUuid(uuid)}` };
-          }
-          accumulator.pushEvent(event);
-          if (!sink) return;
-          if (type === 'text-delta') {
-            const text = stringValue(ownValue(event, 'text') || '');
-            if (text) sink.onTextDelta(text);
-          } else if (type === 'tool-call') {
-            const id = stringValue(ownValue(event, 'toolCallId'));
-            const name = stringValue(ownValue(event, 'toolName') || '');
-            sink.onToolCallDelta({
-              index: toolIndex++,
-              ...(id ? { id } : {}),
-              ...(name ? { nameDelta: name } : {}),
-              argumentsDelta: toolInputText(ownValue(event, 'input')),
-            });
-          }
-        },
-      );
-      const state = accumulator.snapshot();
-      throwTerminalError(state);
-      return completionResult(state, wireBody.params.model, now, uuid);
-    } catch (error) {
-      if (
-        ctx.signal?.aborted
-        || (linked.controller.signal.aborted && providerController.signal.aborted)
-        || error instanceof CommandCodeAbortError
-      ) {
-        throw new CommandCodeProviderAbortError();
-      }
-      if (error instanceof CommandCodeProviderError) throw error;
-      throw new CommandCodeProviderError(
-        error instanceof CommandCodeStreamIdleTimeoutError
-          || error instanceof CommandCodeUpstreamBodyError
-          ? 'COMMANDCODE_PROVIDER_STREAM_FAILED'
-          : 'COMMANDCODE_PROVIDER_UPSTREAM_FAILED',
-      );
+      throw lastError ?? new CommandCodeProviderError('COMMANDCODE_PROVIDER_UPSTREAM_FAILED');
     } finally {
       linked.cleanup();
     }

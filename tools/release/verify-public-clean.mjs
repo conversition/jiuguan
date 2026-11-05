@@ -75,7 +75,7 @@ const contentRules = [
   ['personal Windows path', /(?:[A-Za-z]:[\\/](?:Users|Documents and Settings|Desktop|claude cade test)[\\/]|Users[\\/]+PC|command cli)/i],
   ['timestamp-derived session id', /session-[0-9]{10,}/i],
   ['private key material', /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/],
-  ['common API token', /(?:sk-[A-Za-z0-9_-]{16,}|AIza[0-9A-Za-z_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|jgp1_[A-Za-z0-9_-]{20,})/],
+  ['common API token', /(?<![A-Za-z0-9_-])(?:sk-[A-Za-z0-9_-]{16,}|AIza[0-9A-Za-z_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|jgp1_[A-Za-z0-9_-]{20,})/],
   ['private IPv4 address', /\b(?:100\.(?:[0-9]{1,3}\.){2}[0-9]{1,3}|10\.(?:[0-9]{1,3}\.){2}[0-9]{1,3}|192\.168\.(?:[0-9]{1,3}\.)[0-9]{1,3}|172\.(?:1[6-9]|2[0-9]|3[01])\.(?:[0-9]{1,3}\.)[0-9]{1,3})\b/],
 ];
 const privateTerms = [

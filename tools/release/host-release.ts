@@ -2,10 +2,13 @@
 import { spawnSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import {
-  cpSync,
+  constants as fsConstants,
+  copyFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readdirSync,
+  rmdirSync,
   rmSync,
   unlinkSync,
   writeFileSync,
@@ -23,6 +26,7 @@ import { AGENT_ADMISSION_SCHEMA_VERSION } from '../../apps/server/agent-admissio
 import { AGENT_LEARNING_SCHEMA_VERSION } from '../../apps/server/agent-learning-ledger.ts';
 import { ARC_PROJECTION_SCHEMA_VERSION } from '../../apps/server/arc-projection-store.ts';
 import { AGENT_CONTROL_SCHEMA_VERSION } from '../../apps/server/agent-control-store.ts';
+import { AGENT_CLOSURE_SCHEMA_VERSION } from '../../apps/server/agent-closure-store.ts';
 import { DSH_HOST_API_VERSION } from '../../packages/plugin/src/dsh-host.ts';
 import { beginReleaseDrain, endReleaseDrain } from '../../apps/server/release-drain.ts';
 import { readJsonObjectFile } from './json-file.ts';
@@ -36,6 +40,7 @@ import {
   type ReleaseHostLayout,
 } from './compat-matrix.ts';
 import {
+  assertActivationCompatible,
   assertRollbackCompatible,
   exactHttpsTailnetOrigin,
   loadHostRelease,
@@ -48,6 +53,88 @@ const layout = layoutFor(join(repo, '.workbuddy', 'host-release'));
 const runtimeStatePath = join(repo, '.workbuddy', 'runtime', 'private-host.json');
 const MAX_DRAIN_WAIT_MS = 28 * 60_000;
 const HOST_RELEASE_USAGE = 'usage: release:host prepare [--check-only] [--endpoint=<origin>] [--release-id=<id>] | activate <id> [--data-dir=<path>] [--timeout-ms=<ms>] | rollback <id> [--data-dir=<path>] [--timeout-ms=<ms>] | status';
+
+/**
+ * Copy one release artifact tree without fs.cpSync.
+ *
+ * Node 22's Windows cpSync implementation can fail with EIO while creating the
+ * destination root on otherwise writable volumes. Release inputs are build
+ * outputs, so keep this copier deliberately narrow: no overwrite, links, or
+ * special filesystem entries are accepted.
+ */
+export function copyHostReleaseTree(sourceDir: string, targetDir: string): void {
+  if (existsSync(targetDir)) throw new Error('host-release-copy-target-exists');
+
+  const copyDirectory = (sourcePath: string, targetPath: string): void => {
+    const directory = lstatSync(sourcePath);
+    if (directory.isSymbolicLink() || !directory.isDirectory()) {
+      throw new Error(`host-release-copy-source-invalid: ${sourcePath}`);
+    }
+    mkdirSync(targetPath, { recursive: false });
+    const entries = readdirSync(sourcePath, { withFileTypes: true })
+      .sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
+    for (const entry of entries) {
+      const sourceEntry = join(sourcePath, entry.name);
+      const targetEntry = join(targetPath, entry.name);
+      const stat = lstatSync(sourceEntry);
+      if (entry.isSymbolicLink() || stat.isSymbolicLink()) {
+        throw new Error(`host-release-copy-link-rejected: ${sourceEntry}`);
+      }
+      if (stat.isDirectory()) {
+        copyDirectory(sourceEntry, targetEntry);
+      } else if (stat.isFile()) {
+        copyFileSync(sourceEntry, targetEntry, fsConstants.COPYFILE_EXCL);
+      } else {
+        throw new Error(`host-release-copy-entry-invalid: ${sourceEntry}`);
+      }
+    }
+  };
+
+  copyDirectory(sourceDir, targetDir);
+}
+
+/** Reset only the staging directory owned by this release layout. */
+export function resetHostReleaseStaging(targetLayout: ReleaseHostLayout): void {
+  const rootPath = resolve(targetLayout.root);
+  const stagingPath = resolve(targetLayout.stagingDir);
+  if (stagingPath !== resolve(rootPath, 'staging')) {
+    throw new Error('host-release-staging-path-invalid');
+  }
+  if (existsSync(stagingPath)) {
+    const staging = lstatSync(stagingPath);
+    if (staging.isSymbolicLink() || !staging.isDirectory()) {
+      throw new Error('host-release-staging-path-invalid');
+    }
+    rmSync(stagingPath, { recursive: true, force: false, maxRetries: 5, retryDelay: 50 });
+  }
+  mkdirSync(stagingPath, { recursive: true });
+}
+
+/** Acquire an empty staging directory without deleting content created by another prepare. */
+export function acquireHostReleaseStaging(targetLayout: ReleaseHostLayout): void {
+  const rootPath = resolve(targetLayout.root);
+  const stagingPath = resolve(targetLayout.stagingDir);
+  if (stagingPath !== resolve(rootPath, 'staging')) {
+    throw new Error('host-release-staging-path-invalid');
+  }
+  if (existsSync(rootPath)) {
+    const root = lstatSync(rootPath);
+    if (root.isSymbolicLink() || !root.isDirectory()) {
+      throw new Error('host-release-staging-path-invalid');
+    }
+  } else {
+    mkdirSync(rootPath, { recursive: true });
+  }
+  if (existsSync(stagingPath)) {
+    const staging = lstatSync(stagingPath);
+    if (staging.isSymbolicLink() || !staging.isDirectory()) {
+      throw new Error('host-release-staging-path-invalid');
+    }
+    if (readdirSync(stagingPath).length > 0) throw new Error('host-release-staging-not-empty');
+    rmdirSync(stagingPath);
+  }
+  mkdirSync(stagingPath, { recursive: false });
+}
 
 function argValue(name: string, argv: readonly string[] = process.argv.slice(2)): string | undefined {
   const prefix = `--${name}=`;
@@ -90,7 +177,36 @@ function capture(command: string, args: string[]): string {
 
 function run(command: string, args: string[]): void {
   const result = spawnSync(command, args, { cwd: repo, stdio: 'inherit', shell: false });
-  if (result.status !== 0) throw new Error(`${command} ${args.join(' ')} failed`);
+  if (result.error) {
+    const code = (result.error as NodeJS.ErrnoException).code ?? 'unknown';
+    throw new Error(`${command} ${args.join(' ')} failed to start (${code})`);
+  }
+  if (result.status !== 0) {
+    throw new Error(`${command} ${args.join(' ')} failed (exit=${result.status ?? 'signal'})`);
+  }
+}
+
+export interface HostReleaseVerificationCommand {
+  readonly command: string;
+  readonly args: readonly string[];
+}
+
+export function hostReleaseVerificationCommands(
+  platform: NodeJS.Platform = process.platform,
+  commandProcessor = process.env.ComSpec ?? 'cmd.exe',
+): readonly HostReleaseVerificationCommand[] {
+  if (platform === 'win32') {
+    // Node cannot spawn the pnpm.cmd shim directly on Windows. Keep the /c
+    // payload internal and fixed so no caller-controlled value reaches cmd.exe.
+    return [
+      { command: commandProcessor, args: ['/d', '/s', '/c', 'pnpm.cmd test'] },
+      { command: commandProcessor, args: ['/d', '/s', '/c', 'pnpm.cmd build'] },
+    ];
+  }
+  return [
+    { command: 'pnpm', args: ['test'] },
+    { command: 'pnpm', args: ['build'] },
+  ];
 }
 
 export interface HostReleaseRuntime {
@@ -180,7 +296,7 @@ function buildManifest(releaseId: string, commit: string, apiOrigin: string): Ho
   const webEntry = 'web/index.html';
   const pluginEntry = 'plugin/index.js';
   return {
-    version: 2,
+    version: 3,
     releaseId,
     commit,
     apiOrigin,
@@ -197,6 +313,7 @@ function buildManifest(releaseId: string, commit: string, apiOrigin: string): Ho
       agentLearning: AGENT_LEARNING_SCHEMA_VERSION,
       arcProjection: ARC_PROJECTION_SCHEMA_VERSION,
       agentControl: AGENT_CONTROL_SCHEMA_VERSION,
+      agentClosure: AGENT_CLOSURE_SCHEMA_VERSION,
     },
     artifacts: {
       runtimeEntry, runtimeSha256: sha256File(join(layout.stagingDir, runtimeEntry)),
@@ -224,22 +341,35 @@ export function prepareHostRelease(
     runtime.log(JSON.stringify({ ok: true, command: 'prepare-check', releaseId, apiOrigin }));
     return;
   }
-  runtime.run(process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm', ['test']);
-  runtime.run(process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm', ['build']);
-  if (existsSync(layout.stagingDir)) {
-    rmSync(layout.stagingDir, { force: false });
+  for (const verification of hostReleaseVerificationCommands()) {
+    runtime.run(verification.command, [...verification.args]);
   }
-  mkdirSync(layout.stagingDir, { recursive: true });
-  cpSync(join(repo, 'dist-runtime'), join(layout.stagingDir, 'dist-runtime'), { recursive: true, errorOnExist: true });
-  cpSync(join(repo, 'apps', 'web', 'dist'), join(layout.stagingDir, 'web'), { recursive: true, errorOnExist: true });
-  mkdirSync(join(layout.stagingDir, 'plugin'), { recursive: true });
-  cpSync(join(repo, 'plugins', 'commandcode-provider', 'bundle', 'index.js'), join(layout.stagingDir, 'plugin', 'index.js'));
-  writeCommandCodeProviderReleasePackage(
-    join(layout.stagingDir, 'plugin'),
-    packageVersion(join(repo, 'plugins', 'commandcode-provider', 'package.json')),
-  );
-  const manifest = buildManifest(releaseId, commit, apiOrigin);
-  writeFileSync(join(layout.stagingDir, 'host-release.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+  if (runtime.capture('git', ['status', '--porcelain'])) throw new Error('host-release-requires-clean-tree');
+  if (runtime.capture('git', ['rev-parse', 'HEAD']) !== commit) throw new Error('host-release-commit-changed');
+  acquireHostReleaseStaging(layout);
+  try {
+    copyHostReleaseTree(join(repo, 'dist-runtime'), join(layout.stagingDir, 'dist-runtime'));
+    copyHostReleaseTree(join(repo, 'apps', 'web', 'dist'), join(layout.stagingDir, 'web'));
+    mkdirSync(join(layout.stagingDir, 'plugin'), { recursive: false });
+    copyFileSync(
+      join(repo, 'plugins', 'commandcode-provider', 'bundle', 'index.js'),
+      join(layout.stagingDir, 'plugin', 'index.js'),
+      fsConstants.COPYFILE_EXCL,
+    );
+    writeCommandCodeProviderReleasePackage(
+      join(layout.stagingDir, 'plugin'),
+      packageVersion(join(repo, 'plugins', 'commandcode-provider', 'package.json')),
+    );
+    const manifest = buildManifest(releaseId, commit, apiOrigin);
+    writeFileSync(join(layout.stagingDir, 'host-release.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+  } catch (error) {
+    try {
+      resetHostReleaseStaging(layout);
+    } catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], 'host-release-staging-cleanup-failed');
+    }
+    throw error;
+  }
   stageRelease(layout, releaseId, { commit, apiOrigin });
   loadHostRelease(layout, releaseId);
   console.log(JSON.stringify({ ok: true, command: 'prepare', releaseId }));
@@ -266,7 +396,11 @@ async function switchRelease(
 ): Promise<void> {
   const target = loadHostRelease(layout, releaseId);
   const currentId = currentRelease(layout);
-  if (currentId) assertRollbackCompatible(loadHostRelease(layout, currentId), target);
+  if (currentId) {
+    const current = loadHostRelease(layout, currentId);
+    if (rollback) assertRollbackCompatible(current, target);
+    else assertActivationCompatible(current, target);
+  }
   if (existsSync(runtimeStatePath)) {
     const runningOrigin = readJsonObjectFile(runtimeStatePath).origin;
     if (typeof runningOrigin === 'string' && exactHttpsTailnetOrigin(runningOrigin) !== target.apiOrigin) {

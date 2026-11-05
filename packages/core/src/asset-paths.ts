@@ -1,6 +1,6 @@
 /**
  * core 包 - 资产路径与用户层（编辑器 P2：非只读）
- * 分层：可选只读资产库 + 用户层（data/{presets,worldbooks,cards}，编辑器写入）
+ * 分层：源资产（剧本方案，只读） + 用户层（data/{presets,worldbooks}，编辑器写入）
  * 优先级：用户层 > 源资产（保存/加载统一走 resolveAsset）
  * 用户层目录可用 JG_USER_DATA_DIR 覆盖（测试隔离）。
  */
@@ -55,16 +55,26 @@ export class AssetRevisionConflictError extends Error {
   }
 }
 
+function testAssetBaseOverride(): string | null {
+  const flag = process.env.JG_USE_TEST_ASSET_FIXTURE;
+  if (flag === undefined || flag === '') return null;
+  if (process.env.NODE_ENV !== 'test' || flag !== '1') {
+    throw new Error('JG_USE_TEST_ASSET_FIXTURE=1 requires NODE_ENV=test');
+  }
+  return resolve(import.meta.dirname ?? '.', '..', '..', '..', 'data', 'test-source-assets', '剧本方案');
+}
+
 export const USER_DATA_DIR = process.env.JG_USER_DATA_DIR
   ? resolve(process.env.JG_USER_DATA_DIR)
   : resolve(process.cwd(), 'data');
+
 /**
  * 公开发行版不绑定作者机器上的素材目录。若需要一套只读共享资产，显式设置
  * JG_ASSET_BASE；否则使用用户数据目录下的 library 子目录。
+ * 测试进程仍可用 JG_USE_TEST_ASSET_FIXTURE 指向隔离 fixture。
  */
-export const ASSET_BASE = process.env.JG_ASSET_BASE
-  ? resolve(process.env.JG_ASSET_BASE)
-  : resolve(USER_DATA_DIR, 'library');
+export const ASSET_BASE = testAssetBaseOverride()
+  ?? (process.env.JG_ASSET_BASE ? resolve(process.env.JG_ASSET_BASE) : resolve(USER_DATA_DIR, 'library'));
 export const ASSET_PRESET_DIR = resolve(ASSET_BASE, '预设');
 export const ASSET_WORLDBOOK_DIR = resolve(ASSET_BASE, '世界书');
 export const ASSET_CARD_DIR = resolve(ASSET_BASE, '角色卡');
@@ -82,7 +92,7 @@ export function assetDir(kind: AssetKind, user: boolean): string {
  * 资产文件名守卫：只允许**单个**文件名段。
  *
  * 不允许路径分隔符、NUL、控制字符、首尾空白，不允许 `.` / `..` 或以 `.` 开头
- * （避免 dotfile），不允许 Windows 盘符相对路径，长度上限 200。
+ * （避免 dotfile），不允许 Windows 禁止字符、尾随点/空格或保留设备名，长度上限 200。
  *
  * 背景：保存/删除路径（saveUserAsset / saveAssetBuffer / deleteWorldbookFile /
  * deleteUserCard / deleteUserAsset）早已用 `basename(file) !== file` 拦截，但**读取
@@ -96,8 +106,13 @@ export function isSafeAssetFileName(file: unknown): file is string {
   if (file.length === 0 || file.length > 200) return false;
   if (file !== file.trim()) return false;
   if (file === '.' || file === '..' || file.startsWith('.')) return false;
-  if (/[\\/\u0000-\u001f\u007f]/.test(file)) return false;
-  if (/^[A-Za-z]:/.test(file)) return false;
+  // Windows 会把这些字符解释为路径、ADS 或通配符；跨平台统一拒绝，避免
+  // Linux 开发环境生成的资产在 Windows 运行时变成不可读/不可删的文件。
+  if (/[<>:"/\\|?*\u0000-\u001f\u007f]/.test(file)) return false;
+  if (/[. ]$/.test(file)) return false;
+  // Windows 设备名即使带扩展名仍是保留名（例如 CON.json、LPT1.png）。
+  const stem = file.split('.', 1)[0]!.replace(/[ .]+$/g, '');
+  if (/^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(stem)) return false;
   return basename(file) === file;
 }
 
@@ -318,7 +333,7 @@ export function deleteUserAsset(kind: AssetKind, file: string): boolean {
 }
 
 /** 删除世界书（两层兜底）：优先删用户层副本，无用户层副本时删源层文件。
- *  历史导入可能把用户书直接落在只读资产库的世界书目录，source 被标为 asset，
+ *  历史导入曾把用户书直接落在源资产目录（剧本方案/世界书），source 被标为 asset，
  *  前端按 source==='user' 显示删除按钮导致按钮没有全覆盖；现按钮全覆盖，此处两层都可删。
  *  仅接受裸文件名（防路径穿越）；调用方须已做两步确认。 */
 export function deleteWorldbookFile(file: string): { removed: boolean; layer: 'user' | 'asset' | null } {
@@ -394,7 +409,7 @@ export function deleteWorldbookFileCas(file: string, expectedRevision: string): 
 
 /** 保存二进制到用户层（PNG 卡原件；文件名校验同 saveUserAsset） */
 export function saveAssetBuffer(kind: AssetKind, file: string, buf: Buffer): string {
-  if (basename(file) !== file || !/^[^\\/]+\.[a-zA-Z0-9]+$/.test(file)) {
+  if (!isSafeAssetFileName(file) || !/\.[a-zA-Z0-9]+$/.test(file)) {
     throw new Error(`非法文件名: ${file}`);
   }
   const dir = assetDir(kind, true);

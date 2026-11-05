@@ -1,4 +1,5 @@
 import {
+  AGENT_LANE_OPERATOR_OVERRIDE_ACK,
   AGENT_LANE_RECOVERY_ACK,
   isPublicAgentControlReadModel,
   type AgentSubcapabilityId,
@@ -9,6 +10,9 @@ import {
 } from '../../../packages/mobile-contracts/src/agent-control.ts';
 import { authFetch } from './authClient.ts';
 import { fetchWithInactivityTimeout } from './activityTimeout.ts';
+
+/** Re-exported so panels can send the override without a second contracts import. */
+export { AGENT_LANE_OPERATOR_OVERRIDE_ACK };
 
 const AGENT_CONTROL_IDLE_TIMEOUT_MS = 12_000;
 const PREFERENCE_CLEAR_STORAGE_PREFIX = 'jiuguan:agent-control:clear-preference-profile:v1:';
@@ -42,11 +46,19 @@ export type AgentLaneControlMutation =
       readonly operation: 'recover';
       readonly lane: PublicAgentRolloutLane;
       readonly expectedRevision: string;
+      readonly expectedWindowSequence: number;
       readonly evidenceDigest: string;
       readonly maxProviderCalls: number;
       readonly acknowledgement: typeof AGENT_LANE_RECOVERY_ACK;
     }
   | { readonly operation: 'downgrade'; readonly lane: PublicAgentRolloutLane; readonly expectedRevision: string; readonly desiredState: 'off' | 'shadow' }
+  | {
+      readonly operation: 'operator-override-quality-kill';
+      readonly lane: PublicAgentRolloutLane;
+      readonly expectedRevision: string;
+      readonly acknowledgement: typeof AGENT_LANE_OPERATOR_OVERRIDE_ACK;
+      readonly reopenTo: 'off' | 'shadow' | 'test-session';
+    }
   | { readonly operation: 'kill-capability'; readonly capabilityId: AgentSubcapabilityId; readonly expectedRevision: string; readonly reasonCode: string }
   | { readonly operation: 'clear-capability-kill'; readonly capabilityId: AgentSubcapabilityId; readonly expectedRevision: string }
   | StyleProposalControlMutation
@@ -63,6 +75,52 @@ export type AgentLaneControlMutation =
 export function parseAgentControlResponse(value: unknown): PublicAgentControlReadModel {
   if (!isPublicAgentControlReadModel(value)) throw new Error('Agent 状态响应不符合当前协议');
   return value;
+}
+
+/** True for the content-free Maintenance invalidations that require an immediate status re-read. */
+export function isMaintenanceAgentStatusInvalidation(
+  value: unknown,
+  sessionId: string,
+): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const event = value as Record<string, unknown>;
+  if (!event.resource || typeof event.resource !== 'object' || Array.isArray(event.resource)) return false;
+  const resource = event.resource as Record<string, unknown>;
+  if (event.type !== 'session.updated'
+    || resource.kind !== 'session'
+    || resource.id !== sessionId
+    || !event.data || typeof event.data !== 'object' || Array.isArray(event.data)) return false;
+  const status = (event.data as Record<string, unknown>).status;
+  return status === 'maintenance-evaluated'
+    || status === 'maintenance-enqueued'
+    || status === 'maintenance-settled';
+}
+
+type MaintenanceProposalSummary = NonNullable<PublicAgentControlReadModel['maintenanceProposals']>[number];
+
+/** Stable, content-free snapshot used to detect Maintenance truth transitions. */
+export function maintenanceProposalRevisionMap(
+  proposals: readonly MaintenanceProposalSummary[],
+): Map<string, string> {
+  return new Map(proposals.map((proposal) => [
+    proposal.id, `${proposal.status}:${proposal.revision}`,
+  ]));
+}
+
+/**
+ * True only when the next read model proves a commit/rollback that the prior
+ * snapshot did not contain. `null` deliberately treats an already-applied
+ * first read as a change, closing the concurrent panel-hydration race.
+ */
+export function maintenanceTruthChanged(
+  previous: ReadonlyMap<string, string> | null,
+  proposals: readonly MaintenanceProposalSummary[],
+): boolean {
+  const next = maintenanceProposalRevisionMap(proposals);
+  return proposals.some((proposal) => (
+    (proposal.status === 'applied' || proposal.status === 'rolled_back')
+    && (previous === null || previous.get(proposal.id) !== next.get(proposal.id))
+  ));
 }
 
 function preferenceClearStorageKey(sessionId: string): string {
@@ -184,6 +242,62 @@ export async function mutateAgentLaneControl(
       response.status,
       `Agent 控制失败（HTTP ${response.status}${code}）`,
       errorCode,
+    );
+  }
+}
+
+/** Trusted-local switch for the background shadow runner; the server enforces local authority. */
+export async function setMaintenanceGlobalEnabled(
+  globalEnabled: boolean,
+  options: { fetchImpl?: typeof authFetch; signal?: AbortSignal } = {},
+): Promise<void> {
+  const execute = options.fetchImpl ?? authFetch;
+  const response = await fetchWithInactivityTimeout(
+    (signal) => execute('/api/maintenance/control', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ globalEnabled }),
+      signal,
+    }),
+    AGENT_CONTROL_IDLE_TIMEOUT_MS,
+    options.signal,
+  );
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null) as Record<string, unknown> | null;
+    const code = typeof payload?.code === 'string' ? payload.code : undefined;
+    throw new AgentControlMutationError(
+      response.status,
+      `后台维护总开关失败（HTTP ${response.status}${code ? `：${code}` : ''}）`,
+      code,
+    );
+  }
+}
+
+/** Trusted-local exact-session switch; it cannot widen the host's shadow-only runtime boundary. */
+export async function setSessionMaintenanceEnabled(
+  sessionId: string,
+  enabled: boolean,
+  options: { fetchImpl?: typeof authFetch; signal?: AbortSignal } = {},
+): Promise<void> {
+  if (!sessionId || /[\u0000-\u001f]/u.test(sessionId)) throw new Error('会话 ID 非法');
+  const execute = options.fetchImpl ?? authFetch;
+  const response = await fetchWithInactivityTimeout(
+    (signal) => execute(`/api/session/${encodeURIComponent(sessionId)}/maintenance/settings`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled }),
+      signal,
+    }),
+    AGENT_CONTROL_IDLE_TIMEOUT_MS,
+    options.signal,
+  );
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null) as Record<string, unknown> | null;
+    const code = typeof payload?.code === 'string' ? payload.code : undefined;
+    throw new AgentControlMutationError(
+      response.status,
+      `当前会话后台维护开关失败（HTTP ${response.status}${code ? `：${code}` : ''}）`,
+      code,
     );
   }
 }

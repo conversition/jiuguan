@@ -11,7 +11,8 @@
     "./config": "./dist/config.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json"
+    "build": "tsc -p tsconfig.json",
+    "test": "node --experimental-strip-types --experimental-transform-types tests/verify-config.ts && node --experimental-strip-types --experimental-transform-types tests/verify-history.ts && node --experimental-strip-types --experimental-transform-types tests/verify-provider-registry.ts && node --experimental-strip-types --experimental-transform-types tests/verify-provider-invocation.ts && node --experimental-strip-types --experimental-transform-types tests/verify-provider-client.ts && node --experimental-strip-types --experimental-transform-types tests/verify-openai-stream-boundary.ts"
   },
   "dependencies": {}
 }

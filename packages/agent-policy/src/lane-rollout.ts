@@ -1,5 +1,11 @@
 import { createHash } from 'node:crypto';
 
+// Public rollout-side forwarding only; the canonical identity remains in precommit-critic.
+export {
+  PLAYER_SOVEREIGNTY_ACTION_ALIAS_DEFECT_ID,
+  PLAYER_SOVEREIGNTY_POLICY_REVISION,
+} from './precommit-critic.ts';
+
 export const AGENT_ROLLOUT_LANES = Object.freeze(['interactive', 'learning', 'maintenance'] as const);
 export type AgentRolloutLane = (typeof AGENT_ROLLOUT_LANES)[number];
 export const AGENT_ROLLOUT_STATES = Object.freeze([
@@ -13,6 +19,9 @@ export const AGENT_LANE_QUALITY_KILL_REASONS = Object.freeze([
   'provider-error-rate-exceeded',
   'invalid-call-rate-exceeded',
   'p95-latency-exceeded',
+  // Ordinary Maintenance protocol defects stop one capability first. This
+  // reason is reserved for independent failures across multiple task kinds.
+  'maintenance-multi-task-protocol-invalid',
 ] as const);
 export const AGENT_LANE_PERMANENT_KILL_REASONS = Object.freeze([
   'player-sovereignty-violation',
@@ -20,6 +29,7 @@ export const AGENT_LANE_PERMANENT_KILL_REASONS = Object.freeze([
   'duplicate-write',
   'sensitive-audit-violation',
 ] as const);
+
 /**
  * Per-lane default size of one operator-authorized Provider-call window.
  *
@@ -57,6 +67,11 @@ export interface AgentLaneEvidence {
   readonly observationVersion: typeof AGENT_LANE_OBSERVATION_VERSION;
   readonly operationalEvaluationPassed: boolean;
   readonly qualifyingSamples: number;
+  /**
+   * UTC calendar days containing at least one de-duplicated qualifying sample for the current
+   * observation version. Idle/no-op rows, failed Provider attempts and merely open authorization
+   * windows are deliberately not observation days for the global `on` maturity gate.
+   */
   readonly observationDays: number;
   readonly providerCalls: number;
   readonly providerErrors: number;
@@ -77,6 +92,8 @@ export interface AgentLaneEvidence {
   readonly authorizationWindowProviderErrors?: number;
   readonly authorizationWindowInvalidCalls?: number;
   readonly authorizationWindowQualifyingSamples?: number;
+  /** Number of actual latency observations in the current window (not Provider calls). */
+  readonly authorizationWindowLatencySamples?: number;
   readonly authorizationWindowP50LatencyMs?: number;
   readonly authorizationWindowP95LatencyMs?: number;
   readonly authorizationWindowMaxCalls?: number;
@@ -175,6 +192,12 @@ export function evaluateAgentLaneRollout(input: {
       input.evidence.authorizationWindowQualifyingSamples ?? input.evidence.qualifyingSamples,
       'authorizationWindowQualifyingSamples',
     ),
+    authorizationWindowLatencySamples: count(
+      input.evidence.authorizationWindowLatencySamples
+        ?? input.evidence.authorizationWindowQualifyingSamples
+        ?? input.evidence.qualifyingSamples,
+      'authorizationWindowLatencySamples',
+    ),
     authorizationWindowP50LatencyMs: count(
       input.evidence.authorizationWindowP50LatencyMs ?? input.evidence.p50LatencyMs,
       'authorizationWindowP50LatencyMs',
@@ -204,6 +227,8 @@ export function evaluateAgentLaneRollout(input: {
   const enoughProviderAttempts = providerAttempts >= AGENT_ROLLOUT_THRESHOLDS.canaryMinSamples;
   const enoughAuthorizedCalls = evidence.authorizationWindowCalls
     >= AGENT_ROLLOUT_THRESHOLDS.canaryMinSamples;
+  const enoughLatencySamples = evidence.authorizationWindowLatencySamples
+    >= AGENT_ROLLOUT_THRESHOLDS.canaryMinSamples;
   if (evidence.playerSovereigntyViolations > 0) reasons.push('player-sovereignty-violation');
   if (evidence.unauthorizedOrStaleWrites > 0) reasons.push('unauthorized-or-stale-write');
   if (evidence.duplicateWrites > 0) reasons.push('duplicate-write');
@@ -214,7 +239,7 @@ export function evaluateAgentLaneRollout(input: {
   if (enoughAuthorizedCalls && invalidCallRate > AGENT_ROLLOUT_THRESHOLDS.invalidCallRateMax) {
     reasons.push('invalid-call-rate-exceeded');
   }
-  if (enoughAuthorizedCalls
+  if (enoughLatencySamples
     && evidence.authorizationWindowP95LatencyMs > AGENT_ROLLOUT_THRESHOLDS.p95LatencyMaxMs[lane]) {
     reasons.push('p95-latency-exceeded');
   }
@@ -226,10 +251,22 @@ export function evaluateAgentLaneRollout(input: {
   else if (effectiveState === 'shadow') reasons.push('lane-shadow-only');
   else if (!evidence.operationalEvaluationPassed) reasons.push('operational-evaluation-required');
   else if (effectiveState === 'test-session') {
-    reasons.push(evidence.authorizationWindowQualifyingSamples >= AGENT_ROLLOUT_THRESHOLDS.canaryMinSamples
-      || providerAttempts + evidence.authorizationWindowReservedCalls >= windowMaxCalls
-      ? 'test-session-review-required'
-      : 'test-session-admitted');
+    const sampleTargetReached = evidence.authorizationWindowQualifyingSamples
+      >= AGENT_ROLLOUT_THRESHOLDS.canaryMinSamples;
+    const settledWindowExhausted = providerAttempts >= windowMaxCalls;
+    const reservedWindowFull = !settledWindowExhausted
+      && providerAttempts + evidence.authorizationWindowReservedCalls >= windowMaxCalls;
+    if (sampleTargetReached || settledWindowExhausted || reservedWindowFull) {
+      // Keep the generic reason for older clients, then add one precise reason so
+      // newer operator surfaces never mistake an exhausted window for a passed
+      // sample gate. Sample completion deliberately wins when both are true.
+      reasons.push('test-session-review-required');
+      reasons.push(sampleTargetReached
+        ? 'test-session-sample-target-reached'
+        : settledWindowExhausted
+          ? 'test-session-window-exhausted'
+          : 'test-session-window-fully-reserved');
+    } else reasons.push('test-session-admitted');
   }
   else {
     const percent = canaryPercent(effectiveState);
